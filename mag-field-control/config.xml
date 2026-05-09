@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Root>
+  <Commports>
+    <PortX Port="COM15" BaudRate="9600" />
+    <PortY Port="COM16" BaudRate="9600" />
+    <PortZ Port="COM17" BaudRate="9600" />
+  </Commports>
+  <DataSaveDir>./data</DataSaveDir>
+  <PollIntervalMs>500</PollIntervalMs>
+  <CoilConstant X="143.26" Y="141.77" Z="156.15" />
+  <ZeroOffset X="0.00000" Y="0.00000" Z="0.00000" />
+</Root>
