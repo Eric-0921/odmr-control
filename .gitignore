@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+env/
+captures/
+*.csv
+
+# Vendor manual OCR exports are kept local by default for public repositories.
+*_OperatingManual*.md
