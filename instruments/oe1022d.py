@@ -50,17 +50,26 @@ class LockinSampleItem(IntEnum):
     FREQ = 21
 
 
+class ConnectionMode:
+    RS232 = "RS232"
+    USB = "USB"
+
+
 class OE1022DController:
     def __init__(self) -> None:
         self.serial_port = None
+        self.connection_mode = ConnectionMode.RS232
+        self.usb_address = None
 
     @property
     def is_connected(self) -> bool:
         return self.serial_port is not None and self.serial_port.is_open
 
-    def connect(self, port: str, baudrate: int) -> None:
+    def connect_rs232(self, port: str, baudrate: int) -> None:
+        """连接 RS232 串口"""
         if serial is None:
             raise RuntimeError("pyserial is not installed; run `pip install -r requirements.txt` first")
+        self.connection_mode = ConnectionMode.RS232
         self.serial_port = serial.Serial(
             port=port,
             baudrate=baudrate,
@@ -71,6 +80,40 @@ class OE1022DController:
         )
         self.serial_port.reset_input_buffer()
         self.serial_port.reset_output_buffer()
+
+    def connect_usb(self, address: str = None) -> None:
+        """连接 USB 接口
+        OE1022D USB 接口可以直接通过 pyserial 打开（作为虚拟串口）
+        或者通过 VISA 地址连接
+        """
+        if serial is None:
+            raise RuntimeError("pyserial is not installed; run `pip install -r requirements.txt` first")
+        self.connection_mode = ConnectionMode.USB
+
+        # 尝试作为串口打开（OE1022D USB 多数情况下作为虚拟串口）
+        if address and address.startswith("COM"):
+            # 直接指定了 COM 端口
+            self.serial_port = serial.Serial(
+                port=address,
+                baudrate=921600,  # USB 模式通常使用默认波特率
+                bytesize=8,
+                parity="N",
+                stopbits=1,
+                timeout=1,
+            )
+        else:
+            # 尝试查找 OE1022D USB 设备
+            raise RuntimeError("USB 地址未指定，请提供 COM 端口号")
+
+        self.serial_port.reset_input_buffer()
+        self.serial_port.reset_output_buffer()
+
+    def connect(self, port: str, baudrate: int, mode: str = ConnectionMode.RS232) -> None:
+        """统一连接接口"""
+        if mode == ConnectionMode.USB:
+            self.connect_usb(port)
+        else:
+            self.connect_rs232(port, baudrate)
 
     def close(self) -> None:
         if self.serial_port is not None:

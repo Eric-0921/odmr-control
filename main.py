@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QApplication
 from app.gui import SMB100AControlGUI
 
 
-def main() -> None:
+def main() -> None:s
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = SMB100AControlGUI()

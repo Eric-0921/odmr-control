@@ -192,13 +192,13 @@ class SMB100AControlGUI(QMainWindow):
         layout = QVBoxLayout(page)
         layout.addWidget(self._build_source_control_group())
         layout.addWidget(self._build_params_group())
+        layout.addWidget(self._build_live_data_group())
         layout.addStretch()
         return page
 
     def _build_lockin_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(self._build_live_data_group())
         layout.addWidget(self._build_lockin_control_group())
         record_group = QGroupBox("低频监视记录")
         record_layout = QVBoxLayout(record_group)
@@ -320,7 +320,7 @@ class SMB100AControlGUI(QMainWindow):
 
         smb_row = QHBoxLayout()
         smb_row.addWidget(QLabel("信号源 VISA:"))
-        self.smb_address_input = QLineEdit("USB0::0x0AAD::0x0054::106789::INSTR")
+        self.smb_address_input = QLineEdit("USB::0x0AAD::0x0054::101623::INSTR")
         smb_row.addWidget(self.smb_address_input, 1)
         self.smb_conn_btn = QPushButton("连接")
         self.smb_conn_btn.setObjectName("connBtn")
@@ -328,25 +328,55 @@ class SMB100AControlGUI(QMainWindow):
         smb_row.addWidget(self.smb_conn_btn)
         layout.addLayout(smb_row)
 
-        lockin_row = QHBoxLayout()
-        lockin_row.addWidget(QLabel("锁相放大器:"))
+        # OE1022D 连接设置
+        lockin_mode_row = QHBoxLayout()
+        lockin_mode_row.addWidget(QLabel("锁相放大器:"))
+        self.lockin_mode_combo = QComboBox()
+        self.lockin_mode_combo.addItems(["RS232", "USB"])
+        self.lockin_mode_combo.setCurrentText("RS232")
+        self.lockin_mode_combo.currentTextChanged.connect(self.on_lockin_mode_changed)
+        lockin_mode_row.addWidget(self.lockin_mode_combo)
+
+        # RS232 模式设置
+        self.lockin_rs232_widget = QWidget()
+        rs232_layout = QHBoxLayout()
+        rs232_layout.setContentsMargins(0, 0, 0, 0)
         self.lockin_port_combo = QComboBox()
         self.lockin_port_combo.setEditable(True)
-        self.lockin_port_combo.addItems([f"COM{i}" for i in range(1, 7)])
-        self.lockin_port_combo.setCurrentText("COM4")
-        lockin_row.addWidget(self.lockin_port_combo, 1)
+        self.lockin_port_combo.addItems([f"COM{i}" for i in range(1, 21)])
+        self.lockin_port_combo.setCurrentText("COM5")
+        rs232_layout.addWidget(self.lockin_port_combo, 1)
         self.lockin_baud_combo = QComboBox()
         self.lockin_baud_combo.addItems(["9600", "19200", "38400", "57600", "115200", "921600"])
         self.lockin_baud_combo.setCurrentText("921600")
-        lockin_row.addWidget(self.lockin_baud_combo)
-        self.scan_ports_btn = QPushButton("扫描串口")
+        rs232_layout.addWidget(self.lockin_baud_combo)
+        self.scan_ports_btn = QPushButton("扫描")
         self.scan_ports_btn.clicked.connect(self.scan_serial_ports)
-        lockin_row.addWidget(self.scan_ports_btn)
+        rs232_layout.addWidget(self.scan_ports_btn)
+        self.lockin_rs232_widget.setLayout(rs232_layout)
+        lockin_mode_row.addWidget(self.lockin_rs232_widget, 1)
+
+        # USB 模式设置
+        self.lockin_usb_widget = QWidget()
+        usb_layout = QHBoxLayout()
+        usb_layout.setContentsMargins(0, 0, 0, 0)
+        self.lockin_usb_combo = QComboBox()
+        self.lockin_usb_combo.setEditable(True)
+        self.lockin_usb_combo.addItems([f"COM{i}" for i in range(1, 21)])
+        self.lockin_usb_combo.setCurrentText("COM5")
+        usb_layout.addWidget(self.lockin_usb_combo, 1)
+        self.scan_usb_btn = QPushButton("扫描USB")
+        self.scan_usb_btn.clicked.connect(self.scan_usb_devices)
+        usb_layout.addWidget(self.scan_usb_btn)
+        self.lockin_usb_widget.setLayout(usb_layout)
+        self.lockin_usb_widget.setVisible(False)
+        lockin_mode_row.addWidget(self.lockin_usb_widget, 1)
+
         self.lockin_conn_btn = QPushButton("连接")
         self.lockin_conn_btn.setObjectName("connBtn")
         self.lockin_conn_btn.clicked.connect(self.toggle_lockin_connection)
-        lockin_row.addWidget(self.lockin_conn_btn)
-        layout.addLayout(lockin_row)
+        lockin_mode_row.addWidget(self.lockin_conn_btn)
+        layout.addLayout(lockin_mode_row)
 
         return group
 
@@ -431,15 +461,15 @@ class SMB100AControlGUI(QMainWindow):
         layout.addLayout(cycle_row)
 
         output_row = QHBoxLayout()
-        self.output_checkbox = QCheckBox("RF输出")
-        self.output_checkbox.stateChanged.connect(self.toggle_output)
         self.lf_output_checkbox = QCheckBox("LF输出")
         self.lf_output_checkbox.stateChanged.connect(self.toggle_lf_output)
         self.fm_mod_checkbox = QCheckBox("FM调制")
         self.fm_mod_checkbox.stateChanged.connect(self.toggle_fm_mod)
-        output_row.addWidget(self.output_checkbox)
+        self.output_checkbox = QCheckBox("RF输出")
+        self.output_checkbox.stateChanged.connect(self.toggle_output)
         output_row.addWidget(self.lf_output_checkbox)
         output_row.addWidget(self.fm_mod_checkbox)
+        output_row.addWidget(self.output_checkbox)
         output_row.addStretch()
         layout.addLayout(output_row)
         return group
@@ -653,7 +683,26 @@ class SMB100AControlGUI(QMainWindow):
             "background-color: #f44336; color: white;" if connected else "background-color: #4CAF50; color: white;"
         )
         if hasattr(self, "lockin_status_label"):
-            self.lockin_status_label.setText("OE1022D: 已连接" if connected else "OE1022D: 未连接")
+            mode = self.lockin_mode_combo.currentText()
+            if connected:
+                self.lockin_status_label.setText(f"OE1022D: 已连接({mode})")
+                self.lockin_status_label.setStyleSheet(
+                    "QLabel#statusPill { font-size: 13px; font-weight: bold; color: #ffffff; "
+                    "padding: 8px; border-radius: 6px; background-color: #4CAF50; border: 1px solid #3a3a3a; }"
+                )
+            else:
+                self.lockin_status_label.setText("OE1022D: 未连接")
+                self.lockin_status_label.setStyleSheet(
+                    "QLabel#statusPill { font-size: 13px; font-weight: bold; color: #ffffff; "
+                    "padding: 8px; border-radius: 6px; background-color: #252525; border: 1px solid #3a3a3a; }"
+                )
+        # 连接时禁用模式切换和端口选择
+        if hasattr(self, "lockin_mode_combo"):
+            self.lockin_mode_combo.setEnabled(not connected)
+        if hasattr(self, "lockin_rs232_widget"):
+            self.lockin_rs232_widget.setEnabled(not connected)
+        if hasattr(self, "lockin_usb_widget"):
+            self.lockin_usb_widget.setEnabled(not connected)
         self.start_query_btn.setEnabled(connected and self.lockin_worker is None and self.experiment_worker is None)
         self.stop_query_btn.setEnabled(connected and self.lockin_worker is not None)
         if not connected:
@@ -704,6 +753,13 @@ class SMB100AControlGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "请输入VISA地址")
             return
         self.smb_conn_btn.setEnabled(False)
+        # 显示连接中状态（橙色）
+        if hasattr(self, "smb_status_label"):
+            self.smb_status_label.setText("SMB100A: 连接中...")
+            self.smb_status_label.setStyleSheet(
+                "QLabel#statusPill { font-size: 13px; font-weight: bold; color: #ffffff; "
+                "padding: 8px; border-radius: 6px; background-color: #FFA500; border: 1px solid #3a3a3a; }"
+            )
         try:
             self.log_message("信号源", f"连接 {address}")
             idn = self.smb.connect(address)
@@ -711,6 +767,12 @@ class SMB100AControlGUI(QMainWindow):
             self.get_current_settings()
         except Exception as exc:
             self.log_message("信号源", f"连接失败: {exc}")
+            if hasattr(self, "smb_status_label"):
+                self.smb_status_label.setText("SMB100A: 连接失败")
+                self.smb_status_label.setStyleSheet(
+                    "QLabel#statusPill { font-size: 13px; font-weight: bold; color: #ffffff; "
+                    "padding: 8px; border-radius: 6px; background-color: #f44336; border: 1px solid #3a3a3a; }"
+                )
             QMessageBox.critical(self, "连接错误", str(exc))
             self.smb.close(rf_off=False)
         finally:
@@ -734,19 +796,42 @@ class SMB100AControlGUI(QMainWindow):
             self.connect_lockin()
 
     def connect_lockin(self) -> None:
-        port = self.lockin_port_combo.currentText().strip()
-        baud = int(self.lockin_baud_combo.currentText())
+        mode = self.lockin_mode_combo.currentText()
         self.lockin_conn_btn.setEnabled(False)
+
+        # 显示连接中状态（橙色）
+        if hasattr(self, "lockin_status_label"):
+            self.lockin_status_label.setText("OE1022D: 连接中...")
+            self.lockin_status_label.setStyleSheet(
+                "QLabel#statusPill { font-size: 13px; font-weight: bold; color: #ffffff; "
+                "padding: 8px; border-radius: 6px; background-color: #FFA500; border: 1px solid #3a3a3a; }"
+            )
+
         try:
-            self.log_message("锁相放大器", f"连接 {port} @ {baud}")
-            self.lockin.connect(port, baud)
+            if mode == "USB":
+                port = self.lockin_usb_combo.currentText().strip()
+                self.log_message("锁相放大器", f"USB 连接 {port}")
+                self.lockin.connect_usb(port)
+            else:
+                port = self.lockin_port_combo.currentText().strip()
+                baud = int(self.lockin_baud_combo.currentText())
+                self.log_message("锁相放大器", f"RS232 连接 {port} @ {baud}")
+                self.lockin.connect_rs232(port, baud)
+
             self.log_message("锁相放大器", "连接成功")
             response = self.lockin.identify()
             if response.strip():
-                self.log_message("锁相放大器", f"响应: {response.strip()}")
+                self.log_message("锁相放大器", f"设备: {response.strip()}")
             self.start_query()
+
         except Exception as exc:
             self.log_message("锁相放大器", f"连接失败: {exc}")
+            if hasattr(self, "lockin_status_label"):
+                self.lockin_status_label.setText("OE1022D: 连接失败")
+                self.lockin_status_label.setStyleSheet(
+                    "QLabel#statusPill { font-size: 13px; font-weight: bold; color: #ffffff; "
+                    "padding: 8px; border-radius: 6px; background-color: #f44336; border: 1px solid #3a3a3a; }"
+                )
             QMessageBox.critical(self, "连接错误", str(exc))
             self.lockin.close()
         finally:
@@ -777,6 +862,39 @@ class SMB100AControlGUI(QMainWindow):
             self.log_message("锁相放大器", f"找到 {len(available)} 个串口")
         else:
             QMessageBox.warning(self, "串口扫描", "未找到可用串口")
+
+    def on_lockin_mode_changed(self, mode: str) -> None:
+        """切换 RS232 / USB 模式"""
+        if mode == "USB":
+            self.lockin_rs232_widget.setVisible(False)
+            self.lockin_usb_widget.setVisible(True)
+        else:
+            self.lockin_rs232_widget.setVisible(True)
+            self.lockin_usb_widget.setVisible(False)
+
+    def scan_usb_devices(self) -> None:
+        """扫描 USB 设备（显示为 COM 端口的 USB 设备）"""
+        self.log_message("锁相放大器", "扫描 USB 设备...")
+        available: list[str] = []
+        import serial.tools.list_ports
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            # 检查是否为 USB 设备
+            if "USB" in p.description.upper() or "FTDI" in p.description.upper():
+                available.append(p.device)
+        if available:
+            self.lockin_usb_combo.clear()
+            self.lockin_usb_combo.addItems(available)
+            self.lockin_usb_combo.setCurrentText(available[0])
+            self.log_message("锁相放大器", f"找到 {len(available)} 个 USB 设备: {', '.join(available)}")
+        else:
+            # 如果没找到 USB 设备，显示所有 COM 端口
+            all_ports = [p.device for p in ports]
+            self.lockin_usb_combo.clear()
+            self.lockin_usb_combo.addItems(all_ports)
+            if all_ports:
+                self.lockin_usb_combo.setCurrentText(all_ports[0])
+            QMessageBox.warning(self, "USB 扫描", f"未找到专用 USB 端口，显示所有 COM 端口: {', '.join(all_ports) if all_ports else '无'}")
 
     def get_current_settings(self) -> None:
         try:
@@ -1261,8 +1379,10 @@ class SMB100AControlGUI(QMainWindow):
                 "interval_ms": self.cycle_interval_input.text(),
             },
             "lockin": {
+                "mode": self.lockin_mode_combo.currentText(),
                 "port": self.lockin_port_combo.currentText(),
                 "baud": self.lockin_baud_combo.currentText(),
+                "usb_port": self.lockin_usb_combo.currentText(),
                 "query_interval_ms": self.query_interval_input.text(),
                 "record_file": self.record_file_input.text(),
             },
@@ -1284,8 +1404,12 @@ class SMB100AControlGUI(QMainWindow):
         self.cycle_count_input.setText(str(cycle.get("count", "0")))
         self.cycle_interval_input.setText(str(cycle.get("interval_ms", "200")))
         lockin = payload.get("lockin", {})
+        mode = lockin.get("mode", "RS232")
+        self.lockin_mode_combo.setCurrentText(mode)
+        self.on_lockin_mode_changed(mode)  # 更新 UI 显示
         self.lockin_port_combo.setCurrentText(str(lockin.get("port", self.lockin_port_combo.currentText())))
         self.lockin_baud_combo.setCurrentText(str(lockin.get("baud", self.lockin_baud_combo.currentText())))
+        self.lockin_usb_combo.setCurrentText(str(lockin.get("usb_port", self.lockin_usb_combo.currentText())))
         self.query_interval_input.setText(str(lockin.get("query_interval_ms", self.query_interval_input.text())))
         self.record_file_input.setText(str(lockin.get("record_file", self.record_file_input.text())))
         experiment = payload.get("experiment", {})
