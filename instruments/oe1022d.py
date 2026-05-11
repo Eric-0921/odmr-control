@@ -25,6 +25,30 @@ class LockinChannel(IntEnum):
     BOTH = 3
 
 
+class ReferenceSource(IntEnum):
+    EXTERNAL = 0
+    INTERNAL = 1
+    INTERNAL_SWEEP = 2
+
+
+class ReferenceSlope(IntEnum):
+    TTL_RISING = 0
+    TTL_FALLING = 1
+    SINE_ZERO_CROSSING = 2
+
+
+@dataclass
+class LockinChannelStatus:
+    channel: LockinChannel
+    reference_source: ReferenceSource | None = None
+    reference_slope: ReferenceSlope | None = None
+    reference_phase_deg: float | None = None
+    pll_locked: bool | None = None
+    input_overload: bool | None = None
+    gain_overload: bool | None = None
+    sample_points: int | None = None
+
+
 class LockinSampleItem(IntEnum):
     R = 0
     X = 1
@@ -129,6 +153,83 @@ class OE1022DController:
     def set_sample_mode(self, channel: int | LockinChannel, loop: bool = False) -> None:
         self.write_command(f"SPRMD {int(channel)},{1 if loop else 0}", wait_s=0.02)
 
+    def set_reference_source(self, channel: int | LockinChannel, source: int | ReferenceSource) -> None:
+        channel = normalize_single_channel(channel)
+        self.write_command(f"FMODD {int(channel)},{int(source)}", wait_s=0.02)
+
+    def query_reference_source(self, channel: int | LockinChannel) -> ReferenceSource | None:
+        channel = normalize_single_channel(channel)
+        response = self.exchange(f"FMODD? {int(channel)}", wait_s=0.05)
+        value = parse_last_int(response)
+        try:
+            return ReferenceSource(value) if value is not None else None
+        except ValueError:
+            return None
+
+    def set_reference_slope(self, channel: int | LockinChannel, slope: int | ReferenceSlope) -> None:
+        channel = normalize_single_channel(channel)
+        self.write_command(f"RSLPD {int(channel)},{int(slope)}", wait_s=0.02)
+
+    def query_reference_slope(self, channel: int | LockinChannel) -> ReferenceSlope | None:
+        channel = normalize_single_channel(channel)
+        response = self.exchange(f"RSLPD? {int(channel)}", wait_s=0.05)
+        value = parse_last_int(response)
+        try:
+            return ReferenceSlope(value) if value is not None else None
+        except ValueError:
+            return None
+
+    def set_reference_phase_deg(self, channel: int | LockinChannel, phase_deg: float) -> None:
+        channel = normalize_single_channel(channel)
+        phase = float(phase_deg)
+        if phase < -180 or phase > 180:
+            raise ValueError("OE1022D reference phase must be between -180 and 180 degrees")
+        self.write_command(f"PHASD {int(channel)},{phase:.2f}", wait_s=0.02)
+
+    def query_reference_phase_deg(self, channel: int | LockinChannel) -> float | None:
+        channel = normalize_single_channel(channel)
+        response = self.exchange(f"PHASD? {int(channel)}", wait_s=0.05)
+        values = parse_float_list(response)
+        return values[-1] if values else None
+
+    def query_pll_locked(self, channel: int | LockinChannel) -> bool:
+        channel = normalize_single_channel(channel)
+        response = self.exchange(f"*PLLD? {int(channel)}", wait_s=0.05)
+        return bool(parse_first_int(response))
+
+    def query_input_overload(self, channel: int | LockinChannel) -> bool:
+        channel = normalize_single_channel(channel)
+        response = self.exchange(f"INOVD? {int(channel)}", wait_s=0.05)
+        return bool(parse_first_int(response))
+
+    def query_gain_overload(self, channel: int | LockinChannel) -> bool:
+        channel = normalize_single_channel(channel)
+        response = self.exchange(f"GNOVD? {int(channel)}", wait_s=0.05)
+        return bool(parse_first_int(response))
+
+    def configure_external_sine_reference(
+        self,
+        channel: int | LockinChannel,
+        phase_deg: float = 0.0,
+    ) -> None:
+        channel = normalize_single_channel(channel)
+        self.set_reference_source(channel, ReferenceSource.EXTERNAL)
+        self.set_reference_slope(channel, ReferenceSlope.SINE_ZERO_CROSSING)
+        self.set_reference_phase_deg(channel, phase_deg)
+
+    def query_channel_status(self, channel: int | LockinChannel, include_sample_points: bool = False) -> LockinChannelStatus:
+        channel = normalize_single_channel(channel)
+        status = LockinChannelStatus(channel=channel)
+        status.reference_source = self.query_reference_source(channel)
+        status.reference_slope = self.query_reference_slope(channel)
+        status.reference_phase_deg = self.query_reference_phase_deg(channel)
+        status.pll_locked = self.query_pll_locked(channel)
+        status.input_overload = self.query_input_overload(channel)
+        status.gain_overload = self.query_gain_overload(channel)
+        if include_sample_points:
+            status.sample_points = self.query_sample_points(channel)
+        return status
+
     def reset_sampling(self, channel: int | LockinChannel = LockinChannel.BOTH) -> None:
         self.write_command(f"RESTD {int(channel)}", wait_s=0.05)
 
@@ -196,3 +297,19 @@ def parse_first_int(response: str) -> int:
         return int(value)
     cleaned = "".join(ch for ch in response if ch.isdigit() or ch in "+-")
     return int(cleaned) if cleaned else 0
+
+
+def parse_last_int(response: str) -> int | None:
+    values = parse_float_list(response)
+    if values:
+        return int(values[-1])
+    cleaned = "".join(ch if ch.isdigit() or ch in "+-," else "," for ch in response)
+    parts = [part for part in cleaned.split(",") if part.strip()]
+    return int(parts[-1]) if parts else None
+
+
+def normalize_single_channel(channel: int | LockinChannel) -> LockinChannel:
+    value = LockinChannel(int(channel))
+    if value == LockinChannel.BOTH:
+        raise ValueError("This OE1022D command requires a single channel, not BOTH")
+    return value

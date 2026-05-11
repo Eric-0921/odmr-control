@@ -7,7 +7,7 @@ from dataclasses import asdict
 from typing import Any
 
 from PyQt5.QtCore import QThread, QTimer, Qt
-from PyQt5.QtGui import QIntValidator
+from PyQt5.QtGui import QIntValidator, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,6 +25,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QShortcut,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -38,16 +40,13 @@ import serial
 
 from config.presets import PresetStore
 from data.recorder import DataRecorder
-from instruments.oe1022d import LockinSample, OE1022DController
+from instruments.oe1022d import LockinChannel, LockinSample, OE1022DController, ReferenceSlope, ReferenceSource
 from instruments.smb100a import (
     SMB100AController,
     SMBParameters,
     format_float,
     format_frequency,
-    parse_frequency_to_hz,
-    parse_power_dbm,
-    parse_time_to_ms,
-    parse_voltage_to_mv,
+    evaluate_power_safety,
 )
 from workers.experiment_worker import ExperimentConfig, ExperimentWorker
 from workers.lockin_worker import LockinWorker
@@ -73,6 +72,47 @@ FIELD_LABELS = {
     "lf_output": "LF输出",
     "fm_state": "FM调制",
 }
+
+
+def refresh_style(widget: QWidget) -> None:
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+    widget.update()
+
+
+def set_visual_state(widget: QWidget, state: str) -> None:
+    widget.setProperty("state", state)
+    refresh_style(widget)
+
+
+def show_warning(parent: QWidget, title: str, message: str) -> None:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Warning)
+    box.setWindowTitle(title)
+    box.setText(message)
+    box.addButton("确认 / OK", QMessageBox.AcceptRole)
+    box.exec_()
+
+
+def show_critical(parent: QWidget, title: str, message: str) -> None:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Critical)
+    box.setWindowTitle(title)
+    box.setText(message)
+    box.addButton("确认 / OK", QMessageBox.AcceptRole)
+    box.exec_()
+
+
+def confirm_question(parent: QWidget, title: str, message: str, default_yes: bool = False) -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Question)
+    box.setWindowTitle(title)
+    box.setText(message)
+    yes_button = box.addButton("确认 / Yes", QMessageBox.YesRole)
+    no_button = box.addButton("取消 / No", QMessageBox.NoRole)
+    box.setDefaultButton(yes_button if default_yes else no_button)
+    box.exec_()
+    return box.clickedButton() == yes_button
 
 
 class ParameterReviewDialog(QDialog):
@@ -101,9 +141,9 @@ class ParameterReviewDialog(QDialog):
         layout.addWidget(table)
 
         buttons = QHBoxLayout()
-        apply_btn = QPushButton("用界面参数覆盖设备并开始扫频")
-        sync_btn = QPushButton("同步设备参数到界面并取消扫频")
-        cancel_btn = QPushButton("取消")
+        apply_btn = QPushButton("应用界面参数并开始扫频 / Apply & Start RF Frequency Sweep")
+        sync_btn = QPushButton("同步设备参数并取消 / Sync Device & Cancel")
+        cancel_btn = QPushButton("取消 / Cancel")
         apply_btn.setDefault(True)
         apply_btn.clicked.connect(self._apply)
         sync_btn.clicked.connect(self._sync)
@@ -120,6 +160,69 @@ class ParameterReviewDialog(QDialog):
     def _sync(self) -> None:
         self.choice = self.SYNC_AND_CANCEL
         self.accept()
+
+
+class UnitValueInput(QWidget):
+    FACTORS = {
+        "frequency": {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6, "GHz": 1e9},
+        "time": {"ms": 1.0, "s": 1000.0},
+        "voltage": {"mV": 1.0, "V": 1000.0},
+        "power": {"dBm": 1.0},
+    }
+
+    def __init__(self, kind: str, default_value: str, default_unit: str, width: int = 96, parent=None) -> None:
+        super().__init__(parent)
+        self.kind = kind
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self.value_edit = QLineEdit()
+        self.value_edit.setFixedWidth(width)
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(list(self.FACTORS[kind]))
+        self.unit_combo.setCurrentText(default_unit)
+        self.unit_combo.setFixedWidth(70)
+        layout.addWidget(self.value_edit)
+        layout.addWidget(self.unit_combo)
+        self.setText(default_value)
+
+    def text(self) -> str:
+        return f"{self.value_edit.text().strip()} {self.unit_combo.currentText()}"
+
+    def setText(self, text: str) -> None:
+        value, unit = split_value_unit(text, self.kind, self.unit_combo.currentText())
+        self.value_edit.setText(value)
+        if unit:
+            self.unit_combo.setCurrentText(unit)
+
+    def base_value(self) -> float | None:
+        text = self.value_edit.text().strip()
+        if not text:
+            return None
+        return float(text) * self.FACTORS[self.kind][self.unit_combo.currentText()]
+
+    def set_warning(self, warning: bool) -> None:
+        style = "color: #ff6b6b; font-weight: 700;" if warning else ""
+        self.value_edit.setStyleSheet(style)
+        self.unit_combo.setStyleSheet(style)
+
+    def setEnabled(self, enabled: bool) -> None:
+        super().setEnabled(enabled)
+        self.value_edit.setEnabled(enabled)
+        self.unit_combo.setEnabled(enabled)
+
+
+def split_value_unit(text: str, kind: str, fallback_unit: str) -> tuple[str, str]:
+    raw = str(text).strip()
+    if not raw:
+        return "", fallback_unit
+    units = UnitValueInput.FACTORS[kind]
+    upper = raw.upper().replace(" ", "")
+    for unit in sorted(units, key=len, reverse=True):
+        if upper.endswith(unit.upper()):
+            value = raw[: -len(unit)].strip()
+            return value, unit
+    return raw, fallback_unit
 
 
 class SMB100AControlGUI(QMainWindow):
@@ -151,6 +254,7 @@ class SMB100AControlGUI(QMainWindow):
 
         self.init_ui()
         self.refresh_presets()
+        self._install_keyboard_shortcuts()
 
     def init_ui(self) -> None:
         self.setWindowTitle("信号源 & 锁相放大器 控制面板")
@@ -193,25 +297,26 @@ class SMB100AControlGUI(QMainWindow):
         layout.addWidget(self._build_source_control_group())
         layout.addWidget(self._build_params_group())
         layout.addStretch()
-        return page
+        return self._scroll_page(page)
 
     def _build_lockin_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(self._build_live_data_group())
         layout.addWidget(self._build_lockin_control_group())
+        layout.addWidget(self._build_lockin_reference_group())
         record_group = QGroupBox("低频监视记录")
         record_layout = QVBoxLayout(record_group)
         record_layout.addLayout(self._build_record_row())
         layout.addWidget(record_group)
         layout.addStretch()
-        return page
+        return self._scroll_page(page)
 
     def _build_log_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(self._build_log_group())
-        return page
+        return self._scroll_page(page)
 
     def _build_experiment_page(self) -> QWidget:
         page = QWidget()
@@ -221,7 +326,7 @@ class SMB100AControlGUI(QMainWindow):
         grid = QGridLayout(settings)
         self.experiment_name_input = QLineEdit("odmr")
         self.capture_dir_input = QLineEdit(str(Path("captures").resolve()))
-        self.browse_capture_dir_btn = QPushButton("浏览")
+        self.browse_capture_dir_btn = QPushButton("浏览 / Browse")
         self.browse_capture_dir_btn.clicked.connect(self.browse_capture_dir)
         self.settle_ms_input = QLineEdit("20")
         self.settle_ms_input.setValidator(QIntValidator(0, 600000))
@@ -229,9 +334,9 @@ class SMB100AControlGUI(QMainWindow):
         self.lockin_sample_interval_input.setValidator(QIntValidator(1, 100000))
         self.lockin_sample_count_input = QLineEdit("1000")
         self.lockin_sample_count_input.setValidator(QIntValidator(1, 16384))
-        self.capture_channel_a_checkbox = QCheckBox("Channel A")
+        self.capture_channel_a_checkbox = QCheckBox("通道 A / Channel A")
         self.capture_channel_a_checkbox.setChecked(True)
-        self.capture_channel_b_checkbox = QCheckBox("Channel B")
+        self.capture_channel_b_checkbox = QCheckBox("通道 B / Channel B")
         self.capture_channel_b_checkbox.setChecked(True)
 
         grid.addWidget(QLabel("实验名称:"), 0, 0)
@@ -254,10 +359,10 @@ class SMB100AControlGUI(QMainWindow):
         self.experiment_hint_label = QLabel("频率范围、步进、功率、RF/LF/FM 使用“微波源”页当前界面参数。")
         timing_layout.addWidget(self.experiment_hint_label)
         control_row = QHBoxLayout()
-        self.start_experiment_btn = QPushButton("开始同步采集")
+        self.start_experiment_btn = QPushButton("开始同步采集 / Start Synchronized Capture")
         self.start_experiment_btn.setObjectName("startExperimentBtn")
         self.start_experiment_btn.clicked.connect(self.start_experiment)
-        self.stop_experiment_btn = QPushButton("停止采集")
+        self.stop_experiment_btn = QPushButton("停止采集 / Stop Capture")
         self.stop_experiment_btn.setObjectName("stopExperimentBtn")
         self.stop_experiment_btn.clicked.connect(self.stop_experiment)
         self.experiment_progress = QProgressBar()
@@ -272,7 +377,31 @@ class SMB100AControlGUI(QMainWindow):
         timing_layout.addWidget(self.experiment_detail_label)
         layout.addWidget(timing)
         layout.addStretch()
-        return page
+        return self._scroll_page(page)
+
+    def _scroll_page(self, content: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(content)
+        return scroll
+
+    def _install_keyboard_shortcuts(self) -> None:
+        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.apply_parameters)
+        QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self.apply_parameters)
+        QShortcut(QKeySequence("F5"), self, activated=self.start_experiment)
+        for widget in [
+            self.power_input,
+            self.start_freq_input,
+            self.stop_freq_input,
+            self.step_input,
+            self.dwell_input,
+            self.lf_freq_input,
+            self.lf_amp_input,
+            self.fm_dev_input,
+            self.cw_freq_input,
+        ]:
+            widget.value_edit.returnPressed.connect(self.apply_parameters)
 
     def _build_plot_page(self) -> QWidget:
         page = QWidget()
@@ -295,14 +424,21 @@ class SMB100AControlGUI(QMainWindow):
             return page
 
         amp_plot = pg.PlotWidget()
-        amp_plot.setBackground("#252525")
+        amp_plot.setBackground("#181b1f")
+        amp_plot.showGrid(x=True, y=True, alpha=0.18)
         amp_plot.addLegend()
         amp_plot.setLabel("left", "Amplitude", units="mV")
         amp_plot.setLabel("bottom", "Sample")
         phase_plot = pg.PlotWidget()
-        phase_plot.setBackground("#252525")
+        phase_plot.setBackground("#181b1f")
+        phase_plot.showGrid(x=True, y=True, alpha=0.18)
         phase_plot.setLabel("left", "Theta", units="deg")
         phase_plot.setLabel("bottom", "Sample")
+        for plot in [amp_plot, phase_plot]:
+            plot.getAxis("left").setTextPen("#c8d0d8")
+            plot.getAxis("bottom").setTextPen("#c8d0d8")
+            plot.getAxis("left").setPen(pg.mkPen("#3b424a"))
+            plot.getAxis("bottom").setPen(pg.mkPen("#3b424a"))
         curves = {
             "X_mV": amp_plot.plot(pen=pg.mkPen("#64b5f6", width=1.5), name="X"),
             "Y_mV": amp_plot.plot(pen=pg.mkPen("#81c784", width=1.5), name="Y"),
@@ -322,7 +458,7 @@ class SMB100AControlGUI(QMainWindow):
         smb_row.addWidget(QLabel("信号源 VISA:"))
         self.smb_address_input = QLineEdit("USB0::0x0AAD::0x0054::106789::INSTR")
         smb_row.addWidget(self.smb_address_input, 1)
-        self.smb_conn_btn = QPushButton("连接")
+        self.smb_conn_btn = QPushButton("连接 / Connect")
         self.smb_conn_btn.setObjectName("connBtn")
         self.smb_conn_btn.clicked.connect(self.toggle_smb_connection)
         smb_row.addWidget(self.smb_conn_btn)
@@ -339,10 +475,10 @@ class SMB100AControlGUI(QMainWindow):
         self.lockin_baud_combo.addItems(["9600", "19200", "38400", "57600", "115200", "921600"])
         self.lockin_baud_combo.setCurrentText("921600")
         lockin_row.addWidget(self.lockin_baud_combo)
-        self.scan_ports_btn = QPushButton("扫描串口")
+        self.scan_ports_btn = QPushButton("扫描 RS232/COM 口 / Scan RS232 COM Ports")
         self.scan_ports_btn.clicked.connect(self.scan_serial_ports)
         lockin_row.addWidget(self.scan_ports_btn)
-        self.lockin_conn_btn = QPushButton("连接")
+        self.lockin_conn_btn = QPushButton("连接 / Connect")
         self.lockin_conn_btn.setObjectName("connBtn")
         self.lockin_conn_btn.clicked.connect(self.toggle_lockin_connection)
         lockin_row.addWidget(self.lockin_conn_btn)
@@ -405,10 +541,10 @@ class SMB100AControlGUI(QMainWindow):
         layout = QVBoxLayout(group)
 
         sweep_row = QHBoxLayout()
-        self.start_sweep_btn = QPushButton("开始扫频")
+        self.start_sweep_btn = QPushButton("开始 RF 频率扫频 / Start RF Frequency Sweep")
         self.start_sweep_btn.setObjectName("startSweepBtn")
         self.start_sweep_btn.clicked.connect(self.start_sweep)
-        self.stop_sweep_btn = QPushButton("停止扫频")
+        self.stop_sweep_btn = QPushButton("停止扫频 / Stop Sweep")
         self.stop_sweep_btn.setObjectName("stopSweepBtn")
         self.stop_sweep_btn.clicked.connect(lambda: self.stop_sweep(manual=True))
         self.sweep_status_label = QLabel("扫频已停止")
@@ -431,15 +567,19 @@ class SMB100AControlGUI(QMainWindow):
         layout.addLayout(cycle_row)
 
         output_row = QHBoxLayout()
-        self.output_checkbox = QCheckBox("RF输出")
+        self.output_checkbox = QCheckBox("RF 输出 / RF Output")
         self.output_checkbox.stateChanged.connect(self.toggle_output)
-        self.lf_output_checkbox = QCheckBox("LF输出")
+        self.lf_output_checkbox = QCheckBox("LF 输出 / LF Output")
         self.lf_output_checkbox.stateChanged.connect(self.toggle_lf_output)
-        self.fm_mod_checkbox = QCheckBox("FM调制")
+        self.fm_mod_checkbox = QCheckBox("FM 调制 / FM Modulation")
         self.fm_mod_checkbox.stateChanged.connect(self.toggle_fm_mod)
+        self.power_override_checkbox = QCheckBox("功率 Override")
+        self.power_override_checkbox.setToolTip("开启后允许发送 -20..+18 dBm 之外的功率；仍会记录高危日志和设备错误。")
+        self.power_override_checkbox.stateChanged.connect(self._update_power_warning)
         output_row.addWidget(self.output_checkbox)
         output_row.addWidget(self.lf_output_checkbox)
         output_row.addWidget(self.fm_mod_checkbox)
+        output_row.addWidget(self.power_override_checkbox)
         output_row.addStretch()
         layout.addLayout(output_row)
         return group
@@ -447,14 +587,54 @@ class SMB100AControlGUI(QMainWindow):
     def _build_lockin_control_group(self) -> QGroupBox:
         group = QGroupBox("锁相控制")
         layout = QHBoxLayout(group)
-        self.start_query_btn = QPushButton("开始查询")
+        self.start_query_btn = QPushButton("开始 SNAPD 查询 / Start SNAPD Query")
         self.start_query_btn.setObjectName("startQueryBtn")
         self.start_query_btn.clicked.connect(self.start_query)
-        self.stop_query_btn = QPushButton("停止查询")
+        self.stop_query_btn = QPushButton("停止查询 / Stop Query")
         self.stop_query_btn.setObjectName("stopQueryBtn")
         self.stop_query_btn.clicked.connect(self.stop_query)
         layout.addWidget(self.start_query_btn)
         layout.addWidget(self.stop_query_btn)
+        return group
+
+    def _build_lockin_reference_group(self) -> QGroupBox:
+        group = QGroupBox("OE1022D 参考信号 / PLL")
+        grid = QGridLayout(group)
+        self.oe_ref_channel_combo = QComboBox()
+        self.oe_ref_channel_combo.addItems(["A", "B"])
+        self.oe_ref_source_combo = QComboBox()
+        self.oe_ref_source_combo.addItem("外部参考 / External", ReferenceSource.EXTERNAL)
+        self.oe_ref_source_combo.addItem("内部参考 / Internal", ReferenceSource.INTERNAL)
+        self.oe_ref_source_combo.addItem("内部扫频 / Internal Sweep", ReferenceSource.INTERNAL_SWEEP)
+        self.oe_ref_slope_combo = QComboBox()
+        self.oe_ref_slope_combo.addItem("TTL 上升沿", ReferenceSlope.TTL_RISING)
+        self.oe_ref_slope_combo.addItem("TTL 下降沿", ReferenceSlope.TTL_FALLING)
+        self.oe_ref_slope_combo.addItem("正弦过零 / Sine Zero Crossing", ReferenceSlope.SINE_ZERO_CROSSING)
+        self.oe_ref_slope_combo.setCurrentIndex(2)
+        self.oe_ref_phase_input = QLineEdit("0")
+        self.oe_ref_phase_input.setFixedWidth(72)
+        self.oe_ref_apply_btn = QPushButton("应用参考配置 / Apply")
+        self.oe_ref_apply_btn.setObjectName("paramBtn")
+        self.oe_ref_apply_btn.clicked.connect(self.apply_lockin_reference)
+        self.oe_ref_query_btn = QPushButton("查询状态 / Query")
+        self.oe_ref_query_btn.clicked.connect(self.query_lockin_reference)
+        self.oe_ref_preflight_btn = QPushButton("CH-B PLL Preflight")
+        self.oe_ref_preflight_btn.clicked.connect(self.preflight_ch_b_reference)
+        self.oe_ref_status_label = QLabel("未查询")
+        self.oe_ref_status_label.setObjectName("experimentDetail")
+
+        grid.addWidget(QLabel("通道:"), 0, 0)
+        grid.addWidget(self.oe_ref_channel_combo, 0, 1)
+        grid.addWidget(QLabel("参考源:"), 0, 2)
+        grid.addWidget(self.oe_ref_source_combo, 0, 3)
+        grid.addWidget(QLabel("外部参考类型:"), 1, 0)
+        grid.addWidget(self.oe_ref_slope_combo, 1, 1)
+        grid.addWidget(QLabel("相位(°):"), 1, 2)
+        grid.addWidget(self.oe_ref_phase_input, 1, 3)
+        grid.addWidget(self.oe_ref_apply_btn, 2, 0)
+        grid.addWidget(self.oe_ref_query_btn, 2, 1)
+        grid.addWidget(self.oe_ref_preflight_btn, 2, 2)
+        grid.addWidget(self.oe_ref_status_label, 3, 0, 1, 4)
         return group
 
     def _build_params_group(self) -> QGroupBox:
@@ -462,35 +642,41 @@ class SMB100AControlGUI(QMainWindow):
         layout = QVBoxLayout(group)
 
         grid = QGridLayout()
-        input_width = 105
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        input_width = 92
 
-        self.power_input = self._add_param(grid, 0, 0, "功率(dBm):", "-30", self.set_power, input_width)
-        self.start_freq_input = self._add_param(grid, 0, 3, "起始频率:", "2.82 GHz", self.set_start_frequency, input_width)
-        self.stop_freq_input = self._add_param(grid, 0, 6, "终止频率:", "2.92 GHz", self.set_stop_frequency, input_width)
-        self.step_input = self._add_param(grid, 1, 0, "扫频步进:", "500 kHz", self.set_step, input_width)
-        self.dwell_input = self._add_param(grid, 1, 3, "驻留(ms):", "500", self.set_dwell, input_width)
-        self.lf_freq_input = self._add_param(grid, 1, 6, "LF频率(Hz):", "500", self.set_lf_frequency, input_width)
-        self.lf_amp_input = self._add_param(grid, 2, 0, "LF幅度(mV):", "137", self.set_lf_amplitude, input_width)
+        self.power_input = self._add_unit_param(grid, 0, 0, "功率:", "-20", "dBm", "power", self.set_power, input_width)
+        self.start_freq_input = self._add_unit_param(grid, 1, 0, "起始频率:", "2.82", "GHz", "frequency", self.set_start_frequency, input_width)
+        self.stop_freq_input = self._add_unit_param(grid, 2, 0, "终止频率:", "2.92", "GHz", "frequency", self.set_stop_frequency, input_width)
+        self.step_input = self._add_unit_param(grid, 3, 0, "扫频步进:", "500", "kHz", "frequency", self.set_step, input_width)
+        self.dwell_input = self._add_unit_param(grid, 4, 0, "驻留:", "500", "ms", "time", self.set_dwell, input_width)
+        self.lf_freq_input = self._add_unit_param(grid, 0, 4, "LF频率:", "500", "Hz", "frequency", self.set_lf_frequency, input_width)
+        self.lf_amp_input = self._add_unit_param(grid, 1, 4, "LF幅度:", "137", "mV", "voltage", self.set_lf_amplitude, input_width)
 
-        grid.addWidget(QLabel("LF波形:"), 2, 3)
+        grid.addWidget(QLabel("LF波形:"), 2, 4)
         self.lf_shape_combo = QComboBox()
         self.lf_shape_combo.addItems(["SINE", "SQUARE", "TRIANGLE", "SAWTOOTH", "ISAWTOOTH"])
         self.lf_shape_combo.setCurrentText("SQUARE")
-        grid.addWidget(self.lf_shape_combo, 2, 4)
-        self.set_lf_shape_btn = QPushButton("设")
+        grid.addWidget(self.lf_shape_combo, 2, 5)
+        self.set_lf_shape_btn = QPushButton("设置 / Set")
         self.set_lf_shape_btn.setObjectName("paramBtn")
         self.set_lf_shape_btn.clicked.connect(self.set_lf_shape)
-        grid.addWidget(self.set_lf_shape_btn, 2, 5)
+        grid.addWidget(self.set_lf_shape_btn, 2, 6)
 
-        self.fm_dev_input = self._add_param(grid, 2, 6, "FM偏差:", "4E6", self.set_fm_deviation, input_width)
-        self.cw_freq_input = self._add_param(grid, 3, 0, "当前频率:", "2.82 GHz", self.set_cw_frequency, input_width)
+        self.fm_dev_input = self._add_unit_param(grid, 3, 4, "FM偏差:", "4", "MHz", "frequency", self.set_fm_deviation, input_width)
+        self.cw_freq_input = self._add_unit_param(grid, 4, 4, "当前频率:", "2.82", "GHz", "frequency", self.set_cw_frequency, input_width)
+        self.power_warning_label = QLabel("")
+        self.power_warning_label.setObjectName("powerWarning")
+        grid.addWidget(self.power_warning_label, 5, 0, 1, 7)
 
-        self.apply_params_btn = QPushButton("应用所有参数")
+        self.apply_params_btn = QPushButton("应用所有参数 / Apply All Parameters")
         self.apply_params_btn.clicked.connect(self.apply_parameters)
-        grid.addWidget(self.apply_params_btn, 4, 0, 1, 9)
+        grid.addWidget(self.apply_params_btn, 6, 0, 1, 7)
         layout.addLayout(grid)
 
         layout.addLayout(self._build_preset_row())
+        self._update_power_warning()
         return group
 
     def _add_param(self, grid: QGridLayout, row: int, col: int, label: str, default: str, slot, width: int) -> QLineEdit:
@@ -498,11 +684,36 @@ class SMB100AControlGUI(QMainWindow):
         line_edit = QLineEdit(default)
         line_edit.setFixedWidth(width)
         grid.addWidget(line_edit, row, col + 1)
-        button = QPushButton("设")
+        button = QPushButton("设置 / Set")
         button.setObjectName("paramBtn")
         button.clicked.connect(slot)
         grid.addWidget(button, row, col + 2)
         return line_edit
+
+    def _add_unit_param(
+        self,
+        grid: QGridLayout,
+        row: int,
+        col: int,
+        label: str,
+        default: str,
+        unit: str,
+        kind: str,
+        slot,
+        width: int,
+    ) -> UnitValueInput:
+        grid.addWidget(QLabel(label), row, col)
+        value_input = UnitValueInput(kind, default, unit, width)
+        if kind == "power":
+            value_input.value_edit.textChanged.connect(self._update_power_warning)
+            value_input.unit_combo.currentTextChanged.connect(self._update_power_warning)
+        grid.addWidget(value_input, row, col + 1)
+        button = QPushButton("设置 / Set")
+        button.setObjectName("paramBtn")
+        button.setMinimumWidth(72)
+        button.clicked.connect(slot)
+        grid.addWidget(button, row, col + 2)
+        return value_input
 
     def _build_preset_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -510,13 +721,13 @@ class SMB100AControlGUI(QMainWindow):
         self.preset_combo = QComboBox()
         self.preset_combo.setEditable(True)
         row.addWidget(self.preset_combo, 1)
-        self.load_preset_btn = QPushButton("加载")
+        self.load_preset_btn = QPushButton("加载 / Load Preset")
         self.load_preset_btn.clicked.connect(self.load_selected_preset)
-        self.save_preset_btn = QPushButton("保存")
+        self.save_preset_btn = QPushButton("保存 / Save Preset")
         self.save_preset_btn.clicked.connect(self.save_selected_preset)
-        self.save_as_preset_btn = QPushButton("另存为")
+        self.save_as_preset_btn = QPushButton("另存为 / Save As")
         self.save_as_preset_btn.clicked.connect(self.save_preset_as)
-        self.delete_preset_btn = QPushButton("删除")
+        self.delete_preset_btn = QPushButton("删除 / Delete")
         self.delete_preset_btn.clicked.connect(self.delete_selected_preset)
         for button in [self.load_preset_btn, self.save_preset_btn, self.save_as_preset_btn, self.delete_preset_btn]:
             row.addWidget(button)
@@ -528,11 +739,11 @@ class SMB100AControlGUI(QMainWindow):
         self.query_interval_input = QLineEdit("94")
         self.query_interval_input.setValidator(QIntValidator(10, 5000))
         row.addWidget(self.query_interval_input)
-        self.record_data_checkbox = QCheckBox("保存到文件")
+        self.record_data_checkbox = QCheckBox("保存到文件 / Save to File")
         row.addWidget(self.record_data_checkbox)
         self.record_file_input = QLineEdit("lockin_data.csv")
         row.addWidget(self.record_file_input, 1)
-        self.browse_file_btn = QPushButton("浏览")
+        self.browse_file_btn = QPushButton("浏览 / Browse")
         self.browse_file_btn.clicked.connect(self.browse_record_file)
         row.addWidget(self.browse_file_btn)
         return row
@@ -559,9 +770,9 @@ class SMB100AControlGUI(QMainWindow):
 
         clear_row = QHBoxLayout()
         clear_row.addStretch()
-        clear_smb = QPushButton("清空信号源日志")
+        clear_smb = QPushButton("清空 SMB100A 日志 / Clear SMB100A Log")
         clear_smb.clicked.connect(self.smb_info_text.clear)
-        clear_lockin = QPushButton("清空锁相放大器日志")
+        clear_lockin = QPushButton("清空 OE1022D 日志 / Clear OE1022D Log")
         clear_lockin.clicked.connect(self.lockin_info_text.clear)
         clear_row.addWidget(clear_smb)
         clear_row.addWidget(clear_lockin)
@@ -570,46 +781,95 @@ class SMB100AControlGUI(QMainWindow):
 
     def get_stylesheet(self) -> str:
         return """
-            QMainWindow { background-color: #4d4d4d; }
-            QWidget { color: #ffffff; font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+            QMainWindow { background-color: #1b1d20; }
+            QWidget { color: #e7ebef; font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; font-size: 12px; }
             QGroupBox {
-                font-weight: bold; border: 2px solid #3a3a3a; border-radius: 6px;
-                margin-top: 12px; padding-top: 10px; color: #e0e0e0;
+                font-weight: 600; border: 1px solid #3b424a; border-radius: 6px;
+                margin-top: 14px; padding: 12px 10px 10px 10px; color: #eef3f7;
+                background-color: #24282d;
             }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 8px; color: #4CAF50; background-color: #1e1e1e; }
-            QTabWidget::pane { border: 1px solid #3a3a3a; border-radius: 6px; background-color: #4d4d4d; }
-            QTabBar::tab { min-width: 92px; padding: 8px 14px; background-color: #333333; border: 1px solid #3a3a3a; color: #e0e0e0; }
-            QTabBar::tab:selected { background-color: #1f6f8b; color: #ffffff; }
-            QPushButton { min-height: 30px; padding: 6px 12px; border-radius: 5px; font-weight: bold; border: 1px solid #3a3a3a; background-color: #2d2d2d; color: #ffffff; }
-            QPushButton:hover { background-color: #3e3e3e; border: 1px solid #5a5a5a; }
-            QPushButton:pressed { background-color: #111111; padding-top: 8px; padding-bottom: 4px; }
-            QPushButton:disabled { background-color: #666666; color: #bdbdbd; border: 1px solid #555555; }
-            QPushButton#connBtn { background-color: #4CAF50; color: white; border: none; }
-            QPushButton#startSweepBtn { background-color: #2196F3; color: white; border: none; }
-            QPushButton#stopSweepBtn { background-color: #FF9800; color: white; border: none; }
-            QPushButton#paramBtn { background-color: #4CAF50; color: white; border: none; }
-            QPushButton#startQueryBtn { background-color: #FF5722; color: white; border: none; }
-            QPushButton#stopQueryBtn { background-color: #757575; color: white; border: none; }
-            QPushButton#startExperimentBtn { background-color: #1565C0; color: white; border: none; }
-            QPushButton#stopExperimentBtn { background-color: #C62828; color: white; border: none; }
-            QLineEdit, QComboBox { padding: 4px; border: 1px solid #3a3a3a; border-radius: 4px; background-color: #2d2d2d; color: #ffffff; selection-background-color: #4CAF50; }
-            QTextEdit { font-family: Consolas, "Courier New", monospace; font-size: 11px; background-color: #252525; border: 1px solid #3a3a3a; color: #d0d0d0; }
-            QLabel#freqDisplay { font-size: 22px; font-weight: bold; color: #64b5f6; padding: 8px; border: 1px solid #64b5f6; border-radius: 10px; background-color: #252525; }
-            QLabel#lockinDataDisplay { font-size: 14px; font-weight: bold; color: #64b5f6; padding: 6px; border: 1px solid #3a3a3a; border-radius: 5px; background-color: #252525; }
-            QLabel#dataCountLabel { font-weight: bold; color: #81c784; font-size: 13px; }
-            QLabel#sweepStatusLabel { font-size: 13px; font-weight: bold; color: #ffffff; padding: 5px 10px; border-radius: 15px; background-color: #555555; }
-            QLabel#statusPill, QLabel#experimentDetail { font-size: 13px; font-weight: bold; color: #ffffff; padding: 8px; border-radius: 6px; background-color: #252525; border: 1px solid #3a3a3a; }
-            QProgressBar { border: 1px solid #3a3a3a; border-radius: 5px; text-align: center; background-color: #252525; min-height: 26px; }
-            QProgressBar::chunk { background-color: #1f9d55; border-radius: 4px; }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 8px; color: #8fb8d8; background-color: #1b1d20; }
+            QTabWidget::pane { border: 1px solid #3b424a; border-radius: 6px; background-color: #202328; }
+            QScrollArea { border: none; background-color: #202328; }
+            QTabBar::tab { min-width: 92px; padding: 9px 14px; background-color: #252a30; border: 1px solid #384049; color: #c8d0d8; }
+            QTabBar::tab:selected { background-color: #2f5f87; color: #ffffff; border-bottom-color: #2f5f87; }
+            QTabBar::tab:hover { background-color: #303842; }
+            QLabel { color: #dce3e8; }
+            QPushButton {
+                min-height: 30px; padding: 6px 12px; border-radius: 5px; font-weight: 600;
+                border: 1px solid #4a535d; background-color: #30363d; color: #f5f7f9;
+            }
+            QPushButton:hover { background-color: #3a424b; border: 1px solid #67727e; }
+            QPushButton:pressed { background-color: #242a30; padding-top: 7px; padding-bottom: 5px; }
+            QPushButton:disabled { background-color: #2a2e33; color: #7f8993; border: 1px solid #3b424a; }
+            QPushButton[state="success"], QPushButton#paramBtn { background-color: #2f6f56; color: #ffffff; border: 1px solid #3d8b6c; }
+            QPushButton[state="success"]:hover, QPushButton#paramBtn:hover { background-color: #367d62; }
+            QPushButton[state="danger"], QPushButton#stopExperimentBtn { background-color: #944343; color: #ffffff; border: 1px solid #b15a5a; }
+            QPushButton[state="danger"]:hover, QPushButton#stopExperimentBtn:hover { background-color: #a94d4d; }
+            QPushButton#startSweepBtn, QPushButton#startExperimentBtn { background-color: #2f5f87; color: #ffffff; border: 1px solid #3d78aa; }
+            QPushButton#startSweepBtn:hover, QPushButton#startExperimentBtn:hover { background-color: #376f9d; }
+            QPushButton#stopSweepBtn { background-color: #8a642c; color: #ffffff; border: 1px solid #a77a36; }
+            QPushButton#stopSweepBtn:hover { background-color: #9a7032; }
+            QPushButton#startQueryBtn { background-color: #4f6473; color: #ffffff; border: 1px solid #657e90; }
+            QPushButton#startQueryBtn:hover { background-color: #5b7283; }
+            QPushButton#stopQueryBtn { background-color: #5b6066; color: #ffffff; border: 1px solid #727981; }
+            QPushButton:disabled { background-color: #2a2e33; color: #7f8993; border: 1px solid #3b424a; }
+            QPushButton#paramBtn:disabled,
+            QPushButton#startSweepBtn:disabled,
+            QPushButton#stopSweepBtn:disabled,
+            QPushButton#startQueryBtn:disabled,
+            QPushButton#stopQueryBtn:disabled,
+            QPushButton#startExperimentBtn:disabled,
+            QPushButton#stopExperimentBtn:disabled,
+            QPushButton[state="success"]:disabled,
+            QPushButton[state="danger"]:disabled {
+                background-color: #2a2e33; color: #7f8993; border: 1px solid #3b424a;
+            }
+            QLineEdit, QComboBox {
+                padding: 5px 7px; border: 1px solid #4a535d; border-radius: 4px;
+                background-color: #171a1e; color: #f2f5f8; selection-background-color: #2f5f87;
+            }
+            QLineEdit:focus, QComboBox:focus { border: 1px solid #6f9ec4; }
+            QCheckBox { spacing: 8px; color: #e1e7ec; }
+            QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #66717d; border-radius: 3px; background-color: #171a1e; }
+            QCheckBox::indicator:checked { background-color: #2f6f56; border: 1px solid #52a27e; }
+            QCheckBox::indicator:disabled { background-color: #2a2e33; border: 1px solid #3b424a; }
+            QTextEdit {
+                font-family: Consolas, "Courier New", monospace; font-size: 11px;
+                background-color: #171a1e; border: 1px solid #3b424a; color: #d5dce2;
+            }
+            QTableWidget {
+                background-color: #171a1e; alternate-background-color: #20252a; color: #e7ebef;
+                gridline-color: #3b424a; border: 1px solid #3b424a;
+            }
+            QHeaderView::section { background-color: #2a3036; color: #dce3e8; padding: 6px; border: 1px solid #3b424a; }
+            QLabel#freqDisplay {
+                font-size: 22px; font-weight: 700; color: #95c8ec; padding: 10px;
+                border: 1px solid #4f7fa4; border-radius: 6px; background-color: #171a1e;
+            }
+            QLabel#lockinDataDisplay {
+                font-family: Consolas, "Courier New", monospace; font-size: 14px; font-weight: 700;
+                color: #95c8ec; padding: 7px; border: 1px solid #3b424a; border-radius: 5px; background-color: #171a1e;
+            }
+            QLabel#dataCountLabel { font-weight: 700; color: #7dd3a5; font-size: 13px; }
+            QLabel#powerWarning { color: #ff6b6b; font-weight: 700; }
+            QLabel#sweepStatusLabel {
+                font-size: 13px; font-weight: 700; color: #ffffff; padding: 6px 12px;
+                border-radius: 12px; background-color: #5b6066;
+            }
+            QLabel#statusPill, QLabel#experimentDetail {
+                font-size: 13px; font-weight: 700; color: #f3f6f8; padding: 9px;
+                border-radius: 6px; background-color: #171a1e; border: 1px solid #3b424a;
+            }
+            QProgressBar { border: 1px solid #3b424a; border-radius: 5px; text-align: center; background-color: #171a1e; min-height: 26px; color: #eef3f7; }
+            QProgressBar::chunk { background-color: #2f6f56; border-radius: 4px; }
         """
 
     def update_smb_ui_state(self) -> None:
         connected = self.smb.is_connected
         experiment_running = self.experiment_worker is not None
-        self.smb_conn_btn.setText("断开" if connected else "连接")
-        self.smb_conn_btn.setStyleSheet(
-            "background-color: #f44336; color: white;" if connected else "background-color: #4CAF50; color: white;"
-        )
+        self.smb_conn_btn.setText("断开 / Disconnect" if connected else "连接 / Connect")
+        set_visual_state(self.smb_conn_btn, "danger" if connected else "success")
         if hasattr(self, "smb_status_label"):
             self.smb_status_label.setText("SMB100A: 已连接" if connected else "SMB100A: 未连接")
         for widget in [
@@ -635,6 +895,7 @@ class SMB100AControlGUI(QMainWindow):
             self.output_checkbox,
             self.lf_output_checkbox,
             self.fm_mod_checkbox,
+            self.power_override_checkbox,
             self.load_preset_btn,
             self.save_preset_btn,
             self.save_as_preset_btn,
@@ -648,14 +909,22 @@ class SMB100AControlGUI(QMainWindow):
 
     def update_lockin_ui_state(self) -> None:
         connected = self.lockin.is_connected
-        self.lockin_conn_btn.setText("断开" if connected else "连接")
-        self.lockin_conn_btn.setStyleSheet(
-            "background-color: #f44336; color: white;" if connected else "background-color: #4CAF50; color: white;"
-        )
+        self.lockin_conn_btn.setText("断开 / Disconnect" if connected else "连接 / Connect")
+        set_visual_state(self.lockin_conn_btn, "danger" if connected else "success")
         if hasattr(self, "lockin_status_label"):
             self.lockin_status_label.setText("OE1022D: 已连接" if connected else "OE1022D: 未连接")
         self.start_query_btn.setEnabled(connected and self.lockin_worker is None and self.experiment_worker is None)
         self.stop_query_btn.setEnabled(connected and self.lockin_worker is not None)
+        for widget in [
+            self.oe_ref_channel_combo,
+            self.oe_ref_source_combo,
+            self.oe_ref_slope_combo,
+            self.oe_ref_phase_input,
+            self.oe_ref_apply_btn,
+            self.oe_ref_query_btn,
+            self.oe_ref_preflight_btn,
+        ]:
+            widget.setEnabled(connected and self.experiment_worker is None)
         if not connected:
             for display in [self.x_display, self.y_display, self.r_display, self.theta_display]:
                 display.setText("0.00000000000")
@@ -701,7 +970,7 @@ class SMB100AControlGUI(QMainWindow):
     def connect_smb(self) -> None:
         address = self.smb_address_input.text().strip()
         if not address:
-            QMessageBox.warning(self, "警告", "请输入VISA地址")
+            show_warning(self, "警告", "请输入VISA地址")
             return
         self.smb_conn_btn.setEnabled(False)
         try:
@@ -711,7 +980,7 @@ class SMB100AControlGUI(QMainWindow):
             self.get_current_settings()
         except Exception as exc:
             self.log_message("信号源", f"连接失败: {exc}")
-            QMessageBox.critical(self, "连接错误", str(exc))
+            show_critical(self, "连接错误", str(exc))
             self.smb.close(rf_off=False)
         finally:
             self.update_smb_ui_state()
@@ -747,7 +1016,7 @@ class SMB100AControlGUI(QMainWindow):
             self.start_query()
         except Exception as exc:
             self.log_message("锁相放大器", f"连接失败: {exc}")
-            QMessageBox.critical(self, "连接错误", str(exc))
+            show_critical(self, "连接错误", str(exc))
             self.lockin.close()
         finally:
             self.update_lockin_ui_state()
@@ -758,6 +1027,62 @@ class SMB100AControlGUI(QMainWindow):
         self.lockin.close()
         self.log_message("锁相放大器", "已断开")
         self.update_lockin_ui_state()
+
+    def _selected_oe_ref_channel(self) -> LockinChannel:
+        return LockinChannel.A if self.oe_ref_channel_combo.currentText() == "A" else LockinChannel.B
+
+    def apply_lockin_reference(self) -> None:
+        if not self.lockin.is_connected:
+            return
+        try:
+            channel = self._selected_oe_ref_channel()
+            source = self.oe_ref_source_combo.currentData()
+            slope = self.oe_ref_slope_combo.currentData()
+            phase = float(self.oe_ref_phase_input.text() or "0")
+            self.lockin.set_reference_source(channel, source)
+            self.lockin.set_reference_slope(channel, slope)
+            self.lockin.set_reference_phase_deg(channel, phase)
+            self.log_message("锁相放大器", f"CH-{channel.name} 参考配置已应用: {source.name}, {slope.name}, {phase:.2f}°")
+            self.query_lockin_reference()
+        except Exception as exc:
+            self.log_message("锁相放大器", f"参考配置失败: {exc}")
+            show_warning(self, "OE1022D 参考配置", str(exc))
+
+    def query_lockin_reference(self) -> None:
+        if not self.lockin.is_connected:
+            return
+        try:
+            channel = self._selected_oe_ref_channel()
+            status = self.lockin.query_channel_status(channel, include_sample_points=True)
+            message = (
+                f"CH-{channel.name}: source={status.reference_source.name if status.reference_source else 'N/A'}, "
+                f"slope={status.reference_slope.name if status.reference_slope else 'N/A'}, "
+                f"phase={format_float(status.reference_phase_deg, '°')}, "
+                f"PLL={'LOCKED' if status.pll_locked else 'UNLOCKED'}, "
+                f"input_ovl={status.input_overload}, gain_ovl={status.gain_overload}, points={status.sample_points}"
+            )
+            self.oe_ref_status_label.setText(message)
+            self.log_message("锁相放大器", message)
+        except Exception as exc:
+            self.log_message("锁相放大器", f"参考状态查询失败: {exc}")
+
+    def preflight_ch_b_reference(self) -> None:
+        if not self.lockin.is_connected:
+            return
+        try:
+            self.oe_ref_channel_combo.setCurrentText("B")
+            self.oe_ref_source_combo.setCurrentIndex(self.oe_ref_source_combo.findData(ReferenceSource.EXTERNAL))
+            self.oe_ref_slope_combo.setCurrentIndex(self.oe_ref_slope_combo.findData(ReferenceSlope.SINE_ZERO_CROSSING))
+            self.oe_ref_phase_input.setText("0")
+            self.lockin.configure_external_sine_reference(LockinChannel.B, phase_deg=0.0)
+            locked = self.lockin.query_pll_locked(LockinChannel.B)
+            self.oe_ref_status_label.setText(f"CH-B PLL: {'LOCKED' if locked else 'UNLOCKED'}")
+            self.log_message("锁相放大器", f"CH-B preflight 已发送 FMODD 2,0 / RSLPD 2,2 / PHASD 2,0; PLL={locked}")
+            if not locked:
+                show_warning(self, "CH-B PLL 未锁定", "已配置外部参考、正弦过零、0 度相位，但 *PLLD? 2 仍未锁定。")
+        except Exception as exc:
+            self.log_message("锁相放大器", f"CH-B preflight 失败: {exc}")
+            show_warning(self, "CH-B PLL Preflight", str(exc))
 
     def scan_serial_ports(self) -> None:
         self.log_message("锁相放大器", "扫描串口...")
@@ -776,7 +1101,7 @@ class SMB100AControlGUI(QMainWindow):
             self.lockin_port_combo.setCurrentText(available[0])
             self.log_message("锁相放大器", f"找到 {len(available)} 个串口")
         else:
-            QMessageBox.warning(self, "串口扫描", "未找到可用串口")
+            show_warning(self, "串口扫描", "未找到可用串口")
 
     def get_current_settings(self) -> None:
         try:
@@ -788,19 +1113,20 @@ class SMB100AControlGUI(QMainWindow):
 
     def _ui_params(self) -> SMBParameters:
         return SMBParameters(
-            power_dbm=parse_power_dbm(self.power_input.text()),
-            cw_hz=parse_frequency_to_hz(self.cw_freq_input.text()),
-            start_hz=parse_frequency_to_hz(self.start_freq_input.text()),
-            stop_hz=parse_frequency_to_hz(self.stop_freq_input.text()),
-            step_hz=parse_frequency_to_hz(self.step_input.text()),
-            dwell_ms=parse_time_to_ms(self.dwell_input.text()),
-            lf_freq_hz=parse_frequency_to_hz(self.lf_freq_input.text()),
-            lf_amp_mv=parse_voltage_to_mv(self.lf_amp_input.text()),
+            power_dbm=self.power_input.base_value(),
+            cw_hz=self.cw_freq_input.base_value(),
+            start_hz=self.start_freq_input.base_value(),
+            stop_hz=self.stop_freq_input.base_value(),
+            step_hz=self.step_input.base_value(),
+            dwell_ms=self.dwell_input.base_value(),
+            lf_freq_hz=self.lf_freq_input.base_value(),
+            lf_amp_mv=self.lf_amp_input.base_value(),
             lf_shape=self.lf_shape_combo.currentText(),
-            fm_dev_hz=parse_frequency_to_hz(self.fm_dev_input.text()),
+            fm_dev_hz=self.fm_dev_input.base_value(),
             rf_output=self.output_checkbox.isChecked(),
             lf_output=self.lf_output_checkbox.isChecked(),
             fm_state=self.fm_mod_checkbox.isChecked(),
+            power_override=self.power_override_checkbox.isChecked(),
         )
 
     def _set_ui_from_smb_params(self, params: SMBParameters) -> None:
@@ -827,6 +1153,9 @@ class SMB100AControlGUI(QMainWindow):
         self._set_checkbox_safely(self.output_checkbox, params.rf_output)
         self._set_checkbox_safely(self.lf_output_checkbox, params.lf_output)
         self._set_checkbox_safely(self.fm_mod_checkbox, params.fm_state)
+        if hasattr(self, "power_override_checkbox"):
+            self._set_checkbox_safely(self.power_override_checkbox, params.power_override)
+        self._update_power_warning()
 
     def _set_checkbox_safely(self, checkbox: QCheckBox, value: bool | None) -> None:
         if value is None:
@@ -836,37 +1165,37 @@ class SMB100AControlGUI(QMainWindow):
         checkbox.blockSignals(False)
 
     def set_power(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"POW:LEV {params.power_dbm:.12g}DBM"), "功率设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"POW:LEV {params.power_dbm:.12g} DBM"), "功率设定")
 
     def set_start_frequency(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"FREQ:START {params.start_hz:.12g}Hz"), "起始频率设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"FREQ:START {params.start_hz:.12g} Hz"), "起始频率设定")
 
     def set_stop_frequency(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"FREQ:STOP {params.stop_hz:.12g}Hz"), "终止频率设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"FREQ:STOP {params.stop_hz:.12g} Hz"), "终止频率设定")
 
     def set_step(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"SWE:STEP {params.step_hz:.12g}Hz"), "步进设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"SWE:STEP {params.step_hz:.12g} Hz"), "步进设定")
 
     def set_dwell(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"SWE:DWELL {params.dwell_ms:.12g}MS"), "驻留设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"SWE:DWELL {params.dwell_ms:.12g} MS"), "驻留设定")
 
     def set_lf_frequency(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"SOUR:LFO:FREQ {params.lf_freq_hz:.12g}Hz"), "LF频率设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"SOUR:LFO:FREQ {params.lf_freq_hz:.12g} Hz"), "LF频率设定")
 
     def set_lf_amplitude(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"SOUR:LFO:VOLT {params.lf_amp_mv:.12g} mV"), "LF幅度设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"SOUR:LFO:VOLT {params.lf_amp_mv:.12g} mV"), "LF幅度设定")
 
     def set_lf_shape(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"SOUR:LFO:SHAP {params.lf_shape}"), "LF波形设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"SOUR:LFO:SHAP {params.lf_shape}"), "LF波形设定")
 
     def set_fm_deviation(self) -> None:
-        self._write_smb(lambda params: self.smb.write(f"SOUR:FM:DEV {params.fm_dev_hz:.12g}"), "FM偏差设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"SOUR:FM:DEV {params.fm_dev_hz:.12g} Hz"), "FM偏差设定")
 
     def set_cw_frequency(self) -> None:
         if self.is_sweeping:
-            QMessageBox.warning(self, "警告", "扫频模式下无法设置CW频率")
+            show_warning(self, "警告", "扫频模式下无法设置CW频率")
             return
-        self._write_smb(lambda params: self.smb.write(f"FREQ:CW {params.cw_hz:.12g}Hz"), "CW频率设定")
+        self._write_smb(lambda params: self.smb.write_checked(f"FREQ:CW {params.cw_hz:.12g} Hz"), "CW频率设定")
         try:
             self._update_current_frequency_display(self.smb.current_frequency_hz())
         except Exception:
@@ -877,10 +1206,18 @@ class SMB100AControlGUI(QMainWindow):
             return
         try:
             params = self._ui_params()
-            writer(params)
+            safety = evaluate_power_safety(params.power_dbm, params.power_override)
+            if safety.blocked_reason:
+                self._update_power_warning()
+                self.log_message("信号源", f"{action}被拦截: {safety.blocked_reason}")
+                raise ValueError(safety.blocked_reason)
+            errors = writer(params) or []
+            for error in errors:
+                self.log_message("信号源", f"SMB error {error.code}: {error.message}")
             self.log_message("信号源", f"{action}完成")
         except Exception as exc:
             self.log_message("信号源", f"{action}失败: {exc}")
+            show_warning(self, action, str(exc))
 
     def apply_parameters(self) -> None:
         if not self.smb.is_connected:
@@ -891,9 +1228,38 @@ class SMB100AControlGUI(QMainWindow):
                 self.smb.apply_sweep_parameters(params)
             else:
                 self.smb.apply_cw_parameters(params)
+            self._log_smb_error_queue("应用参数")
             self.log_message("信号源", "所有参数已应用")
         except Exception as exc:
             self.log_message("信号源", f"应用参数失败: {exc}")
+
+    def _log_smb_error_queue(self, action: str) -> None:
+        try:
+            for error in self.smb.query_errors():
+                self.log_message("信号源", f"{action}: SMB error {error.code}: {error.message}")
+        except Exception as exc:
+            self.log_message("信号源", f"{action}: 错误队列读取失败: {exc}")
+
+    def _update_power_warning(self) -> None:
+        if not hasattr(self, "power_input") or not hasattr(self, "power_warning_label"):
+            return
+        try:
+            power = self.power_input.base_value()
+        except Exception:
+            self.power_input.set_warning(True)
+            self.power_warning_label.setText("功率输入无效")
+            return
+        safety = evaluate_power_safety(power, self.power_override_checkbox.isChecked())
+        warning = safety.near_limit or not safety.within_limits
+        self.power_input.set_warning(warning)
+        if safety.blocked_reason:
+            self.power_warning_label.setText("超出 -20..+18 dBm，非 Override 模式不会发送")
+        elif power is not None and not safety.within_limits:
+            self.power_warning_label.setText("Override 已开启：功率越界发送会记录为高危事件")
+        elif safety.near_limit:
+            self.power_warning_label.setText("接近 SMB100A 常规功率边界 -20..+18 dBm")
+        else:
+            self.power_warning_label.setText("")
 
     def start_sweep(self) -> None:
         if not self.smb.is_connected:
@@ -909,7 +1275,7 @@ class SMB100AControlGUI(QMainWindow):
         try:
             device_params = self.smb.read_parameters()
         except Exception as exc:
-            QMessageBox.critical(self, "参数读取失败", f"无法读取设备参数，已取消扫频。\n{exc}")
+            show_critical(self, "参数读取失败", f"无法读取设备参数，已取消扫频。\n{exc}")
             self.log_message("信号源", f"扫频前参数读取失败: {exc}")
             return
 
@@ -1033,19 +1399,19 @@ class SMB100AControlGUI(QMainWindow):
 
     def toggle_output(self, state: int) -> None:
         if self.smb.is_connected:
-            self._write_smb(lambda _params: self.smb.write(f"OUTP {'ON' if state == Qt.Checked else 'OFF'}"), "RF输出切换")
+            self._write_smb(lambda _params: self.smb.write_checked(f"OUTP {'ON' if state == Qt.Checked else 'OFF'}"), "RF输出切换")
 
     def toggle_lf_output(self, state: int) -> None:
         if self.smb.is_connected:
-            self._write_smb(lambda _params: self.smb.write(f"SOUR:LFO:STAT {'ON' if state == Qt.Checked else 'OFF'}"), "LF输出切换")
+            self._write_smb(lambda _params: self.smb.write_checked(f"SOUR:LFO:STAT {'ON' if state == Qt.Checked else 'OFF'}"), "LF输出切换")
 
     def toggle_fm_mod(self, state: int) -> None:
         if self.smb.is_connected:
-            self._write_smb(lambda _params: self.smb.write(f"SOUR:FM:STAT {'ON' if state == Qt.Checked else 'OFF'}"), "FM调制切换")
+            self._write_smb(lambda _params: self.smb.write_checked(f"SOUR:FM:STAT {'ON' if state == Qt.Checked else 'OFF'}"), "FM调制切换")
 
     def start_query(self) -> None:
         if not self.lockin.is_connected:
-            QMessageBox.warning(self, "警告", "请先连接锁相放大器")
+            show_warning(self, "警告", "请先连接锁相放大器")
             return
         if self.lockin_worker is not None:
             self.stop_query(reset_count=False)
@@ -1126,10 +1492,10 @@ class SMB100AControlGUI(QMainWindow):
 
     def start_experiment(self) -> None:
         if not self.smb.is_connected or not self.lockin.is_connected:
-            QMessageBox.warning(self, "同步采集", "请先连接 SMB100A 和 OE1022D")
+            show_warning(self, "同步采集", "请先连接 SMB100A 和 OE1022D")
             return
         if self.is_sweeping:
-            QMessageBox.warning(self, "同步采集", "请先停止手动扫频")
+            show_warning(self, "同步采集", "请先停止手动扫频")
             return
         if self.lockin_worker is not None:
             self.stop_query(reset_count=False)
@@ -1137,7 +1503,7 @@ class SMB100AControlGUI(QMainWindow):
         try:
             config = self._experiment_config_from_ui()
         except Exception as exc:
-            QMessageBox.warning(self, "同步采集参数错误", str(exc))
+            show_warning(self, "同步采集参数错误", str(exc))
             return
 
         Path(config.output_root).mkdir(parents=True, exist_ok=True)
@@ -1279,7 +1645,10 @@ class SMB100AControlGUI(QMainWindow):
 
     def apply_preset_payload(self, payload: dict[str, Any]) -> None:
         smb_data = payload.get("smb", {})
-        self._set_ui_from_smb_params(SMBParameters(**{key: smb_data.get(key) for key in SMBParameters.__dataclass_fields__}))
+        defaults = SMBParameters()
+        self._set_ui_from_smb_params(
+            SMBParameters(**{key: smb_data.get(key, getattr(defaults, key)) for key in SMBParameters.__dataclass_fields__})
+        )
         cycle = payload.get("cycle", {})
         self.cycle_count_input.setText(str(cycle.get("count", "0")))
         self.cycle_interval_input.setText(str(cycle.get("interval_ms", "200")))
@@ -1304,12 +1673,12 @@ class SMB100AControlGUI(QMainWindow):
         try:
             payload = self.presets.get(name)
             if payload is None:
-                QMessageBox.warning(self, "快捷配置", f"未找到配置: {name}")
+                show_warning(self, "快捷配置", f"未找到配置: {name}")
                 return
             self.apply_preset_payload(payload)
             self.log_message("信号源", f"已加载快捷配置: {name}")
         except Exception as exc:
-            QMessageBox.critical(self, "快捷配置错误", str(exc))
+            show_critical(self, "快捷配置错误", str(exc))
 
     def save_selected_preset(self) -> None:
         name = self.preset_combo.currentText().strip()
@@ -1322,31 +1691,34 @@ class SMB100AControlGUI(QMainWindow):
             self.preset_combo.setCurrentText(name)
             self.log_message("信号源", f"已保存快捷配置: {name}")
         except Exception as exc:
-            QMessageBox.critical(self, "保存失败", str(exc))
+            show_critical(self, "保存失败", str(exc))
 
     def save_preset_as(self) -> None:
-        name, ok = QInputDialog.getText(self, "另存为快捷配置", "配置名称:")
-        if not ok or not name.strip():
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("另存为快捷配置")
+        dialog.setLabelText("配置名称:")
+        dialog.setOkButtonText("保存 / Save")
+        dialog.setCancelButtonText("取消 / Cancel")
+        if dialog.exec_() != QDialog.Accepted or not dialog.textValue().strip():
             return
-        self.preset_combo.setCurrentText(name.strip())
+        self.preset_combo.setCurrentText(dialog.textValue().strip())
         self.save_selected_preset()
 
     def delete_selected_preset(self) -> None:
         name = self.preset_combo.currentText().strip()
         if not name:
             return
-        if QMessageBox.question(self, "删除快捷配置", f"确定删除 {name}？") != QMessageBox.Yes:
+        if not confirm_question(self, "删除快捷配置", f"确定删除 {name}？"):
             return
         try:
             self.presets.delete(name)
             self.refresh_presets()
             self.log_message("信号源", f"已删除快捷配置: {name}")
         except Exception as exc:
-            QMessageBox.critical(self, "删除失败", str(exc))
+            show_critical(self, "删除失败", str(exc))
 
     def closeEvent(self, event) -> None:
-        reply = QMessageBox.question(self, "退出", "确定退出？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply == QMessageBox.Yes:
+        if confirm_question(self, "退出", "确定退出？"):
             if self.experiment_worker is not None:
                 self.stop_experiment()
                 if self.experiment_thread is not None and self.experiment_thread.isRunning():

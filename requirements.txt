@@ -3,3 +3,5 @@ pyvisa
 pyserial
 pyqtgraph
 numpy
+h5py
+pytest
