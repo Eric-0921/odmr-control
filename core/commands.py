@@ -72,19 +72,47 @@ class CommandType(Enum):
     MAG_DISCONNECT_AXIS = auto()      # {axis}
     MAG_CONNECT_ALL = auto()          # {ports: {X,Y,Z}, baudrate}
     MAG_DISCONNECT_ALL = auto()
+    MAG_SCAN_PORTS = auto()           # {baudrate}
+    MAG_AUTO_DETECT = auto()          # {baudrate, bindings}
+    MAG_BIND_AXIS_IDN = auto()        # {axis, idn, port}
+    MAG_SET_POLL_INTERVAL = auto()    # {interval_ms}
     MAG_SET_FIELD = auto()            # {axis, field_nT}
     MAG_SET_FIELD_3D = auto()         # {x_nT, y_nT, z_nT}
     MAG_SET_CURRENT = auto()          # {axis, current_mA}
     MAG_SET_ZERO_OFFSET = auto()      # {axis, zero_offset_mA}
+    MAG_CAPTURE_BACKGROUND = auto()   # {axis}: read current as zero offset/background
+    MAG_PREPARE_ZERO_LOCK = auto()    # {axis}: output zero offset then lock zero
     MAG_SET_COIL_CONSTANT = auto()    # {axis, coil_constant}
     MAG_SET_OUTPUT = auto()           # {axis, enabled}
     MAG_LOCK_ZERO = auto()            # {axis, locked}
     MAG_QUERY_STATE = auto()          # {axis?} -> 三轴状态
     MAG_EMERGENCY_STOP = auto()
+    MAG_LOAD_SEQUENCE = auto()        # {sequence | path}
+    MAG_START_SEQUENCE = auto()       # {record_path?}
+    MAG_PAUSE_SEQUENCE = auto()
+    MAG_RESUME_SEQUENCE = auto()
+    MAG_STOP_SEQUENCE = auto()
 
     # ===== 系统 =====
     SYS_EMERGENCY_STOP = auto()
     SYS_QUERY_ALL_STATUS = auto()     # 查询所有已连接设备状态
+
+    # ===== 配置和实验自动化 =====
+    LOCKIN_QUERY_CONFIG = auto()
+    LOCKIN_APPLY_CONFIG = auto()
+    LOCKIN_SET_DISPLAY_REFRESH_POLICY = auto()
+    SMB_QUERY_CONFIG = auto()
+    SMB_APPLY_CONFIG = auto()
+    EXPERIMENT_LOAD_JSON = auto()
+    EXPERIMENT_VALIDATE = auto()
+    EXPERIMENT_START = auto()
+    EXPERIMENT_PAUSE = auto()
+    EXPERIMENT_RESUME = auto()
+    EXPERIMENT_STOP = auto()
+    EXPERIMENT_QUERY_STATE = auto()
+    EXPERIMENT_WAIT = auto()           # {duration_s?, condition?}
+    EXPERIMENT_CONDITION_EVAL = auto() # {condition} -> {met: bool}
+    EXPERIMENT_MODIFY_STEP = auto()    # {step_index, overrides}
 
 
 @dataclass(frozen=True)

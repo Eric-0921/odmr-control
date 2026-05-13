@@ -26,6 +26,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "parity": "N",
         "stopbits": 1,
         "timeout": 1.0,
+        "display_refresh_policy": {
+            "mode": "time_constant_adaptive",
+            "max_interval_ms": 300,
+            "min_interval_ms": 50,
+            "default_time_constant_index": 6,
+        },
     },
     "laser": {
         "port": "COM5",
@@ -45,10 +51,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "magnetic_field": {
         "baudrate": 9600,
         "poll_interval_ms": 500,
+        "bindings": {
+            "X": {"idn": "", "port": "COM1"},
+            "Y": {"idn": "", "port": "COM2"},
+            "Z": {"idn": "", "port": "COM3"},
+        },
+        "coil_constant": {"X": 143.26, "Y": 141.77, "Z": 156.15},
+        "zero_offset": {"X": 0.0, "Y": 0.0, "Z": 0.0},
         "axes": {
             "X": {"port": "COM1", "coil_constant": 143.26, "zero_offset_mA": 0.0},
-            "Y": {"port": "COM2", "coil_constant": 143.26, "zero_offset_mA": 0.0},
-            "Z": {"port": "COM3", "coil_constant": 143.26, "zero_offset_mA": 0.0},
+            "Y": {"port": "COM2", "coil_constant": 141.77, "zero_offset_mA": 0.0},
+            "Z": {"port": "COM3", "coil_constant": 156.15, "zero_offset_mA": 0.0},
         },
         "sequence": {
             "settle_seconds": 0.5,
@@ -79,6 +92,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "poll_interval_ms": 100,
         "window_width": 1200,
         "window_height": 800,
+    },
+    "automation": {
+        "default_safety_policy": {
+            "on_error": "safe_outputs_off",
+            "stop_recording": True,
+            "smb_output_off": True,
+            "magnetic_output_off": True,
+            "laser_output_off": False,
+        }
     },
 }
 

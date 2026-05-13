@@ -1,0 +1,251 @@
+{
+  "metadata": {
+    "name": "NV 多轴 ODMR 扫描",
+    "description": "测试同一 NV 传感头在不同磁场配置下的 ODMR 响应：单轴 (X/Y/Z) 和多轴组合。每种磁场配置下执行一次微波频率扫描 (2.82-2.92 GHz, 500 kHz 步进)，锁相放大器同步记录数据。",
+    "domain": "ODMR",
+    "mode": "multi-axis-field-scan",
+    "author": "ODMR Control",
+    "created_at": "2026-05-14T00:00:00Z",
+    "tags": ["ODMR", "multi-axis", "NV-center", "Zeeman"]
+  },
+  "sequence": {
+    "loop_count": 1,
+    "loop_delay": 0.0,
+    "return_to_zero": true,
+    "steps": [
+      {
+        "name": "Bx_50uT",
+        "magnetic_field": {"x_nT": 50000.0, "y_nT": 0.0, "z_nT": 0.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/Bx_50uT"
+        }
+      },
+      {
+        "name": "By_50uT",
+        "magnetic_field": {"x_nT": 0.0, "y_nT": 50000.0, "z_nT": 0.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/By_50uT"
+        }
+      },
+      {
+        "name": "Bz_50uT",
+        "magnetic_field": {"x_nT": 0.0, "y_nT": 0.0, "z_nT": 50000.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/Bz_50uT"
+        }
+      },
+      {
+        "name": "Bx_100uT",
+        "magnetic_field": {"x_nT": 100000.0, "y_nT": 0.0, "z_nT": 0.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/Bx_100uT"
+        }
+      },
+      {
+        "name": "By_100uT",
+        "magnetic_field": {"x_nT": 0.0, "y_nT": 100000.0, "z_nT": 0.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/By_100uT"
+        }
+      },
+      {
+        "name": "Bz_100uT",
+        "magnetic_field": {"x_nT": 0.0, "y_nT": 0.0, "z_nT": 100000.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/Bz_100uT"
+        }
+      },
+      {
+        "name": "Bx_50uT_By_50uT",
+        "magnetic_field": {"x_nT": 50000.0, "y_nT": 50000.0, "z_nT": 0.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/Bx_50uT_By_50uT"
+        }
+      },
+      {
+        "name": "Bx_50uT_Bz_50uT",
+        "magnetic_field": {"x_nT": 50000.0, "y_nT": 0.0, "z_nT": 50000.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/Bx_50uT_Bz_50uT"
+        }
+      },
+      {
+        "name": "By_50uT_Bz_50uT",
+        "magnetic_field": {"x_nT": 0.0, "y_nT": 50000.0, "z_nT": 50000.0},
+        "microwave": {
+          "power_dbm": -10,
+          "rf_output": true,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 500000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {"settle_s": 2.0, "hold_s": 12.0, "trigger": "immediate"},
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "microwave_sweep_complete",
+          "start_recording": true,
+          "output_dir": "data/nv_multi_axis/By_50uT_Bz_50uT"
+        }
+      },
+      {
+        "name": "停止采集",
+        "timing": {"settle_s": 0.5, "hold_s": 0.0, "trigger": "immediate"},
+        "acquisition": {
+          "stop_trigger": "step_end",
+          "stop_recording": true
+        }
+      }
+    ]
+  }
+}

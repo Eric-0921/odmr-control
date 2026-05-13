@@ -37,6 +37,8 @@ class SMB100ADriver:
         self._cached_power_dbm: float = -30.0
         self._cached_output_on: bool = False
         self._cached_mode: str = "CW"  # "CW" or "SWEEP"
+        self._cached_lf_on: bool = False
+        self._cached_mod_on: bool = False
         self._raw_log_cb: Optional[Callable[[str, bytes], None]] = None
 
     # -- properties ----------------------------------------------------------
@@ -178,11 +180,20 @@ class SMB100ADriver:
             power = float(self._query("POW:LEV?"))
             outp = self._query("OUTP?").strip()
             mode = self._query("FREQ:MODE?").strip()
+            lf_on = False
+            mod_on = False
+            try:
+                lf_on = self._query("SOUR:LFO:STAT?").strip() in ("1", "ON")
+                mod_on = self._query("SOUR:MOD:ALL:STAT?").strip() in ("1", "ON")
+            except Exception:
+                pass
             with self._lock:
                 self._cached_freq_hz = freq
                 self._cached_power_dbm = power
                 self._cached_output_on = outp in ("1", "ON")
                 self._cached_mode = mode
+                self._cached_lf_on = lf_on
+                self._cached_mod_on = mod_on
         except Exception as exc:
             logging.warning(f"[SMB100A] 状态缓存更新失败: {exc}")
 
@@ -311,10 +322,25 @@ class SMB100ADriver:
         """spacing: LIN | LOG"""
         self._write(f"SWE:SPAC {spacing}")
 
+    def set_sweep_shape(self, shape: str = "SAW") -> None:
+        """shape: SAW | TRI."""
+        self._write(f"SWE:SHAP {shape}")
+
+    def set_sweep_retrace(self, on: bool = True) -> None:
+        self._write(f"SWE:RETR {'ON' if on else 'OFF'}")
+
+    def set_sweep_trigger_source(self, source: str = "IMM") -> None:
+        self._write(f"SWE:TRIG:SOUR {source}")
+
+    def get_sweep_running(self) -> bool:
+        return self._query("SWE:RUNN?").strip() in ("1", "ON")
+
     # -- LF output -----------------------------------------------------------
 
     def set_lf_output(self, on: bool) -> None:
         self._write(f"SOUR:LFO:STAT {'ON' if on else 'OFF'}")
+        with self._lock:
+            self._cached_lf_on = on
 
     def set_lf_freq(self, hz: float) -> None:
         self._write(f"SOUR:LFO:FREQ {hz:.3f}Hz")
@@ -331,13 +357,80 @@ class SMB100ADriver:
     def set_lf_impedance(self, imp: str = "LOW") -> None:
         self._write(f"SOUR:LFO:IMP {imp}")
 
+    def set_lf_sweep(self, start_hz: float, stop_hz: float, step_hz: float,
+                     shape: str = "SAW", spacing: str = "LIN", trigger: str = "IMM") -> None:
+        self._write(f"SOUR:LFO:FREQ:MODE SWE")
+        self._write(f"SOUR:LFO:FREQ:STAR {start_hz:.3f}Hz")
+        self._write(f"SOUR:LFO:FREQ:STOP {stop_hz:.3f}Hz")
+        self._write(f"SOUR:LFO:SWE:STEP {step_hz:.3f}Hz")
+        self._write(f"SOUR:LFO:SWE:SHAP {shape}")
+        self._write(f"SOUR:LFO:SWE:SPAC {spacing}")
+        self._write(f"SOUR:LFO:SWE:TRIG:SOUR {trigger}")
+
     # -- FM modulation -------------------------------------------------------
 
     def set_fm_state(self, on: bool) -> None:
         self._write(f"SOUR:FM:STAT {'ON' if on else 'OFF'}")
+        with self._lock:
+            self._cached_mod_on = on
 
     def set_fm_deviation(self, hz: float) -> None:
         self._write(f"SOUR:FM:DEV {hz:.3f}Hz")
+
+    def set_fm_source(self, source: str = "INT") -> None:
+        self._write(f"SOUR:FM:SOUR {source}")
+
+    def set_am_state(self, on: bool) -> None:
+        self._write(f"SOUR:AM:STAT {'ON' if on else 'OFF'}")
+        with self._lock:
+            self._cached_mod_on = on
+
+    def set_am_depth(self, pct: float) -> None:
+        if not 0 <= pct <= 100:
+            raise ValueError("AM depth must be 0..100 %")
+        self._write(f"SOUR:AM:DEPT {pct:.3f}PCT")
+
+    def set_am_source(self, source: str = "INT") -> None:
+        self._write(f"SOUR:AM:SOUR {source}")
+
+    def set_phase(self, deg: float) -> None:
+        self._write(f"SOUR:PHAS {deg:.6f}DEG")
+
+    def set_level_offset(self, db: float) -> None:
+        self._write(f"POW:OFFS {db:.3f}DB")
+
+    def query_config(self) -> dict:
+        """Best-effort snapshot aligned with the SMB100A front-panel groups."""
+        result = {
+            "frequency_hz": self.cached_freq_hz,
+            "power_dbm": self.cached_power_dbm,
+            "rf_output": self.cached_output_on,
+            "mode": self.cached_mode,
+        }
+        queries = {
+            "lf_output": "SOUR:LFO:STAT?",
+            "lf_frequency_hz": "SOUR:LFO:FREQ?",
+            "lf_shape": "SOUR:LFO:SHAP?",
+            "lf_impedance": "SOUR:LFO:IMP?",
+            "modulation": "SOUR:MOD:ALL:STAT?",
+            "fm_state": "SOUR:FM:STAT?",
+            "fm_deviation_hz": "SOUR:FM:DEV?",
+            "am_state": "SOUR:AM:STAT?",
+            "am_depth_pct": "SOUR:AM:DEPT?",
+            "sweep_running": "SWE:RUNN?",
+        }
+        for key, cmd in queries.items():
+            try:
+                value = self._query(cmd)
+                if key.endswith("_hz") or key.endswith("_pct"):
+                    result[key] = float(value)
+                elif key.endswith("_output") or key.endswith("_state") or key in ("modulation", "sweep_running"):
+                    result[key] = value.strip() in ("1", "ON")
+                else:
+                    result[key] = value
+            except Exception:
+                pass
+        return result
 
     # -- convenience ---------------------------------------------------------
 
@@ -372,9 +465,12 @@ class SMB100ADriver:
             self._write("OUTP OFF")
             self._write("SOUR:LFO:STAT OFF")
             self._write("SOUR:FM:STAT OFF")
+            self._write("SOUR:AM:STAT OFF")
             self._write("FREQ:MODE CW")
         except Exception:
             pass
         with self._lock:
             self._cached_output_on = False
             self._cached_mode = "CW"
+            self._cached_lf_on = False
+            self._cached_mod_on = False

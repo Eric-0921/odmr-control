@@ -1,0 +1,62 @@
+{
+  "metadata": {
+    "name": "ODMR 频率扫描",
+    "description": "标准 ODMR 实验：在固定磁场下扫描微波频率，同时记录锁相信号",
+    "domain": "ODMR",
+    "mode": "sweep",
+    "author": "ODMR Control",
+    "tags": ["ODMR", "frequency-sweep", "standard"]
+  },
+  "sequence": {
+    "loop_count": 1,
+    "loop_delay": 0.0,
+    "return_to_zero": false,
+    "steps": [
+      {
+        "name": "设置磁场并稳定",
+        "magnetic_field": {
+          "x_nT": 0.0,
+          "y_nT": 0.0,
+          "z_nT": 50000.0
+        },
+        "timing": {
+          "settle_s": 2.0,
+          "hold_s": 0.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "start_trigger": "step_start",
+          "stop_trigger": "disabled",
+          "start_recording": true,
+          "output_dir": "data/odmr_sweep"
+        }
+      },
+      {
+        "name": "微波扫频 2.80-2.92 GHz",
+        "microwave": {
+          "power_dbm": -10,
+          "sweep": {
+            "start_hz": 2800000000,
+            "stop_hz": 2920000000,
+            "step_hz": 1000000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {
+          "settle_s": 0.5,
+          "hold_s": 30.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "start_trigger": "microwave_sweep_start",
+          "stop_trigger": "hold_elapsed",
+          "stop_recording": true
+        }
+      }
+    ]
+  }
+}

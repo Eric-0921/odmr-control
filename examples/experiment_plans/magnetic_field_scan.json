@@ -1,0 +1,151 @@
+{
+  "metadata": {
+    "name": "磁场扫描 ODMR",
+    "description": "在不同磁场强度下进行 ODMR 测量，扫描 Z 轴磁场从 0 到 100,000 nT",
+    "domain": "ODMR",
+    "mode": "field-scan",
+    "author": "ODMR Control",
+    "tags": ["ODMR", "magnetic-field", "scan", "Zeeman"]
+  },
+  "sequence": {
+    "loop_count": 1,
+    "loop_delay": 0.0,
+    "return_to_zero": true,
+    "steps": [
+      {
+        "name": "Bz = 0 nT - ODMR 扫频",
+        "magnetic_field": {
+          "x_nT": 0.0,
+          "y_nT": 0.0,
+          "z_nT": 0.0
+        },
+        "microwave": {
+          "power_dbm": -10,
+          "sweep": {
+            "start_hz": 2820000000,
+            "stop_hz": 2920000000,
+            "step_hz": 1000000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {
+          "settle_s": 2.0,
+          "hold_s": 20.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "start_trigger": "magnetic_settled",
+          "stop_trigger": "hold_elapsed",
+          "start_recording": true,
+          "output_dir": "data/field_scan"
+        }
+      },
+      {
+        "name": "Bz = 25000 nT - ODMR 扫频",
+        "magnetic_field": {
+          "x_nT": 0.0,
+          "y_nT": 0.0,
+          "z_nT": 25000.0
+        },
+        "microwave": {
+          "power_dbm": -10,
+          "sweep": {
+            "start_hz": 2800000000,
+            "stop_hz": 2940000000,
+            "step_hz": 1000000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {
+          "settle_s": 2.0,
+          "hold_s": 20.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "start_trigger": "magnetic_settled",
+          "stop_trigger": "hold_elapsed"
+        }
+      },
+      {
+        "name": "Bz = 50000 nT - ODMR 扫频",
+        "magnetic_field": {
+          "x_nT": 0.0,
+          "y_nT": 0.0,
+          "z_nT": 50000.0
+        },
+        "microwave": {
+          "power_dbm": -10,
+          "sweep": {
+            "start_hz": 2780000000,
+            "stop_hz": 2960000000,
+            "step_hz": 1000000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {
+          "settle_s": 2.0,
+          "hold_s": 20.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "start_trigger": "magnetic_settled",
+          "stop_trigger": "hold_elapsed"
+        }
+      },
+      {
+        "name": "Bz = 100000 nT - ODMR 扫频（球坐标）",
+        "magnetic_field": {
+          "magnitude_nT": 100000.0,
+          "theta_deg": 0.0,
+          "phi_deg": 0.0
+        },
+        "microwave": {
+          "power_dbm": -10,
+          "sweep": {
+            "start_hz": 2700000000,
+            "stop_hz": 3040000000,
+            "step_hz": 1000000,
+            "dwell_ms": 50,
+            "shape": "SAWTOOTH",
+            "retrace": true,
+            "trigger": "IMM",
+            "execute": true
+          }
+        },
+        "timing": {
+          "settle_s": 3.0,
+          "hold_s": 20.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "start_trigger": "magnetic_settled",
+          "stop_trigger": "hold_elapsed"
+        }
+      },
+      {
+        "name": "停止采集",
+        "timing": {
+          "settle_s": 0.5,
+          "hold_s": 0.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "stop_trigger": "step_end",
+          "stop_recording": true
+        }
+      }
+    ]
+  }
+}

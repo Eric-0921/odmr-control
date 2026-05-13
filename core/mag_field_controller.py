@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import queue
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 
@@ -135,18 +135,43 @@ class FieldController(QObject):
         return results
 
     @staticmethod
+    def _normalize_binding(value: Union[str, Dict[str, str], None]) -> Dict[str, str]:
+        """将绑定值统一转换为 {"idn": "...", "port": "..."} 格式。
+
+        兼容旧格式（纯 IDN 字符串）、新格式（含 idn + port 的 dict）及 None。
+        """
+        if value is None:
+            return {"idn": "", "port": ""}
+        if isinstance(value, dict):
+            return {
+                "idn": str(value.get("idn", "")),
+                "port": str(value.get("port", "")),
+            }
+        # 旧格式：纯 IDN 字符串
+        return {"idn": str(value), "port": ""}
+
+    @staticmethod
     def match_devices_to_axes(
         detected: List[Dict[str, str]],
-        bindings: Dict[str, str],
+        bindings: Dict[str, Union[str, Dict[str, str]]],
     ) -> Dict[str, Optional[str]]:
         """Match detected devices to axes using stored IDN bindings.
 
         Returns {axis: port} for matched axes, {axis: None} for unmatched.
         If all bindings are empty, falls back to index-based assignment.
+
+        bindings 兼容两种格式:
+          - 旧格式: {"X": "IDN字符串", ...}
+          - 新格式: {"X": {"idn": "...", "port": "..."}, ...}
         """
         result: Dict[str, Optional[str]] = {a: None for a in AXES}
+        # 统一绑定格式并提取 IDN
+        normalized: Dict[str, Dict[str, str]] = {}
+        for axis in AXES:
+            raw = bindings.get(axis, "")
+            normalized[axis] = FieldController._normalize_binding(raw)
         # Check if any bindings exist
-        has_bindings = any(bindings.get(a, "") for a in AXES)
+        has_bindings = any(normalized[a]["idn"] for a in AXES)
         if not has_bindings:
             # Fallback: index-based assignment
             for i, axis in enumerate(AXES):
@@ -156,7 +181,7 @@ class FieldController(QObject):
         # Match by IDN
         idn_to_port = {d["idn"]: d["port"] for d in detected}
         for axis in AXES:
-            bound_idn = bindings.get(axis, "")
+            bound_idn = normalized[axis]["idn"]
             if bound_idn and bound_idn in idn_to_port:
                 result[axis] = idn_to_port[bound_idn]
         return result
@@ -228,6 +253,42 @@ class FieldController(QObject):
         if ctrl.output_on:
             self._queue_total_current(axis)
         return True
+
+    def capture_background_as_zero(self, axis: str) -> float:
+        """Read back the present PSU current and use it as the zero/background offset.
+
+        The coil PSU cannot measure the ambient magnetic field directly. In this
+        control model the "background" is the compensation current that is
+        already present on the axis. Capturing it makes the old workflow explicit:
+        output compensation current, read it back, store as zero offset, then lock
+        zero before applying reproduction field current.
+        """
+        ctrl = self._controllers[axis]
+        if not ctrl.is_connected:
+            raise ConnectionError(f"{axis} 轴未连接")
+        ma = max(0.0, ctrl.get_current())
+        ctrl.update_cached_current(ma)
+        self._latest_current[axis] = ma
+        if not self.set_zero_offset(axis, ma):
+            raise ValueError(f"{axis} 轴背景零偏捕获失败")
+        self._recur_current[axis] = 0.0
+        return ma
+
+    def prepare_zero_lock(self, axis: str, *, capture_readback: bool = False) -> bool:
+        """Start output at the zero offset and lock the zero/background state."""
+        ctrl = self._controllers[axis]
+        if not ctrl.is_connected:
+            raise ConnectionError(f"{axis} 轴未连接")
+        self._recur_current[axis] = 0.0
+        if not self.set_output(axis, True):
+            return False
+        if capture_readback:
+            try:
+                self.capture_background_as_zero(axis)
+            except Exception as exc:
+                self._reject(axis, f"背景零偏回读失败: {exc}")
+                return False
+        return self.lock_zero(axis, True)
 
     def set_voltage(self, axis: str, v: float) -> None:
         self._queues[axis].put(("set_voltage", (v,)))

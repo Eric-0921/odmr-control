@@ -1,0 +1,73 @@
+{
+  "metadata": {
+    "name": "全光实验",
+    "description": "无微波激发的全光基线采集，用于测量激光和锁相的噪声基线",
+    "domain": "optical",
+    "mode": "baseline",
+    "author": "ODMR Control",
+    "tags": ["optical", "baseline", "noise-floor"]
+  },
+  "sequence": {
+    "loop_count": 3,
+    "loop_delay": 1.0,
+    "return_to_zero": false,
+    "steps": [
+      {
+        "name": "激光开启并等待稳定",
+        "laser": {
+          "output": true,
+          "power_mw": 50.0
+        },
+        "timing": {
+          "settle_s": 3.0,
+          "hold_s": 0.0,
+          "trigger": "immediate"
+        }
+      },
+      {
+        "name": "锁相自动增益和相位",
+        "lockin": {
+          "channel": 1,
+          "auto": {
+            "gain": true,
+            "phase": true
+          }
+        },
+        "timing": {
+          "settle_s": 2.0,
+          "hold_s": 0.0,
+          "trigger": "immediate"
+        }
+      },
+      {
+        "name": "基线数据采集",
+        "timing": {
+          "settle_s": 0.5,
+          "hold_s": 60.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "start_trigger": "step_start",
+          "stop_trigger": "hold_elapsed",
+          "start_recording": true,
+          "output_dir": "data/optical_baseline"
+        }
+      },
+      {
+        "name": "停止采集并关闭激光",
+        "laser": {
+          "output": false
+        },
+        "timing": {
+          "settle_s": 0.5,
+          "hold_s": 0.0,
+          "trigger": "immediate"
+        },
+        "acquisition": {
+          "stop_trigger": "step_end",
+          "stop_recording": true
+        }
+      }
+    ]
+  }
+}
