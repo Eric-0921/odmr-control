@@ -229,6 +229,42 @@ class FieldController(QObject):
             self._queue_total_current(axis)
         return True
 
+    def capture_background_as_zero(self, axis: str) -> float:
+        """Read back the present PSU current and use it as the zero/background offset.
+
+        The coil PSU cannot measure the ambient magnetic field directly. In this
+        control model the "background" is the compensation current that is
+        already present on the axis. Capturing it makes the old workflow explicit:
+        output compensation current, read it back, store as zero offset, then lock
+        zero before applying reproduction field current.
+        """
+        ctrl = self._controllers[axis]
+        if not ctrl.is_connected:
+            raise ConnectionError(f"{axis} 轴未连接")
+        ma = max(0.0, ctrl.get_current())
+        ctrl.update_cached_current(ma)
+        self._latest_current[axis] = ma
+        if not self.set_zero_offset(axis, ma):
+            raise ValueError(f"{axis} 轴背景零偏捕获失败")
+        self._recur_current[axis] = 0.0
+        return ma
+
+    def prepare_zero_lock(self, axis: str, *, capture_readback: bool = False) -> bool:
+        """Start output at the zero offset and lock the zero/background state."""
+        ctrl = self._controllers[axis]
+        if not ctrl.is_connected:
+            raise ConnectionError(f"{axis} 轴未连接")
+        self._recur_current[axis] = 0.0
+        if not self.set_output(axis, True):
+            return False
+        if capture_readback:
+            try:
+                self.capture_background_as_zero(axis)
+            except Exception as exc:
+                self._reject(axis, f"背景零偏回读失败: {exc}")
+                return False
+        return self.lock_zero(axis, True)
+
     def set_voltage(self, axis: str, v: float) -> None:
         self._queues[axis].put(("set_voltage", (v,)))
 

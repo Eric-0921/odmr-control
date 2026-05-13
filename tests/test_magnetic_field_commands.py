@@ -72,6 +72,26 @@ class TestMagneticFieldCommands(unittest.TestCase):
                 {"ports": {"X": "/dev/tty.same", "Y": "/dev/tty.same", "Z": ""}},
             ))
 
+    def test_prepare_zero_lock_command_routes_to_field_controller(self):
+        calls = {}
+
+        def prepare(axis, capture_readback=False):
+            calls["axis"] = axis
+            calls["capture_readback"] = capture_readback
+            return True
+
+        self.ctrl.mag.prepare_zero_lock = prepare
+        self.ctrl.mag.get_status = lambda axis: {"axis": axis, "output_on": True, "lock_zero": True}
+
+        result = self.service._execute(Command(
+            CommandType.MAG_PREPARE_ZERO_LOCK,
+            {"axis": "X", "capture_readback": True},
+        ))
+
+        self.assertEqual(calls, {"axis": "X", "capture_readback": True})
+        self.assertTrue(result["output_on"])
+        self.assertTrue(result["lock_zero"])
+
 
 if __name__ == "__main__":
     unittest.main()

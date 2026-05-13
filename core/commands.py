@@ -80,6 +80,8 @@ class CommandType(Enum):
     MAG_SET_FIELD_3D = auto()         # {x_nT, y_nT, z_nT}
     MAG_SET_CURRENT = auto()          # {axis, current_mA}
     MAG_SET_ZERO_OFFSET = auto()      # {axis, zero_offset_mA}
+    MAG_CAPTURE_BACKGROUND = auto()   # {axis}: read current as zero offset/background
+    MAG_PREPARE_ZERO_LOCK = auto()    # {axis}: output zero offset then lock zero
     MAG_SET_COIL_CONSTANT = auto()    # {axis, coil_constant}
     MAG_SET_OUTPUT = auto()           # {axis, enabled}
     MAG_LOCK_ZERO = auto()            # {axis, locked}

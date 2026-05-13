@@ -527,6 +527,19 @@ class CommandService(QObject):
                 raise SafetyError(f"{axis} 轴零偏设置被拒绝")
             return self._ctrl.mag.get_status(axis)
 
+        if ct == CommandType.MAG_CAPTURE_BACKGROUND:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            zero = self._ctrl.mag.capture_background_as_zero(axis)
+            state = self._ctrl.mag.get_status(axis)
+            return {"axis": axis, "zero_offset_mA": zero, "state": state}
+
+        if ct == CommandType.MAG_PREPARE_ZERO_LOCK:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            ok = self._ctrl.mag.prepare_zero_lock(axis, capture_readback=bool(p.get("capture_readback", False)))
+            if not ok:
+                raise SafetyError(f"{axis} 轴零场锁定准备失败")
+            return self._ctrl.mag.get_status(axis)
+
         if ct == CommandType.MAG_SET_COIL_CONSTANT:
             axis = self._normalize_axis(p.get("axis", "X"))
             value = float(p["coil_constant"])
@@ -751,32 +764,45 @@ class CommandService(QObject):
                 self._ctrl.smb.set_sweep_retrace(bool(sweep["retrace"]))
             if "trigger" in sweep:
                 self._ctrl.smb.set_sweep_trigger_source(str(sweep["trigger"]))
+            if sweep.get("execute"):
+                self._ctrl.smb.set_output(True)
+                self._ctrl.smb.start_sweep()
         if "rf_output" in cfg:
             self._ctrl.smb.set_output(bool(cfg["rf_output"]))
         return self._ctrl.smb.query_config()
 
     def _apply_lockin_config(self, cfg: Dict[str, Any]) -> dict:
         channel = int(cfg.get("channel", 1))
+        applied = False
         if "input" in cfg:
             data = dict(cfg["input"], channel=channel)
             self._execute(Command(CommandType.LOCKIN_SET_INPUT, data, source="system"))
+            applied = True
         if "ref" in cfg:
             data = dict(cfg["ref"], channel=channel)
             self._execute(Command(CommandType.LOCKIN_SET_REF_PHASE, data, source="system"))
+            applied = True
         if "gain_tc" in cfg:
             data = dict(cfg["gain_tc"], channel=channel)
             self._execute(Command(CommandType.LOCKIN_SET_GAIN_TC, data, source="system"))
+            applied = True
         if "output" in cfg:
             data = dict(cfg["output"], channel=channel)
             self._execute(Command(CommandType.LOCKIN_SET_OUTPUT, data, source="system"))
+            applied = True
         if "auto" in cfg:
             auto = cfg["auto"]
             if auto.get("gain"):
                 self._ctrl.lockin.auto_gain(channel)
+                applied = True
             if auto.get("reserve"):
                 self._ctrl.lockin.auto_reserve(channel)
+                applied = True
             if auto.get("phase"):
                 self._ctrl.lockin.auto_phase(channel)
+                applied = True
+        if not applied:
+            return {"channel": channel}
         return self._ctrl.lockin.query_config(channel)
 
     def _set_lockin_display_refresh_policy(self, params: Dict[str, Any]) -> dict:
@@ -864,6 +890,16 @@ class CommandService(QObject):
                 continue
             if "magnetic_field" in step:
                 self._resolve_field_step(step["magnetic_field"])
+            acq = step.get("acquisition", {})
+            if isinstance(acq, dict):
+                start_trigger = acq.get("start_trigger", "step_start")
+                stop_trigger = acq.get("stop_trigger", "hold_elapsed")
+                valid_start = {"step_start", "setpoints_applied", "magnetic_settled", "microwave_output_on", "microwave_sweep_start", "disabled"}
+                valid_stop = {"hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end", "disabled"}
+                if start_trigger not in valid_start:
+                    errors.append(f"step {idx} acquisition.start_trigger 无效: {start_trigger}")
+                if stop_trigger not in valid_stop:
+                    errors.append(f"step {idx} acquisition.stop_trigger 无效: {stop_trigger}")
         return {"valid": not errors, "errors": errors, "steps": len(steps) if isinstance(steps, list) else 0}
 
     def _start_experiment(self, plan: Dict[str, Any]) -> dict:
@@ -898,11 +934,18 @@ class CommandService(QObject):
                         break
                     self._wait_experiment_unpaused()
                     self._experiment_state.update({"running": True, "paused": False, "step_index": idx, "loop_index": loop, "step_name": step.get("name", "")})
-                    self._apply_experiment_step(step)
                     timing = step.get("timing", {})
                     settle = float(timing.get("settle_s", step.get("settle_s", 0.0)))
                     hold = float(timing.get("hold_s", step.get("hold_s", 0.0)))
                     trigger = timing.get("trigger", step.get("trigger", "immediate"))
+                    acq = step.get("acquisition", {}) if isinstance(step.get("acquisition", {}), dict) else {}
+                    start_trigger = acq.get("start_trigger", "step_start")
+                    stop_trigger = acq.get("stop_trigger", "hold_elapsed")
+                    if start_trigger == "step_start":
+                        self._apply_acquisition_action(step, start=True)
+                    self._apply_experiment_step(step)
+                    if start_trigger in {"setpoints_applied", "microwave_output_on", "microwave_sweep_start"}:
+                        self._apply_acquisition_action(step, start=True)
                     if trigger == "manual":
                         self._experiment_manual_advance.clear()
                         while not self._experiment_stop.is_set() and not self._experiment_manual_advance.wait(0.1):
@@ -910,7 +953,15 @@ class CommandService(QObject):
                     elif trigger == "delay":
                         self._interruptible_experiment_sleep(float(timing.get("delay_s", 0.0)))
                     self._interruptible_experiment_sleep(settle)
+                    if start_trigger == "magnetic_settled":
+                        self._apply_acquisition_action(step, start=True)
                     self._interruptible_experiment_sleep(hold)
+                    if stop_trigger == "manual":
+                        self._experiment_manual_advance.clear()
+                        while not self._experiment_stop.is_set() and not self._experiment_manual_advance.wait(0.1):
+                            self._wait_experiment_unpaused()
+                    if stop_trigger in {"hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end"}:
+                        self._apply_acquisition_action(step, start=False)
                 loop += 1
         except Exception as exc:
             self._experiment_state["error"] = str(exc)
@@ -946,10 +997,33 @@ class CommandService(QObject):
                 self._execute(Command(CommandType.LASER_SET_OUTPUT, {"enabled": laser["output"]}, source="experiment"))
         if "acquisition" in step:
             acq = step["acquisition"]
-            if acq.get("start_recording"):
+            if acq.get("start_recording") and acq.get("start_trigger") == "inline":
                 self._execute(Command(CommandType.ACQ_START_RECORDING, {"output_dir": acq.get("output_dir")}, source="experiment"))
-            if acq.get("stop_recording"):
+            if acq.get("stop_recording") and acq.get("stop_trigger") == "inline":
                 self._execute(Command(CommandType.ACQ_STOP_RECORDING, {"stop_acquire": bool(acq.get("stop_acquire", False))}, source="experiment"))
+
+    def _apply_acquisition_action(self, step: Dict[str, Any], *, start: bool) -> None:
+        acq = step.get("acquisition", {})
+        if not isinstance(acq, dict):
+            return
+        if start:
+            if acq.get("start_recording", False) and self._acq_recorder is None:
+                self._experiment_state["phase"] = "acquisition_start"
+                self._execute(Command(
+                    CommandType.ACQ_START_RECORDING,
+                    {"output_dir": acq.get("output_dir")},
+                    source="experiment",
+                ))
+            elif acq.get("start_stream", False) and not self._ctrl.is_acquiring:
+                self._ctrl.start_lockin_acquire(None)
+            return
+        if acq.get("stop_recording", True) and self._acq_recorder is not None:
+            self._experiment_state["phase"] = "acquisition_stop"
+            self._execute(Command(
+                CommandType.ACQ_STOP_RECORDING,
+                {"stop_acquire": bool(acq.get("stop_acquire", False))},
+                source="experiment",
+            ))
 
     @staticmethod
     def _resolve_field_step(field: Dict[str, Any]) -> Dict[str, float]:

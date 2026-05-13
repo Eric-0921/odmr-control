@@ -234,6 +234,24 @@ class AgentAPI:
         cmd = Command(CommandType.MAG_LOCK_ZERO, {"axis": axis, "locked": locked}, source="agent")
         return self._svc.submit_sync(cmd, timeout_ms)
 
+    def capture_magnetic_background(
+        self, axis: str, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """回读单轴当前电源电流并保存为背景零偏。"""
+        cmd = Command(CommandType.MAG_CAPTURE_BACKGROUND, {"axis": axis}, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def prepare_magnetic_zero_lock(
+        self, axis: str, capture_readback: bool = False, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """按连接-输出零偏-可选回读-锁零工作流准备单轴磁场。"""
+        cmd = Command(
+            CommandType.MAG_PREPARE_ZERO_LOCK,
+            {"axis": axis, "capture_readback": capture_readback},
+            source="agent",
+        )
+        return self._svc.submit_sync(cmd, timeout_ms)
+
     def get_magnetic_state(
         self, axis: Optional[str] = None, timeout_ms: int = 5000
     ) -> Tuple[bool, str, dict]:
