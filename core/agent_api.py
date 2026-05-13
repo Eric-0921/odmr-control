@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from core.command_service import CommandService
@@ -94,6 +95,16 @@ class AgentAPI:
         cmd = Command(CommandType.SMB_QUERY_STATE, source="agent")
         return self._svc.submit_sync(cmd, timeout_ms)
 
+    def query_smb_config(self, timeout_ms: int = 5000) -> Tuple[bool, str, dict]:
+        """读取 SMB100A 面板分组配置快照。"""
+        cmd = Command(CommandType.SMB_QUERY_CONFIG, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def apply_smb_config(self, config: Dict[str, Any], timeout_ms: int = 5000) -> Tuple[bool, str, dict]:
+        """按统一配置对象应用 SMB100A CW/LF/sweep/modulation 设置。"""
+        cmd = Command(CommandType.SMB_APPLY_CONFIG, config, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
     # -- OE1022D 快捷方法 ----------------------------------------------------
 
     def get_lockin_snapd(
@@ -108,6 +119,20 @@ class AgentAPI:
     ) -> Tuple[bool, str, dict]:
         """获取 OE1022D 通道的状态（过载、PLL）。"""
         cmd = Command(CommandType.LOCKIN_QUERY_STATUS, {"channel": channel}, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def query_lockin_config(
+        self, channel: int = 1, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """读取 OE1022D 指定通道的结构化配置快照。"""
+        cmd = Command(CommandType.LOCKIN_QUERY_CONFIG, {"channel": channel}, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def apply_lockin_config(
+        self, config: Dict[str, Any], timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """应用 OE1022D input/ref/gain_tc/output/auto 配置对象。"""
+        cmd = Command(CommandType.LOCKIN_APPLY_CONFIG, config, source="agent")
         return self._svc.submit_sync(cmd, timeout_ms)
 
     def start_lockin_acquisition(
@@ -217,6 +242,19 @@ class AgentAPI:
         cmd = Command(CommandType.MAG_QUERY_STATE, params, source="agent")
         return self._svc.submit_sync(cmd, timeout_ms)
 
+    def scan_magnetic_ports(self, timeout_ms: int = 10000) -> Tuple[bool, str, dict]:
+        """扫描串口并读取磁场电源 IDN。"""
+        cmd = Command(CommandType.MAG_SCAN_PORTS, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def auto_detect_magnetic_axes(
+        self, bindings: Optional[Dict[str, Any]] = None, timeout_ms: int = 10000
+    ) -> Tuple[bool, str, dict]:
+        """按 IDN 绑定自动匹配 X/Y/Z 磁场电源。"""
+        params = {"bindings": bindings} if bindings is not None else {}
+        cmd = Command(CommandType.MAG_AUTO_DETECT, params, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
     def set_lockin_time_constant(
         self, channel: int, index: int, timeout_ms: int = 5000
     ) -> Tuple[bool, str, dict]:
@@ -253,6 +291,52 @@ class AgentAPI:
     def get_all_status(self, timeout_ms: int = 5000) -> Tuple[bool, str, dict]:
         """获取所有已连接设备的状态。"""
         cmd = Command(CommandType.SYS_QUERY_ALL_STATUS, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    # -- 统一实验 JSON -------------------------------------------------------
+
+    def load_experiment_json(
+        self, path_or_dict: str | Path | Dict[str, Any], timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """加载统一实验 JSON 文件或 dict。"""
+        params = {"plan": path_or_dict} if isinstance(path_or_dict, dict) else {"path": str(path_or_dict)}
+        cmd = Command(CommandType.EXPERIMENT_LOAD_JSON, params, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def validate_experiment_plan(
+        self, plan: Optional[Dict[str, Any]] = None, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """校验统一实验 JSON。plan 为空时校验已加载计划。"""
+        params = {"plan": plan} if plan is not None else {}
+        cmd = Command(CommandType.EXPERIMENT_VALIDATE, params, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def start_experiment(
+        self, plan: Optional[Dict[str, Any]] = None, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """启动统一实验序列。plan 为空时使用已加载计划。"""
+        params = {"plan": plan} if plan is not None else {}
+        cmd = Command(CommandType.EXPERIMENT_START, params, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def pause_experiment(self, timeout_ms: int = 5000) -> Tuple[bool, str, dict]:
+        """暂停当前实验序列。"""
+        cmd = Command(CommandType.EXPERIMENT_PAUSE, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def resume_experiment(self, timeout_ms: int = 5000) -> Tuple[bool, str, dict]:
+        """继续当前实验序列。"""
+        cmd = Command(CommandType.EXPERIMENT_RESUME, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def stop_experiment(self, timeout_ms: int = 5000) -> Tuple[bool, str, dict]:
+        """停止当前实验序列并触发默认安全策略。"""
+        cmd = Command(CommandType.EXPERIMENT_STOP, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def get_experiment_state(self, timeout_ms: int = 5000) -> Tuple[bool, str, dict]:
+        """查询统一实验序列状态。"""
+        cmd = Command(CommandType.EXPERIMENT_QUERY_STATE, source="agent")
         return self._svc.submit_sync(cmd, timeout_ms)
 
     # -- 高级组合操作 --------------------------------------------------------

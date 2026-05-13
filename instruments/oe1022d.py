@@ -57,6 +57,38 @@ RALL_PARAM_COUNT = len(RALL_PARAMS)
 # SNAPD? 1,0,1,2,3  ->  CH-A: X=0, Y=1, R=2, θ=3
 SNAPD_FIELDS = ["X", "Y", "R", "theta"]
 
+TIME_CONSTANTS = {
+    0: ("10 us", 0.00001),
+    1: ("30 us", 0.00003),
+    2: ("100 us", 0.0001),
+    3: ("300 us", 0.0003),
+    4: ("1 ms", 0.001),
+    5: ("3 ms", 0.003),
+    6: ("10 ms", 0.010),
+    7: ("30 ms", 0.030),
+    8: ("100 ms", 0.100),
+    9: ("300 ms", 0.300),
+    10: ("1 s", 1.0),
+    11: ("3 s", 3.0),
+    12: ("10 s", 10.0),
+    13: ("30 s", 30.0),
+    14: ("100 s", 100.0),
+    15: ("300 s", 300.0),
+    16: ("1 ks", 1000.0),
+    17: ("3 ks", 3000.0),
+}
+
+SENSITIVITY_LABELS = {
+    0: "1 nV", 1: "2 nV", 2: "5 nV", 3: "10 nV", 4: "20 nV", 5: "50 nV",
+    6: "100 nV", 7: "200 nV", 8: "500 nV", 9: "1 uV", 10: "2 uV", 11: "5 uV",
+    12: "10 uV", 13: "20 uV", 14: "50 uV", 15: "100 uV", 16: "200 uV", 17: "500 uV",
+    18: "1 mV", 19: "2 mV", 20: "5 mV", 21: "10 mV", 22: "20 mV", 23: "50 mV",
+    24: "100 mV", 25: "200 mV", 26: "500 mV", 27: "1 V",
+}
+
+FILTER_SLOPES = {0: "6 dB/oct", 1: "12 dB/oct", 2: "18 dB/oct", 3: "24 dB/oct"}
+RESERVE_LABELS = {0: "Low", 1: "Normal", 2: "High"}
+
 
 class OE1022DDriver:
     """OE1022D DSP Lock-In Amplifier serial driver."""
@@ -298,6 +330,43 @@ class OE1022DDriver:
             data[col_name] = samples * scale
         return data
 
+    @staticmethod
+    def parse_rall_config(raw: bytes) -> Dict[str, Dict[str, object]]:
+        """Parse the RALL? configuration snapshot region when available.
+
+        The manual maps key CH-A bytes at offsets 8390/8391/8404/8405/8406 and
+        status bytes at 8479..8481. CH-B uses the same block stride observed in
+        the configuration table. Missing or short packets return empty channel
+        dictionaries instead of failing the data path.
+        """
+        if len(raw) < 8482:
+            return {"A": {}, "B": {}}
+
+        def _byte(offset: int) -> int:
+            if offset >= len(raw):
+                return 0
+            return raw[offset]
+
+        def _channel(base_shift: int) -> Dict[str, object]:
+            tc_idx = _byte(8404 + base_shift)
+            return {
+                "sensitivity_index": _byte(8390 + base_shift),
+                "sensitivity": SENSITIVITY_LABELS.get(_byte(8390 + base_shift), str(_byte(8390 + base_shift))),
+                "reserve_index": _byte(8391 + base_shift),
+                "reserve": RESERVE_LABELS.get(_byte(8391 + base_shift), str(_byte(8391 + base_shift))),
+                "time_constant_index": tc_idx,
+                "time_constant": TIME_CONSTANTS.get(tc_idx, (str(tc_idx), 0.0))[0],
+                "time_constant_s": TIME_CONSTANTS.get(tc_idx, ("", 0.0))[1],
+                "filter_slope_index": _byte(8405 + base_shift),
+                "filter_slope": FILTER_SLOPES.get(_byte(8405 + base_shift), str(_byte(8405 + base_shift))),
+                "sync_filter": bool(_byte(8406 + base_shift)),
+                "input_overload": bool(_byte(8479 + base_shift)),
+                "gain_overload": bool(_byte(8480 + base_shift)),
+                "pll_locked": bool(_byte(8481 + base_shift)),
+            }
+
+        return {"A": _channel(0), "B": _channel(96)}
+
     # -- status queries ------------------------------------------------------
 
     def get_input_overload(self, channel: int = 1) -> bool:
@@ -345,6 +414,13 @@ class OE1022DDriver:
     def set_line_notch(self, channel: int = 1, mode: int = 1) -> None:
         """mode: 0=Off, 1=50Hz, 2=50+100Hz, 3=100Hz"""
         self._exchange_ascii(f"ILIND {channel},{mode}")
+
+    def get_index(self, mnemonic: str, channel: int = 1, default: int = 0) -> int:
+        resp = self._exchange_ascii(f"{mnemonic}? {channel}")
+        try:
+            return int(float(resp.split(",")[-1].strip()))
+        except Exception:
+            return default
 
     # -- INPUT / FILTERS -----------------------------------------------------
 
@@ -411,6 +487,57 @@ class OE1022DDriver:
     def set_output_expand(self, channel: int = 1, output_ch: int = 1, expand: int = 0) -> None:
         """输出扩展: 0=1, 1=10, 2=100。"""
         self._exchange_ascii(f"OEXPD {channel},{output_ch},{expand}")
+
+    def set_output_speed(self, channel: int = 1, output_ch: int = 1, speed: int = 0) -> None:
+        """输出速率: 0=Fast, 1=Slow."""
+        self._exchange_ascii(f"OSPD {channel},{output_ch},{speed}")
+
+    def set_aux_output_voltage(self, channel: int = 1, output_ch: int = 1, voltage_v: float = 0.0) -> None:
+        self._exchange_ascii(f"OAUXD {channel},{output_ch},{int(voltage_v * 1000)}")
+
+    def query_config(self, channel: int = 1) -> Dict[str, object]:
+        """Best-effort query of the main front-panel configuration."""
+        config: Dict[str, object] = {"channel": channel}
+        query_map = {
+            "input_source": ("FMODD", 0),
+            "current_gain": ("ICNPD", 0),
+            "ground": ("IGNDD", 0),
+            "coupling": ("ICPLD", 0),
+            "line_notch": ("ILIND", 1),
+            "ref_source": ("RSLPD", 0),
+            "ref_slope": ("RMODD", 0),
+            "harmonic": ("HMODD", 1),
+            "sensitivity_index": ("SENSD", 10),
+            "reserve_index": ("RMODD", 1),
+            "time_constant_index": ("OFLTD", 6),
+            "filter_slope_index": ("OFSLD", 2),
+            "sync_filter": ("SYNCD", 1),
+        }
+        for key, (mnemonic, default) in query_map.items():
+            config[key] = self.get_index(mnemonic, channel, default)
+        tc_idx = int(config.get("time_constant_index", 6))
+        sens_idx = int(config.get("sensitivity_index", 10))
+        slope_idx = int(config.get("filter_slope_index", 2))
+        reserve_idx = int(config.get("reserve_index", 1))
+        config["time_constant"] = TIME_CONSTANTS.get(tc_idx, ("unknown", 0.0))[0]
+        config["time_constant_s"] = TIME_CONSTANTS.get(tc_idx, ("", 0.0))[1]
+        config["sensitivity"] = SENSITIVITY_LABELS.get(sens_idx, str(sens_idx))
+        config["filter_slope"] = FILTER_SLOPES.get(slope_idx, str(slope_idx))
+        config["reserve"] = RESERVE_LABELS.get(reserve_idx, str(reserve_idx))
+        try:
+            config["input_overload"] = self.get_input_overload(channel)
+            config["gain_overload"] = self.get_gain_overload(channel)
+            config["pll_locked"] = self.get_pll_locked(channel)
+        except Exception:
+            pass
+        return config
+
+    @staticmethod
+    def display_interval_for_time_constant(index: int, min_ms: int = 50, max_ms: int = 300) -> int:
+        tc_s = TIME_CONSTANTS.get(index, ("", 0.010))[1]
+        if tc_s <= 0.030:
+            return max(min_ms, 50)
+        return int(min(max(tc_s * 1000.0 / 3.0, 100.0), float(max_ms)))
 
     # -- convenience ---------------------------------------------------------
 

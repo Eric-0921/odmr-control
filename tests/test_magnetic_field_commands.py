@@ -50,6 +50,28 @@ class TestMagneticFieldCommands(unittest.TestCase):
         self.assertEqual(sorted(result["axes"].keys()), ["X", "Y", "Z"])
         self.assertFalse(result["axes"]["X"]["connected"])
 
+    def test_auto_detect_matches_axis_bindings_by_idn(self):
+        devices = [
+            {"port": "/dev/tty.x", "idn": "PSU-X,SN001"},
+            {"port": "/dev/tty.y", "idn": "PSU-Y,SN002"},
+        ]
+        self.ctrl.mag.scan_device_ports = lambda baudrate=9600: devices
+
+        result = self.service._execute(Command(
+            CommandType.MAG_AUTO_DETECT,
+            {"bindings": {"X": "PSU-X,SN001", "Y": "PSU-Y,SN002"}},
+        ))
+
+        self.assertEqual(result["matched"]["X"]["port"], "/dev/tty.x")
+        self.assertEqual(result["matched"]["Y"]["idn"], "PSU-Y,SN002")
+
+    def test_connect_all_rejects_duplicate_ports_before_hardware(self):
+        with self.assertRaises(Exception):
+            self.service._execute(Command(
+                CommandType.MAG_CONNECT_ALL,
+                {"ports": {"X": "/dev/tty.same", "Y": "/dev/tty.same", "Z": ""}},
+            ))
+
 
 if __name__ == "__main__":
     unittest.main()

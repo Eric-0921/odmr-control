@@ -40,6 +40,7 @@ class LockinAcquireWorker(QObject):
         self._stop_requested = False
         self._batch_count = 0
         self._dropped = 0
+        self._last_batch_time_s = 0.0
         self._state_lock = threading.Lock()
         self._smb_freq_hz = 0.0
         self._smb_power_dbm = 0.0
@@ -114,6 +115,13 @@ class LockinAcquireWorker(QObject):
 
                     consecutive_errors = 0
                     batch = self._driver.parse_rall(raw)
+                    config_snapshot = self._driver.parse_rall_config(raw)
+                    batch["config_snapshot"] = config_snapshot
+                    batch["acquisition_stats"] = {
+                        "batch_count": self._batch_count + 1,
+                        "dropped_batches": self._dropped,
+                        "batch_rate_hz": self._batch_rate(t_start),
+                    }
                     self.batch_ready.emit(batch)
                     self._batch_count += 1
 
@@ -181,6 +189,16 @@ class LockinAcquireWorker(QObject):
 
     def stop(self) -> None:
         self._stop_requested = True
+
+    def _batch_rate(self, now_s: float) -> float:
+        if self._last_batch_time_s <= 0:
+            self._last_batch_time_s = now_s
+            return 0.0
+        dt = now_s - self._last_batch_time_s
+        self._last_batch_time_s = now_s
+        if dt <= 0:
+            return 0.0
+        return 1.0 / dt
 
     def _drain_commands(self) -> None:
         while True:

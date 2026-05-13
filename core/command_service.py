@@ -11,6 +11,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,6 +19,8 @@ from PyQt5.QtCore import QObject, QThread, pyqtSignal
 
 from core.commands import Command, CommandType
 from core.instrument_controller import InstrumentController
+from core.mag_sequence_engine import FieldSequence, FieldStep, SequenceEngine
+from core.vector_field import SphericalField, spherical_to_cartesian
 from core.timestamp_sync import TimestampSyncHub, TimestampedSample
 from data.recorder import ODMRRecorder
 
@@ -62,6 +65,13 @@ class CommandService(QObject):
         self._worker_thread: Optional[QThread] = None
         self._running = False
         self._acq_recorder: Optional[ODMRRecorder] = None
+        self._mag_sequence = SequenceEngine(controller.mag)
+        self._experiment_plan: Optional[Dict[str, Any]] = None
+        self._experiment_state: Dict[str, Any] = {"running": False, "paused": False, "step_index": -1}
+        self._experiment_thread: Optional[threading.Thread] = None
+        self._experiment_stop = threading.Event()
+        self._experiment_pause = threading.Event()
+        self._experiment_manual_advance = threading.Event()
 
         # 时间戳同步中心
         self._ts_hub = TimestampSyncHub()
@@ -237,6 +247,10 @@ class CommandService(QObject):
             # 简化版：仅开关 FM 调制
             enabled = bool(p.get("enabled", False))
             self._ctrl.smb.set_fm_state(enabled)
+            if "am_state" in p:
+                self._ctrl.smb.set_am_state(bool(p["am_state"]))
+            if "am_depth_pct" in p:
+                self._ctrl.smb.set_am_depth(float(p["am_depth_pct"]))
             return {"enabled": enabled}
 
         if ct == CommandType.SMB_SET_SWEEP:
@@ -261,6 +275,12 @@ class CommandService(QObject):
 
         if ct == CommandType.SMB_QUERY_STATE:
             return self._query_smb_state()
+
+        if ct == CommandType.SMB_QUERY_CONFIG:
+            return self._ctrl.smb.query_config()
+
+        if ct == CommandType.SMB_APPLY_CONFIG:
+            return self._apply_smb_config(p)
 
         if ct == CommandType.SMB_EMERGENCY_STOP:
             self._ctrl.smb.emergency_stop()
@@ -378,6 +398,16 @@ class CommandService(QObject):
             )
             return {"status": "configured"}
 
+        if ct == CommandType.LOCKIN_QUERY_CONFIG:
+            ch = int(p.get("channel", 1))
+            return self._ctrl.lockin.query_config(ch)
+
+        if ct == CommandType.LOCKIN_APPLY_CONFIG:
+            return self._apply_lockin_config(p)
+
+        if ct == CommandType.LOCKIN_SET_DISPLAY_REFRESH_POLICY:
+            return self._set_lockin_display_refresh_policy(p)
+
         # ===== 采集 =====
         if ct == CommandType.ACQ_SET_SAMPLING:
             interval_ms = int(p.get("interval_ms", 50))
@@ -425,6 +455,10 @@ class CommandService(QObject):
 
         if ct == CommandType.MAG_CONNECT_ALL:
             ports = dict(p.get("ports", {}))
+            selected = [port for port in ports.values() if port]
+            duplicates = sorted({port for port in selected if selected.count(port) > 1})
+            if duplicates:
+                raise SafetyError(f"重复串口已阻止: {', '.join(duplicates)}")
             results = self._ctrl.mag.connect_all(ports, int(p.get("baudrate", 9600)))
             for axis in ("X", "Y", "Z"):
                 axis_cfg = p.get("axes", {}).get(axis, {})
@@ -435,6 +469,34 @@ class CommandService(QObject):
         if ct == CommandType.MAG_DISCONNECT_ALL:
             self._ctrl.mag.disconnect_all()
             return {}
+
+        if ct == CommandType.MAG_SCAN_PORTS:
+            baudrate = int(p.get("baudrate", self._config.get("magnetic_field", {}).get("baudrate", 9600)))
+            return {"devices": self._ctrl.mag.scan_device_ports(baudrate)}
+
+        if ct == CommandType.MAG_AUTO_DETECT:
+            baudrate = int(p.get("baudrate", self._config.get("magnetic_field", {}).get("baudrate", 9600)))
+            devices = self._ctrl.mag.scan_device_ports(baudrate)
+            bindings = p.get("bindings") or self._mag_axis_bindings()
+            matched_ports = self._ctrl.mag.match_devices_to_axes(devices, bindings)
+            port_to_idn = {item.get("port"): item.get("idn", "") for item in devices}
+            matched = {
+                axis: {"port": port or "", "idn": port_to_idn.get(port, "")}
+                for axis, port in matched_ports.items()
+            }
+            return {"devices": devices, "matched": matched}
+
+        if ct == CommandType.MAG_BIND_AXIS_IDN:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            binding = {"idn": str(p.get("idn", "")), "port": str(p.get("port", ""))}
+            self._config.setdefault("magnetic_field", {}).setdefault("bindings", {})[axis] = binding
+            return {"axis": axis, "binding": binding}
+
+        if ct == CommandType.MAG_SET_POLL_INTERVAL:
+            interval_ms = int(p["interval_ms"])
+            self._ctrl.mag.set_poll_interval_ms(interval_ms)
+            self._config.setdefault("magnetic_field", {})["poll_interval_ms"] = interval_ms
+            return {"interval_ms": interval_ms}
 
         if ct == CommandType.MAG_SET_FIELD:
             axis = self._normalize_axis(p.get("axis", "X"))
@@ -499,6 +561,27 @@ class CommandService(QObject):
             self._ctrl.mag.all_output_off()
             return self._ctrl.mag.verify_emergency_stop()
 
+        if ct == CommandType.MAG_LOAD_SEQUENCE:
+            seq = self._load_mag_sequence(p)
+            self._mag_sequence.load_sequence(seq)
+            return {"name": seq.name, "steps": len(seq.steps)}
+
+        if ct == CommandType.MAG_START_SEQUENCE:
+            self._mag_sequence.start(p.get("record_path"))
+            return {"running": True}
+
+        if ct == CommandType.MAG_PAUSE_SEQUENCE:
+            self._mag_sequence.pause()
+            return {"paused": True}
+
+        if ct == CommandType.MAG_RESUME_SEQUENCE:
+            self._mag_sequence.resume()
+            return {"paused": False}
+
+        if ct == CommandType.MAG_STOP_SEQUENCE:
+            self._mag_sequence.stop()
+            return {"running": False}
+
         # ===== 激光器 =====
         if ct == CommandType.LASER_CONNECT:
             idn = self._ctrl.connect_laser(
@@ -557,6 +640,43 @@ class CommandService(QObject):
                 result["magnetic_field"] = self._ctrl.mag.get_field_snapshot()
             return result
 
+        # ===== 统一实验自动化 =====
+        if ct == CommandType.EXPERIMENT_LOAD_JSON:
+            plan = self._load_experiment_plan(p)
+            self._experiment_plan = plan
+            return self._validate_experiment_plan(plan)
+
+        if ct == CommandType.EXPERIMENT_VALIDATE:
+            plan = self._load_experiment_plan(p) if p else self._experiment_plan
+            if plan is None:
+                raise ValueError("未加载实验 JSON")
+            return self._validate_experiment_plan(plan)
+
+        if ct == CommandType.EXPERIMENT_START:
+            plan = self._load_experiment_plan(p) if ("path" in p or "plan" in p) else self._experiment_plan
+            if plan is None:
+                raise ValueError("未加载实验 JSON")
+            return self._start_experiment(plan)
+
+        if ct == CommandType.EXPERIMENT_PAUSE:
+            self._experiment_pause.set()
+            self._experiment_state["paused"] = True
+            return self._experiment_state.copy()
+
+        if ct == CommandType.EXPERIMENT_RESUME:
+            self._experiment_pause.clear()
+            self._experiment_manual_advance.set()
+            self._experiment_state["paused"] = False
+            return self._experiment_state.copy()
+
+        if ct == CommandType.EXPERIMENT_STOP:
+            self._experiment_stop.set()
+            self._experiment_manual_advance.set()
+            return self._experiment_state.copy()
+
+        if ct == CommandType.EXPERIMENT_QUERY_STATE:
+            return self._experiment_state.copy()
+
         raise NotImplementedError(f"未实现的命令类型: {ct.name}")
 
     # -- safety checks -------------------------------------------------------
@@ -581,12 +701,106 @@ class CommandService(QObject):
                 f"激光功率 {power_mw} mW 超出安全范围 [0, {max_mw}] mW"
             )
 
+    def _apply_smb_config(self, cfg: Dict[str, Any]) -> dict:
+        if "frequency_hz" in cfg:
+            self._ctrl.smb.set_freq_cw(float(cfg["frequency_hz"]))
+        if "power_dbm" in cfg:
+            self._check_power_limit(float(cfg["power_dbm"]))
+            self._ctrl.smb.set_power(float(cfg["power_dbm"]))
+        if "phase_deg" in cfg:
+            self._ctrl.smb.set_phase(float(cfg["phase_deg"]))
+        if "level_offset_db" in cfg:
+            self._ctrl.smb.set_level_offset(float(cfg["level_offset_db"]))
+        if "lf" in cfg:
+            lf = cfg["lf"]
+            if "frequency_hz" in lf:
+                self._ctrl.smb.set_lf_freq(float(lf["frequency_hz"]))
+            if "voltage_mv" in lf:
+                self._ctrl.smb.set_lf_voltage(float(lf["voltage_mv"]))
+            if "shape" in lf:
+                self._ctrl.smb.set_lf_shape(str(lf["shape"]))
+            if "impedance" in lf:
+                self._ctrl.smb.set_lf_impedance(str(lf["impedance"]))
+            if "output" in lf:
+                self._ctrl.smb.set_lf_output(bool(lf["output"]))
+        if "modulation" in cfg:
+            mod = cfg["modulation"]
+            if "fm_deviation_hz" in mod:
+                self._ctrl.smb.set_fm_deviation(float(mod["fm_deviation_hz"]))
+            if "fm_state" in mod:
+                self._ctrl.smb.set_fm_state(bool(mod["fm_state"]))
+            if "am_depth_pct" in mod:
+                self._ctrl.smb.set_am_depth(float(mod["am_depth_pct"]))
+            if "am_state" in mod:
+                self._ctrl.smb.set_am_state(bool(mod["am_state"]))
+        if "sweep" in cfg:
+            sweep = cfg["sweep"]
+            if all(k in sweep for k in ("start_hz", "stop_hz", "step_hz", "dwell_ms")):
+                sweep_power = float(sweep.get("power_dbm", cfg.get("power_dbm", self._ctrl.smb.cached_power_dbm)))
+                self._check_power_limit(sweep_power)
+                self._ctrl.smb.configure_sweep(
+                    float(sweep["start_hz"]),
+                    float(sweep["stop_hz"]),
+                    float(sweep["step_hz"]),
+                    float(sweep["dwell_ms"]),
+                    sweep_power,
+                )
+            if "shape" in sweep:
+                self._ctrl.smb.set_sweep_shape(str(sweep["shape"]))
+            if "retrace" in sweep:
+                self._ctrl.smb.set_sweep_retrace(bool(sweep["retrace"]))
+            if "trigger" in sweep:
+                self._ctrl.smb.set_sweep_trigger_source(str(sweep["trigger"]))
+        if "rf_output" in cfg:
+            self._ctrl.smb.set_output(bool(cfg["rf_output"]))
+        return self._ctrl.smb.query_config()
+
+    def _apply_lockin_config(self, cfg: Dict[str, Any]) -> dict:
+        channel = int(cfg.get("channel", 1))
+        if "input" in cfg:
+            data = dict(cfg["input"], channel=channel)
+            self._execute(Command(CommandType.LOCKIN_SET_INPUT, data, source="system"))
+        if "ref" in cfg:
+            data = dict(cfg["ref"], channel=channel)
+            self._execute(Command(CommandType.LOCKIN_SET_REF_PHASE, data, source="system"))
+        if "gain_tc" in cfg:
+            data = dict(cfg["gain_tc"], channel=channel)
+            self._execute(Command(CommandType.LOCKIN_SET_GAIN_TC, data, source="system"))
+        if "output" in cfg:
+            data = dict(cfg["output"], channel=channel)
+            self._execute(Command(CommandType.LOCKIN_SET_OUTPUT, data, source="system"))
+        if "auto" in cfg:
+            auto = cfg["auto"]
+            if auto.get("gain"):
+                self._ctrl.lockin.auto_gain(channel)
+            if auto.get("reserve"):
+                self._ctrl.lockin.auto_reserve(channel)
+            if auto.get("phase"):
+                self._ctrl.lockin.auto_phase(channel)
+        return self._ctrl.lockin.query_config(channel)
+
+    def _set_lockin_display_refresh_policy(self, params: Dict[str, Any]) -> dict:
+        policy = {
+            **self._config.get("lockin", {}).get("display_refresh_policy", {}),
+            **params,
+        }
+        self._config.setdefault("lockin", {})["display_refresh_policy"] = policy
+        return policy
+
     @staticmethod
     def _normalize_axis(axis: object) -> str:
         value = str(axis).upper()
         if value not in ("X", "Y", "Z"):
             raise ValueError(f"无效磁场轴: {axis}")
         return value
+
+    def _mag_axis_bindings(self) -> Dict[str, str]:
+        raw = self._config.get("magnetic_field", {}).get("bindings", {})
+        result: Dict[str, str] = {}
+        for axis in ("X", "Y", "Z"):
+            value = raw.get(axis, "")
+            result[axis] = value.get("idn", "") if isinstance(value, dict) else str(value)
+        return result
 
     def _apply_mag_axis_config(self, axis: str, params: Dict[str, Any]) -> None:
         cfg = self._config.get("magnetic_field", {}).get("axes", {}).get(axis, {})
@@ -601,17 +815,188 @@ class CommandService(QObject):
             if not ok:
                 raise SafetyError(f"{axis} 轴零偏设置被拒绝")
 
+    def _load_mag_sequence(self, params: Dict[str, Any]) -> FieldSequence:
+        if "path" in params:
+            return SequenceEngine.load_sequence_file(str(params["path"]))
+        data = params.get("sequence", params)
+        steps = []
+        for step in data.get("steps", []):
+            steps.append(FieldStep(
+                name=step.get("name", ""),
+                field_x_nT=float(step.get("field_x_nT", step.get("x_nT", 0.0))),
+                field_y_nT=float(step.get("field_y_nT", step.get("y_nT", 0.0))),
+                field_z_nT=float(step.get("field_z_nT", step.get("z_nT", 0.0))),
+                hold_seconds=float(step.get("hold_seconds", step.get("hold_s", 0.0))),
+                settle_seconds=float(step.get("settle_seconds", step.get("settle_s", 0.5))),
+                trigger=step.get("trigger", "immediate"),
+                delay_seconds=float(step.get("delay_seconds", step.get("delay_s", 0.0))),
+            ))
+        return FieldSequence(
+            name=data.get("name", "Untitled"),
+            steps=steps,
+            loop_count=int(data.get("loop_count", 1)),
+            loop_delay=float(data.get("loop_delay", 0.0)),
+            return_to_zero=bool(data.get("return_to_zero", True)),
+        )
+
+    def _load_experiment_plan(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if "plan" in params:
+            plan = params["plan"]
+            if not isinstance(plan, dict):
+                raise ValueError("plan 必须是 dict")
+            return plan
+        if "path" in params:
+            return json.loads(Path(params["path"]).read_text(encoding="utf-8"))
+        return params
+
+    def _validate_experiment_plan(self, plan: Dict[str, Any]) -> dict:
+        errors = []
+        sequence = plan.get("sequence", [])
+        if isinstance(sequence, dict):
+            steps = sequence.get("steps", [])
+        else:
+            steps = sequence
+        if not isinstance(steps, list) or not steps:
+            errors.append("sequence.steps 不能为空")
+        for idx, step in enumerate(steps if isinstance(steps, list) else []):
+            if not isinstance(step, dict):
+                errors.append(f"step {idx} 必须是对象")
+                continue
+            if "magnetic_field" in step:
+                self._resolve_field_step(step["magnetic_field"])
+        return {"valid": not errors, "errors": errors, "steps": len(steps) if isinstance(steps, list) else 0}
+
+    def _start_experiment(self, plan: Dict[str, Any]) -> dict:
+        if self._experiment_thread is not None and self._experiment_thread.is_alive():
+            raise RuntimeError("实验正在运行")
+        validation = self._validate_experiment_plan(plan)
+        if not validation["valid"]:
+            raise ValueError("; ".join(validation["errors"]))
+        self._experiment_plan = plan
+        self._experiment_stop.clear()
+        self._experiment_pause.clear()
+        self._experiment_manual_advance.clear()
+        self._experiment_state = {"running": True, "paused": False, "step_index": -1, "error": ""}
+        self._experiment_thread = threading.Thread(
+            target=self._run_experiment_plan,
+            args=(plan,),
+            name="ODMRExperimentEngine",
+            daemon=True,
+        )
+        self._experiment_thread.start()
+        return self._experiment_state.copy()
+
+    def _run_experiment_plan(self, plan: Dict[str, Any]) -> None:
+        try:
+            sequence = plan.get("sequence", {})
+            steps = sequence.get("steps", sequence if isinstance(sequence, list) else [])
+            loop_count = int(sequence.get("loop_count", 1)) if isinstance(sequence, dict) else 1
+            loop = 0
+            while not self._experiment_stop.is_set() and (loop_count == 0 or loop < loop_count):
+                for idx, step in enumerate(steps):
+                    if self._experiment_stop.is_set():
+                        break
+                    self._wait_experiment_unpaused()
+                    self._experiment_state.update({"running": True, "paused": False, "step_index": idx, "loop_index": loop, "step_name": step.get("name", "")})
+                    self._apply_experiment_step(step)
+                    timing = step.get("timing", {})
+                    settle = float(timing.get("settle_s", step.get("settle_s", 0.0)))
+                    hold = float(timing.get("hold_s", step.get("hold_s", 0.0)))
+                    trigger = timing.get("trigger", step.get("trigger", "immediate"))
+                    if trigger == "manual":
+                        self._experiment_manual_advance.clear()
+                        while not self._experiment_stop.is_set() and not self._experiment_manual_advance.wait(0.1):
+                            self._wait_experiment_unpaused()
+                    elif trigger == "delay":
+                        self._interruptible_experiment_sleep(float(timing.get("delay_s", 0.0)))
+                    self._interruptible_experiment_sleep(settle)
+                    self._interruptible_experiment_sleep(hold)
+                loop += 1
+        except Exception as exc:
+            self._experiment_state["error"] = str(exc)
+            self._apply_experiment_safety()
+        finally:
+            self._experiment_state["running"] = False
+
+    def _wait_experiment_unpaused(self) -> None:
+        while self._experiment_pause.is_set() and not self._experiment_stop.is_set():
+            self._experiment_state["paused"] = True
+            time.sleep(0.1)
+        self._experiment_state["paused"] = False
+
+    def _interruptible_experiment_sleep(self, seconds: float) -> None:
+        end = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < end and not self._experiment_stop.is_set():
+            self._wait_experiment_unpaused()
+            time.sleep(min(0.1, end - time.monotonic()))
+
+    def _apply_experiment_step(self, step: Dict[str, Any]) -> None:
+        if "magnetic_field" in step:
+            field = self._resolve_field_step(step["magnetic_field"])
+            self._execute(Command(CommandType.MAG_SET_FIELD_3D, field, source="experiment"))
+        if "microwave" in step:
+            self._apply_smb_config(step["microwave"])
+        if "lockin" in step:
+            self._apply_lockin_config(step["lockin"])
+        if "laser" in step:
+            laser = step["laser"]
+            if "power_mw" in laser:
+                self._execute(Command(CommandType.LASER_SET_POWER, {"power_mw": laser["power_mw"]}, source="experiment"))
+            if "output" in laser:
+                self._execute(Command(CommandType.LASER_SET_OUTPUT, {"enabled": laser["output"]}, source="experiment"))
+        if "acquisition" in step:
+            acq = step["acquisition"]
+            if acq.get("start_recording"):
+                self._execute(Command(CommandType.ACQ_START_RECORDING, {"output_dir": acq.get("output_dir")}, source="experiment"))
+            if acq.get("stop_recording"):
+                self._execute(Command(CommandType.ACQ_STOP_RECORDING, {"stop_acquire": bool(acq.get("stop_acquire", False))}, source="experiment"))
+
+    @staticmethod
+    def _resolve_field_step(field: Dict[str, Any]) -> Dict[str, float]:
+        if all(k in field for k in ("magnitude_nT", "theta_deg", "phi_deg")):
+            cart = spherical_to_cartesian(SphericalField(
+                float(field["magnitude_nT"]),
+                float(field["theta_deg"]),
+                float(field["phi_deg"]),
+            ))
+            return {"x_nT": cart.x_nT, "y_nT": cart.y_nT, "z_nT": cart.z_nT}
+        return {
+            "x_nT": float(field.get("x_nT", field.get("field_x_nT", 0.0))),
+            "y_nT": float(field.get("y_nT", field.get("field_y_nT", 0.0))),
+            "z_nT": float(field.get("z_nT", field.get("field_z_nT", 0.0))),
+        }
+
+    def _apply_experiment_safety(self) -> None:
+        try:
+            self._ctrl.smb.emergency_stop()
+        except Exception:
+            pass
+        try:
+            self._ctrl.mag.all_output_off()
+        except Exception:
+            pass
+        try:
+            if self._acq_recorder is not None:
+                self._execute(Command(CommandType.ACQ_STOP_RECORDING, {"stop_acquire": False}, source="experiment"))
+        except Exception:
+            pass
+
     # -- state helpers -------------------------------------------------------
 
     def _query_smb_state(self) -> dict:
         """查询 SMB100A 完整状态。"""
         smb = self._ctrl.smb
-        return {
+        state = {
             "freq_hz": smb.cached_freq_hz,
             "power_dbm": smb.cached_power_dbm,
             "output_on": smb.cached_output_on,
             "mode": smb.cached_mode,
         }
+        try:
+            state.update(smb.query_config())
+        except Exception:
+            pass
+        return state
 
     def _create_recorder(self, params: Dict[str, Any]) -> ODMRRecorder:
         """创建并启动一次 CSV 记录会话。"""
