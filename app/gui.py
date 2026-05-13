@@ -1286,13 +1286,11 @@ class ODMRControlGUI(QMainWindow):
         self._waveform_page_active = True
         if not self._waveform_rall_running and self._ctrl.is_lockin_connected:
             try:
-                if self._cmd_service is not None:
-                    self._cmd_service.submit(Command(CommandType.LOCKIN_START_ACQUIRE, source="gui"))
-                else:
-                    self._ctrl.start_lockin_acquire(None)
+                self._ctrl.start_lockin_acquire(None)
                 self._waveform_rall_running = True
                 self._on_log("[Waveform] RALL? 启动", "lockin")
             except Exception as exc:
+                self._waveform_rall_running = False
                 self._on_error(f"[Waveform] RALL? 启动失败: {exc}")
 
     def _stop_waveform_acquire(self) -> None:
@@ -1303,10 +1301,7 @@ class ODMRControlGUI(QMainWindow):
             return
         if self._waveform_rall_running:
             try:
-                if self._cmd_service is not None:
-                    self._cmd_service.submit(Command(CommandType.LOCKIN_STOP_ACQUIRE, source="gui"))
-                else:
-                    self._ctrl.stop_lockin_acquire()
+                self._ctrl.stop_lockin_acquire()
                 self._waveform_rall_running = False
                 self._on_log("[Waveform] RALL? 停止", "lockin")
             except Exception:
@@ -2252,6 +2247,13 @@ class ODMRControlGUI(QMainWindow):
             return
         if self._waveform_paused:
             return
+        if (
+            getattr(self, "_waveform_page_active", False)
+            and self._ctrl.is_lockin_connected
+            and not self._ctrl.is_acquiring
+        ):
+            self._waveform_rall_running = False
+            self._start_waveform_acquire()
 
         # 选择当前通道 buffer
         ch_idx = self._wave_ch_select.currentIndex() if hasattr(self, '_wave_ch_select') else 0
