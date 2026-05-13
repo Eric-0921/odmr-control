@@ -650,6 +650,27 @@ class ODMRControlGUI(QMainWindow):
             self._laser_param_displays[key] = (disp, unit, fmt)
         layout.addWidget(laser_params_group)
 
+        # -- Laser Control -----------------------------------------------------
+        laser_ctrl_group = QGroupBox("激光器控制 / Laser Control")
+        laser_ctrl_layout = QGridLayout(laser_ctrl_group)
+        laser_ctrl_layout.addWidget(QLabel("功率 (mW):"), 0, 0)
+        self._laser_power_edit = QLineEdit("0")
+        self._laser_power_edit.setValidator(QIntValidator(0, 999))
+        self._laser_power_edit.setFixedWidth(80)
+        laser_ctrl_layout.addWidget(self._laser_power_edit, 0, 1)
+        laser_power_btn = QPushButton("设 / Set")
+        laser_power_btn.setObjectName("primaryBtn")
+        laser_power_btn.clicked.connect(self._set_laser_power)
+        laser_ctrl_layout.addWidget(laser_power_btn, 0, 2)
+        self._laser_max_label = QLabel(f"Max: {self._cfg['laser'].get('max_power_mw', 150)} mW")
+        self._laser_max_label.setStyleSheet("color: #666; font-size: 11px;")
+        laser_ctrl_layout.addWidget(self._laser_max_label, 0, 3)
+        self._laser_output_toggle = QCheckBox("激光输出 / Laser Output")
+        self._laser_output_toggle.stateChanged.connect(self._toggle_laser_output)
+        laser_ctrl_layout.addWidget(self._laser_output_toggle, 1, 0, 1, 2)
+        laser_ctrl_layout.setColumnStretch(4, 1)
+        layout.addWidget(laser_ctrl_group)
+
         # -- Lock-in Amplifier (Channel A/B tabs) ------------------------------
         lockin_tabs = QTabWidget()
         self._lockin_ch_displays: Dict[int, Dict[str, QLabel]] = {}
@@ -1840,6 +1861,39 @@ class ODMRControlGUI(QMainWindow):
         except Exception as exc:
             self._on_error("FM toggle failed: " + str(exc))
 
+    def _set_laser_power(self):
+        if not self._ctrl.is_laser_connected:
+            QMessageBox.warning(self, "警告", "请先连接激光器")
+            return
+        try:
+            power = int(self._laser_power_edit.text())
+            max_mw = self._cfg["laser"].get("max_power_mw", 150)
+            if power < 0 or power > max_mw:
+                QMessageBox.warning(self, "警告", f"功率超出范围 [0, {max_mw}] mW")
+                return
+            if self._cmd_service is not None:
+                self._cmd_service.submit(Command(CommandType.LASER_SET_POWER, {"power_mw": power}, source="gui"))
+            else:
+                self._ctrl.laser.set_power(power)
+            self._on_log(f"激光功率设为 {power} mW", "laser")
+        except ValueError:
+            QMessageBox.warning(self, "警告", "请输入有效的功率值")
+        except Exception as exc:
+            self._on_error("激光功率设置失败: " + str(exc))
+
+    def _toggle_laser_output(self, state):
+        if not self._ctrl.is_laser_connected:
+            return
+        try:
+            on = state == Qt.Checked
+            if self._cmd_service is not None:
+                self._cmd_service.submit(Command(CommandType.LASER_SET_OUTPUT, {"enabled": on}, source="gui"))
+            else:
+                self._ctrl.laser.set_output(on)
+            self._on_log("激光输出 " + ("ON" if on else "OFF"), "laser")
+        except Exception as exc:
+            self._on_error("激光输出切换失败: " + str(exc))
+
     def _start_sweep(self):
         if not self._ctrl.is_smb_connected:
             QMessageBox.warning(self, "Warning", "Please connect SMB100A first")
@@ -2021,6 +2075,13 @@ class ODMRControlGUI(QMainWindow):
             led.setProperty("on", "true" if output_on else "false")
             led.style().unpolish(led)
             led.style().polish(led)
+
+        # 同步输出开关状态
+        if hasattr(self, "_laser_output_toggle"):
+            if output_on != self._laser_output_toggle.isChecked():
+                self._laser_output_toggle.blockSignals(True)
+                self._laser_output_toggle.setChecked(output_on)
+                self._laser_output_toggle.blockSignals(False)
 
     def _on_lockin_data_ready(self, data):
         """处理 Lockin 数据，按 channel 路由到对应显示和 buffer。"""

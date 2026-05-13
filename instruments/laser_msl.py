@@ -144,6 +144,7 @@ class LaserMSLDriver:
 
         激光器无 IDN 命令，无法验证设备身份，
         仅报告端口是否可达（发送关闭指令不报错）。
+        返回端口描述含 USB 适配器信息（VID/PID/SN）。
         """
         if serial is None:
             raise RuntimeError("pyserial is not installed")
@@ -165,7 +166,13 @@ class LaserMSLDriver:
                 s.reset_output_buffer()
                 s.write(LaserMSLDriver._CMD_OFF)
                 s.close()
-                results.append((port, "Laser (unverified)"))
+                # 附加 USB 适配器信息
+                label = "Laser (unverified)"
+                if p.serial_number:
+                    label += f" [USB SN:{p.serial_number}]"
+                if p.vid and p.pid:
+                    label += f" [VID:{p.vid:04X} PID:{p.pid:04X}]"
+                results.append((port, label))
             except Exception:
                 pass
         return results

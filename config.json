@@ -27,7 +27,7 @@
     "rall_points_per_batch": 50
   },
   "laser": {
-    "port": "COM5",
+    "port": "COM9",
     "baudrate": 9600,
     "bytesize": 8,
     "parity": "N",
@@ -36,6 +36,7 @@
     "model": "MSL-U-532nm-300mW",
     "manufacturer": "CNI",
     "serial_number": "DL21088",
+    "usb_serial_number": "FTE86EB2A",
     "wavelength_nm": 532.12457,
     "max_power_mw": 150,
     "power_stability_pct": 0.117,
@@ -46,6 +47,7 @@
     "cmd_laser_off": [85, 170, 3, 0, 3],
     "cmd_laser_on": [85, 170, 3, 1, 4]
   },
+  "laser_bindings": {},
   "lockin_bindings": {},
   "smb_bindings": {},
   "sweep": {

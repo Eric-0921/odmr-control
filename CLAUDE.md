@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ODMR Control is a PyQt5 desktop application for controlling Optically Detected Magnetic Resonance experiments. It controls two instruments:
+ODMR Control is a PyQt5 desktop application for controlling Optically Detected Magnetic Resonance experiments. It controls three instruments:
 - **SMB100A** (Rohde & Schwarz) — microwave signal source, VISA/SCPI protocol
 - **OE1022D** (SSI) — dual-channel DSP lock-in amplifier, Serial/RS-232 protocol
+- **MSL-U** (CNI) — 532nm laser, Serial/RS-232 one-way protocol (no query, software-cached state)
 
 The codebase language is Chinese (comments, docs, UI labels) with English code identifiers.
 
@@ -35,7 +36,7 @@ Layer 4: core/agent_api.py                       — AI Agent Python API
 Layer 3: core/command_service.py                 — Command bus (single-thread queue)
 Layer 2: core/instrument_controller.py           — Facade over drivers + workers
 Layer 1.5: core/sweep_engine.py, timestamp_sync  — Sweep sequences, timestamp alignment
-Layer 1: instruments/smb100a.py, instruments/oe1022d.py  — Device drivers
+Layer 1: instruments/smb100a.py, instruments/oe1022d.py, instruments/laser_msl.py  — Device drivers
 Layer 0: data/recorder.py, data/circular_buffer.py       — Parquet recording, ring buffer
 ```
 
@@ -51,6 +52,7 @@ Layer 0: data/recorder.py, data/circular_buffer.py       — Parquet recording, 
 - QThread: CommandService worker (serial command queue)
 - QThread: SMBPollWorker (100ms), LockinMonitorWorker (94ms)
 - QThread: LockinAcquireWorker (50ms, sweep-only)
+- QThread: LaserPollWorker (1000ms, cache-only no I/O)
 - QThread: SweepEngine `_SweepRunner` (must be parentless QObject for moveToThread safety)
 
 ## Safety Constraints
