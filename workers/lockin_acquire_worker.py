@@ -46,6 +46,7 @@ class LockinAcquireWorker(QObject):
         self._smb_rf_on = False
         self._laser_power_mw = 0.0
         self._laser_on = False
+        self._mag_state = {}
 
     def set_smb_state(self, freq_hz: float, power_dbm: float, rf_on: bool) -> None:
         """同步 SMB100A 当前状态，用于写入 CSV。"""
@@ -59,6 +60,11 @@ class LockinAcquireWorker(QObject):
         with self._state_lock:
             self._laser_power_mw = power_mw
             self._laser_on = output_on
+
+    def set_mag_state(self, state: dict) -> None:
+        """同步三轴磁场缓存状态，用于写入 CSV。"""
+        with self._state_lock:
+            self._mag_state = dict(state)
 
     def set_recorder(self, recorder: ODMRRecorder | None) -> None:
         """采集不中断时切换/附加 recorder。"""
@@ -118,6 +124,7 @@ class LockinAcquireWorker(QObject):
                         smb_rf_on = self._smb_rf_on
                         laser_power_mw = self._laser_power_mw
                         laser_on = self._laser_on
+                        mag_state = dict(self._mag_state)
 
                     if recorder is not None and recorder.is_recording:
                         recorder.write_batch(
@@ -127,6 +134,7 @@ class LockinAcquireWorker(QObject):
                             smb_rf_on=smb_rf_on,
                             laser_power_mw=laser_power_mw,
                             laser_on=laser_on,
+                            mag_state=mag_state,
                         )
 
                     if self._batch_count % 200 == 0:

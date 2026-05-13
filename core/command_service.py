@@ -43,6 +43,7 @@ class CommandService(QObject):
     lockin_status_broadcast = pyqtSignal(dict)
     lockin_batch_broadcast = pyqtSignal(dict)
     laser_state_broadcast = pyqtSignal(dict)
+    mag_state_broadcast = pyqtSignal(dict)
 
     # 日志和错误转发
     log_requested = pyqtSignal(str)
@@ -79,6 +80,7 @@ class CommandService(QObject):
         self._ctrl.lockin_status_changed.connect(self._on_lockin_status_changed)
         self._ctrl.lockin_batch_ready.connect(self._on_lockin_batch_ready)
         self._ctrl.laser_state_changed.connect(self.laser_state_broadcast.emit)
+        self._ctrl.mag_state_changed.connect(self.mag_state_broadcast.emit)
         self._ctrl.error_occurred.connect(self.error_occurred.emit)
         self._ctrl.log_requested.connect(self.log_requested.emit)
 
@@ -409,6 +411,94 @@ class CommandService(QObject):
                 result["output_dir"] = str(recorder.output_dir)
             return result
 
+        # ===== 磁场控制 =====
+        if ct == CommandType.MAG_CONNECT_AXIS:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            idn = self._ctrl.mag.connect_axis(axis, p["port"], int(p.get("baudrate", 9600)))
+            self._apply_mag_axis_config(axis, p)
+            return {"axis": axis, "idn": idn, "state": self._ctrl.mag.get_status(axis)}
+
+        if ct == CommandType.MAG_DISCONNECT_AXIS:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            self._ctrl.mag.disconnect_axis(axis)
+            return {"axis": axis}
+
+        if ct == CommandType.MAG_CONNECT_ALL:
+            ports = dict(p.get("ports", {}))
+            results = self._ctrl.mag.connect_all(ports, int(p.get("baudrate", 9600)))
+            for axis in ("X", "Y", "Z"):
+                axis_cfg = p.get("axes", {}).get(axis, {})
+                if self._ctrl.mag.is_connected(axis):
+                    self._apply_mag_axis_config(axis, axis_cfg)
+            return {"results": results, "state": self._ctrl.mag.get_field_snapshot()}
+
+        if ct == CommandType.MAG_DISCONNECT_ALL:
+            self._ctrl.mag.disconnect_all()
+            return {}
+
+        if ct == CommandType.MAG_SET_FIELD:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            ok = self._ctrl.mag.set_field(axis, float(p["field_nT"]))
+            if not ok:
+                raise SafetyError(f"{axis} 轴磁场设置被拒绝")
+            return self._ctrl.mag.get_status(axis)
+
+        if ct == CommandType.MAG_SET_FIELD_3D:
+            for axis, key in (("X", "x_nT"), ("Y", "y_nT"), ("Z", "z_nT")):
+                if self._ctrl.mag.is_connected(axis):
+                    ok = self._ctrl.mag.set_field(axis, float(p.get(key, 0.0)))
+                    if not ok:
+                        raise SafetyError(f"{axis} 轴磁场设置被拒绝")
+            return self._ctrl.mag.get_field_snapshot()
+
+        if ct == CommandType.MAG_SET_CURRENT:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            ok = self._ctrl.mag.set_current(axis, float(p["current_mA"]))
+            if not ok:
+                raise SafetyError(f"{axis} 轴电流设置被拒绝")
+            return self._ctrl.mag.get_status(axis)
+
+        if ct == CommandType.MAG_SET_ZERO_OFFSET:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            ok = self._ctrl.mag.set_zero_offset(axis, float(p["zero_offset_mA"]))
+            if not ok:
+                raise SafetyError(f"{axis} 轴零偏设置被拒绝")
+            return self._ctrl.mag.get_status(axis)
+
+        if ct == CommandType.MAG_SET_COIL_CONSTANT:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            value = float(p["coil_constant"])
+            if value <= 0:
+                raise SafetyError("线圈常数必须为正数")
+            self._ctrl.mag.set_coil_constant(axis, value)
+            return self._ctrl.mag.get_status(axis)
+
+        if ct == CommandType.MAG_SET_OUTPUT:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            if not self._ctrl.mag.is_connected(axis):
+                raise SafetyError(f"{axis} 轴未连接，不能开启或关闭输出")
+            ok = self._ctrl.mag.set_output(axis, bool(p["enabled"]))
+            if not ok:
+                raise SafetyError(f"{axis} 轴输出设置被拒绝")
+            return self._ctrl.mag.get_status(axis)
+
+        if ct == CommandType.MAG_LOCK_ZERO:
+            axis = self._normalize_axis(p.get("axis", "X"))
+            ok = self._ctrl.mag.lock_zero(axis, bool(p["locked"]))
+            if not ok:
+                raise SafetyError(f"{axis} 轴锁零设置被拒绝")
+            return self._ctrl.mag.get_status(axis)
+
+        if ct == CommandType.MAG_QUERY_STATE:
+            if "axis" in p:
+                axis = self._normalize_axis(p["axis"])
+                return self._ctrl.mag.get_status(axis)
+            return self._ctrl.mag.get_field_snapshot()
+
+        if ct == CommandType.MAG_EMERGENCY_STOP:
+            self._ctrl.mag.all_output_off()
+            return self._ctrl.mag.verify_emergency_stop()
+
         # ===== 激光器 =====
         if ct == CommandType.LASER_CONNECT:
             idn = self._ctrl.connect_laser(
@@ -463,6 +553,8 @@ class CommandService(QObject):
                     "power_mw": self._ctrl.laser.get_power(),
                     "output_on": self._ctrl.laser.get_output(),
                 }
+            if self._ctrl.is_mag_connected:
+                result["magnetic_field"] = self._ctrl.mag.get_field_snapshot()
             return result
 
         raise NotImplementedError(f"未实现的命令类型: {ct.name}")
@@ -488,6 +580,26 @@ class CommandService(QObject):
             raise SafetyError(
                 f"激光功率 {power_mw} mW 超出安全范围 [0, {max_mw}] mW"
             )
+
+    @staticmethod
+    def _normalize_axis(axis: object) -> str:
+        value = str(axis).upper()
+        if value not in ("X", "Y", "Z"):
+            raise ValueError(f"无效磁场轴: {axis}")
+        return value
+
+    def _apply_mag_axis_config(self, axis: str, params: Dict[str, Any]) -> None:
+        cfg = self._config.get("magnetic_field", {}).get("axes", {}).get(axis, {})
+        merged = {**cfg, **params}
+        if "coil_constant" in merged:
+            value = float(merged["coil_constant"])
+            if value <= 0:
+                raise SafetyError(f"{axis} 轴线圈常数必须为正数")
+            self._ctrl.mag.set_coil_constant(axis, value)
+        if "zero_offset_mA" in merged:
+            ok = self._ctrl.mag.set_zero_offset(axis, float(merged["zero_offset_mA"]))
+            if not ok:
+                raise SafetyError(f"{axis} 轴零偏设置被拒绝")
 
     # -- state helpers -------------------------------------------------------
 
