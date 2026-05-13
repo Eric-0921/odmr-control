@@ -13,8 +13,9 @@ import logging
 import queue
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QDoubleValidator, QFont, QIntValidator
 from PyQt5.QtWidgets import (
@@ -157,6 +158,20 @@ QStatusBar {
     color: #1a1a1a; font-size: 12px;
 }
 QStatusBar QLabel { padding: 0 12px; }
+QFrame#globalStatusBar {
+    background-color: #2a2a2a; border-bottom: 1px solid #444;
+    padding: 2px 8px;
+}
+QFrame#globalStatusBar QLabel {
+    color: #cccccc; font-size: 10px; padding: 0 2px;
+}
+QLabel#globalLed {
+    min-width: 12px; min-height: 12px; max-width: 12px; max-height: 12px;
+    border-radius: 6px; border: 1px solid #666;
+}
+QLabel#globalLed[on="true"] { background-color: #00a651; border-color: #008a44; }
+QLabel#globalLed[on="false"] { background-color: #555; border-color: #444; }
+QLabel#globalLed[on="warn"] { background-color: #e04040; border-color: #c03030; }
 """
 
 
@@ -350,9 +365,10 @@ class ODMRControlGUI(QMainWindow):
             ("微波源控制 / Source", 2),
             ("锁相控制 / Lock-in Control", 3),
             ("采集配置 / Acquisition", 4),
-            ("实验序列 / Sequence", 5),
-            ("数据记录 / Data Log", 6),
-            ("日志 / Log", 7),
+            ("实时波形 / Waveform", 5),
+            ("实验序列 / Sequence", 6),
+            ("数据记录 / Data Log", 7),
+            ("日志 / Log", 8),
         ]
         for label, idx in nav_items:
             item = QTreeWidgetItem([label])
@@ -361,18 +377,30 @@ class ODMRControlGUI(QMainWindow):
         self._nav.currentItemChanged.connect(self._on_nav_changed)
         splitter.addWidget(self._nav)
 
-        # right: stacked pages
+        # right: global status bar + stacked pages
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        # Global status bar (always visible)
+        self._global_status_bar = self._build_global_status_bar()
+        right_layout.addWidget(self._global_status_bar)
+
+        # Stacked pages
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_connection_page())
         self._stack.addWidget(self._build_monitor_page())
         self._stack.addWidget(self._build_source_page())
         self._stack.addWidget(self._build_lockin_control_page())
         self._stack.addWidget(self._build_acquisition_page())
+        self._stack.addWidget(self._build_waveform_page())
         self._stack.addWidget(self._build_sequence_page())
         self._stack.addWidget(self._build_data_log_page())
         self._stack.addWidget(self._build_log_page())
-        splitter.addWidget(self._stack)
+        right_layout.addWidget(self._stack, 1)
 
+        splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
@@ -382,6 +410,91 @@ class ODMRControlGUI(QMainWindow):
         if current is not None:
             idx = current.data(0, Qt.UserRole)
             self._stack.setCurrentIndex(idx)
+            # RALL? lifecycle: waveform page (idx=5) needs RALL? data
+            if idx == 5:
+                self._start_waveform_acquire()
+            else:
+                self._stop_waveform_acquire()
+
+    # -----------------------------------------------------------------------
+    # Global Status Bar
+    # -----------------------------------------------------------------------
+
+    def _build_global_status_bar(self) -> QFrame:
+        """全局状态栏：始终可见，显示所有设备关键状态。"""
+        bar = QFrame()
+        bar.setObjectName("globalStatusBar")
+        bar.setFixedHeight(32)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(4)
+
+        def _led() -> QLabel:
+            led = QLabel()
+            led.setObjectName("globalLed")
+            led.setProperty("on", "false")
+            return led
+
+        def _sep() -> QFrame:
+            sep = QFrame()
+            sep.setFrameShape(QFrame.VLine)
+            sep.setStyleSheet("color: #555;")
+            return sep
+
+        def _txt(text: str) -> QLabel:
+            return QLabel(text)
+
+        # SMB100A
+        layout.addWidget(_txt("SMB:"))
+        self._gs_smb_rf = _led()
+        layout.addWidget(self._gs_smb_rf)
+        layout.addWidget(_txt("RF"))
+        self._gs_smb_lf = _led()
+        layout.addWidget(self._gs_smb_lf)
+        layout.addWidget(_txt("LF"))
+        self._gs_smb_mod = _led()
+        layout.addWidget(self._gs_smb_mod)
+        layout.addWidget(_txt("Mod"))
+
+        layout.addWidget(_sep())
+
+        # OE1022D CH-A
+        layout.addWidget(_txt("A:"))
+        self._gs_lockin_a_ov = _led()
+        layout.addWidget(self._gs_lockin_a_ov)
+        layout.addWidget(_txt("OV"))
+        self._gs_lockin_a_pll = _led()
+        layout.addWidget(self._gs_lockin_a_pll)
+        layout.addWidget(_txt("PLL"))
+
+        # OE1022D CH-B
+        layout.addWidget(_txt("B:"))
+        self._gs_lockin_b_ov = _led()
+        layout.addWidget(self._gs_lockin_b_ov)
+        layout.addWidget(_txt("OV"))
+        self._gs_lockin_b_pll = _led()
+        layout.addWidget(self._gs_lockin_b_pll)
+        layout.addWidget(_txt("PLL"))
+
+        layout.addWidget(_sep())
+
+        # Laser
+        layout.addWidget(_txt("Laser:"))
+        self._gs_laser_out = _led()
+        layout.addWidget(self._gs_laser_out)
+        layout.addWidget(_txt("Out"))
+
+        layout.addWidget(_sep())
+
+        # Sweep / Recording status
+        self._gs_sweep = _txt("扫频: 空闲")
+        layout.addWidget(self._gs_sweep)
+        layout.addWidget(_sep())
+        self._gs_rec = _txt("记录: 关")
+        layout.addWidget(self._gs_rec)
+
+        layout.addStretch()
+        return bar
 
 
     # -----------------------------------------------------------------------
@@ -902,12 +1015,15 @@ class ODMRControlGUI(QMainWindow):
         layout.addLayout(ch_layout)
 
         def add_param_group(parent_layout, title, params):
-            """辅助函数：创建参数分组。"""
+            """辅助函数：创建参数分组（中英双语标签）。"""
             group = QGroupBox(title)
             gl = QGridLayout(group)
+            gl.setColumnMinimumWidth(0, 240)
             widgets = {}
             for row, (label, key, default, wtype, *args) in enumerate(params):
-                gl.addWidget(QLabel(label), row, 0)
+                lbl = QLabel(label)
+                lbl.setWordWrap(True)
+                gl.addWidget(lbl, row, 0)
                 if wtype == "combo":
                     w = QComboBox()
                     w.addItems(args[0])
@@ -915,7 +1031,7 @@ class ODMRControlGUI(QMainWindow):
                 else:
                     w = QLineEdit(str(default))
                 gl.addWidget(w, row, 1)
-                btn = QPushButton("设 / Set")
+                btn = QPushButton("Set")
                 btn.setObjectName("primaryBtn")
                 gl.addWidget(btn, row, 2)
                 widgets[key] = (w, btn)
@@ -923,72 +1039,73 @@ class ODMRControlGUI(QMainWindow):
             parent_layout.addWidget(group)
             return widgets
 
-        # INPUT/FILTERS
+        # 输入与滤波器 / INPUT / FILTERS
         self._lockin_input_widgets = add_param_group(
-            layout, "INPUT / FILTERS",
+            layout, "输入与滤波器 / INPUT / FILTERS",
             [
-                ("Source (0=A,1=AB,2=I6,3=I8):", "source", 0, "combo", ["A", "AB", "I(10^6)", "I(10^8)"]),
-                ("Current Gain (0=1,1=10,2=100):", "gain", 0, "combo", ["1", "10", "100"]),
-                ("Grounding (0=Float,1=Ground):", "ground", 0, "combo", ["Float", "Ground"]),
-                ("Coupling (0=AC,1=DC):", "coupling", 0, "combo", ["AC", "DC"]),
-                ("Line Notch (0=Off,1=50Hz,2=50+100,3=100Hz):", "notch", 1, "combo", ["Off", "50Hz", "50+100Hz", "100Hz"]),
+                ("输入模式：A=单端, AB=差分, I=电流\nSource (0=A,1=AB,2=I6,3=I8)", "source", 0, "combo", ["A", "AB", "I(10^6)", "I(10^8)"]),
+                ("电流增益（放大倍数）\nCurrent Gain (0=1,1=10,2=100)", "gain", 0, "combo", ["1", "10", "100"]),
+                ("接地方式：浮地 / 接地\nGrounding (0=Float,1=Ground)", "ground", 0, "combo", ["Float", "Ground"]),
+                ("耦合方式：AC=交流(0.16Hz高通), DC=直流\nCoupling (0=AC,1=DC)", "coupling", 0, "combo", ["AC", "DC"]),
+                ("工频陷波器：关 / 50Hz / 50+100Hz / 100Hz\nLine Notch (0=Off,1=50Hz,2=50+100,3=100Hz)", "notch", 1, "combo", ["Off", "50Hz", "50+100Hz", "100Hz"]),
             ]
         )
-        # 连接 INPUT/FILTERS 按钮
         for key, (w, btn) in self._lockin_input_widgets.items():
             btn.clicked.connect(lambda _k=key, _w=w: self._set_lockin_input(_k, _w))
 
-        # REF/PHASE
+        # 参考与相位 / REF / PHASE
         self._lockin_ref_widgets = add_param_group(
-            layout, "REF / PHASE",
+            layout, "参考与相位 / REF / PHASE",
             [
-                ("Phase (deg):", "phase", "0", "line"),
-                ("Source (0=Ext,1=Int):", "ref_source", 0, "combo", ["External", "Internal"]),
-                ("Slope (0=Sine,1=PosTTL,2=NegTTL):", "slope", 0, "combo", ["Sine", "Pos TTL", "Neg TTL"]),
-                ("Frequency (Hz):", "freq", "1000", "line"),
-                ("Harmonic:", "harmonic", "1", "line"),
+                ("参考相位（-180°~+180°, 精度0.01°）\nPhase (deg)", "phase", "0", "line"),
+                ("参考信号源：外部 / 内部\nSource (0=Ext,1=Int)", "ref_source", 0, "combo", ["External", "Internal"]),
+                ("外部参考类型：正弦 / 上升沿 / 下降沿\nSlope (0=Sine,1=PosTTL,2=NegTTL)", "slope", 0, "combo", ["Sine", "Pos TTL", "Neg TTL"]),
+                ("内部参考频率（1mHz~102kHz）\nFrequency (Hz)", "freq", "1000", "line"),
+                ("谐波检测次数（限制: 次数×频率<102kHz）\nHarmonic", "harmonic", "1", "line"),
             ]
         )
         for key, (w, btn) in self._lockin_ref_widgets.items():
             btn.clicked.connect(lambda _k=key, _w=w: self._set_lockin_ref(_k, _w))
 
-        # GAIN/TC
+        # 增益与时间常数 / GAIN / TC
         self._lockin_gain_widgets = add_param_group(
-            layout, "GAIN / TC",
+            layout, "增益与时间常数 / GAIN / TC",
             [
-                ("Sensitivity (index):", "sens", "10", "line"),
-                ("Reserve (0=Min,1=Auto,2=Max):", "reserve", 1, "combo", ["Min", "Auto", "Max"]),
-                ("Time Constant (index):", "tc", "6", "line"),
-                ("Filter dB/oct (0=6,1=12,2=18,3=24):", "filter", 2, "combo", ["6dB", "12dB", "18dB", "24dB"]),
-                ("Sync Filter (0=Off,1=On):", "sync", 1, "combo", ["Off", "On"]),
+                ("满偏灵敏度（1nV~1V, 1-2-5步进）\nSensitivity (index)", "sens", "10", "line"),
+                ("动态储备：低 / 普通 / 高\nReserve (0=Low,1=Normal,2=High)", "reserve", 1, "combo", ["低 Low", "普通 Normal", "高 High"]),
+                ("时间常数（10μs~3000s）\nTime Constant (index)", "tc", "6", "line"),
+                ("低通滤波陡降（6/12/18/24 dB/oct）\nFilter dB/oct (0=6,1=12,2=18,3=24)", "filter", 2, "combo", ["6dB", "12dB", "18dB", "24dB"]),
+                ("同步滤波器（≤200Hz时有效）\nSync Filter (0=Off,1=On)", "sync", 1, "combo", ["Off", "On"]),
             ]
         )
         for key, (w, btn) in self._lockin_gain_widgets.items():
             btn.clicked.connect(lambda _k=key, _w=w: self._set_lockin_gain(_k, _w))
 
-        # CHANNEL OUTPUT
+        # 通道输出 / CHANNEL OUTPUT
         self._lockin_output_widgets = add_param_group(
-            layout, "CHANNEL OUTPUT",
+            layout, "通道输出 / CHANNEL OUTPUT",
             [
-                ("Output CH (1 or 2):", "out_ch", "1", "line"),
-                ("Source (index):", "out_source", "0", "line"),
-                ("Offset (-10000~10000):", "out_offset", "0", "line"),
-                ("Expand (0=1,1=10,2=100):", "out_expand", 0, "combo", ["1", "10", "100"]),
+                ("输出通道号\nOutput CH (1 or 2)", "out_ch", "1", "line"),
+                ("输出源（X/Y/R/θ/各谐波/Noise/AUXOUT）\nSource (index)", "out_source", "0", "line"),
+                ("偏置（-100%~+100%）\nOffset (-10000~10000)", "out_offset", "0", "line"),
+                ("扩展倍数\nExpand (0=1,1=10,2=100)", "out_expand", 0, "combo", ["1", "10", "100"]),
             ]
         )
         for key, (w, btn) in self._lockin_output_widgets.items():
             btn.clicked.connect(lambda _k=key, _w=w: self._set_lockin_output(_k, _w))
 
-        # AUTO SET
-        auto_group = QGroupBox("AUTO SET")
+        # 自动设置 / AUTO SET
+        auto_group = QGroupBox("自动设置 / AUTO SET")
         auto_layout = QHBoxLayout(auto_group)
-        for label, cmd_type in [
-            ("Auto Gain", CommandType.LOCKIN_AUTO_GAIN),
-            ("Auto Reserve", CommandType.LOCKIN_AUTO_RESERVE),
-            ("Auto Phase", CommandType.LOCKIN_AUTO_PHASE),
+        for label, tip, cmd_type in [
+            ("Auto Gain\n自动灵敏度", "根据R值自动调整灵敏度，约5秒", CommandType.LOCKIN_AUTO_GAIN),
+            ("Auto Reserve\n自动储备", "选取当前信号的最小动态储备", CommandType.LOCKIN_AUTO_RESERVE),
+            ("Auto Phase\n自动移相", "使输入信号相位为0°，约5秒", CommandType.LOCKIN_AUTO_PHASE),
         ]:
             btn = QPushButton(label)
             btn.setObjectName("primaryBtn")
+            btn.setToolTip(tip)
+            btn.setMinimumHeight(48)
             btn.clicked.connect(lambda _ct=cmd_type: self._send_lockin_cmd(_ct))
             auto_layout.addWidget(btn)
         auto_layout.addStretch()
@@ -1133,52 +1250,6 @@ class ODMRControlGUI(QMainWindow):
         sample_layout.setColumnStretch(2, 1)
         layout.addWidget(sample_group)
 
-        # -- Waveform plot (migrated from Monitor page) ------------------------
-        plot_group = QGroupBox("实时波形 / Waveform")
-        plot_layout = QVBoxLayout(plot_group)
-
-        # Plot controls
-        plot_ctrl = QHBoxLayout()
-        plot_ctrl.addWidget(QLabel("时间窗口 / Time Window:"))
-        self._wave_time_window = QComboBox()
-        self._wave_time_window.addItems(["512 ms", "1024 ms", "2048 ms", "4096 ms", "8192 ms"])
-        self._wave_time_window.setCurrentIndex(2)  # 2048 ms default
-        self._wave_time_window.currentTextChanged.connect(self._on_wave_window_changed)
-        plot_ctrl.addWidget(self._wave_time_window)
-
-        self._wave_auto_scale = QCheckBox("自动 Y 轴 / Auto Scale Y")
-        self._wave_auto_scale.setChecked(True)
-        plot_ctrl.addWidget(self._wave_auto_scale)
-
-        self._wave_channel_select = QComboBox()
-        self._wave_channel_select.addItems(["Channel A", "Channel B"])
-        self._wave_channel_select.currentIndexChanged.connect(self._on_wave_channel_changed)
-        plot_ctrl.addWidget(self._wave_channel_select)
-
-        plot_ctrl.addStretch()
-        plot_layout.addLayout(plot_ctrl)
-
-        if _HAS_PYG:
-            self._plot_widget = pg.PlotWidget()
-            self._plot_widget.setLabel("left", "幅度 / Amplitude", units="mV")
-            self._plot_widget.setLabel("bottom", "时间 / Time", units="s")
-            self._plot_widget.addLegend()
-            self._plot_widget.setYRange(-100, 100, padding=0.05)
-            self._plot_curves: Dict[str, pg.PlotDataItem] = {}
-            colors = {"X": "#0080c8", "Y": "#00a651", "R": "#e04040"}
-            for ch in ["X", "Y", "R"]:
-                curve = self._plot_widget.plot(pen=colors.get(ch, "#888"), name=ch)
-                self._plot_curves[ch] = curve
-            # 添加零线
-            self._plot_zero_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen("#999", width=1, style=Qt.DotLine))
-            self._plot_widget.addItem(self._plot_zero_line)
-            plot_layout.addWidget(self._plot_widget)
-        else:
-            plot_layout.addWidget(QLabel("pyqtgraph 未安装，波形显示不可用"))
-            self._plot_widget = None
-            self._plot_curves = {}
-        layout.addWidget(plot_group, 1)
-
         layout.addStretch()
         page.setWidget(inner)
         return page
@@ -1187,21 +1258,6 @@ class ODMRControlGUI(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "选择保存目录", self._save_dir_input.text())
         if d:
             self._save_dir_input.setText(d)
-
-    def _on_wave_window_changed(self, text: str) -> None:
-        """波形图时间窗口变更。"""
-        if not _HAS_PYG or self._plot_widget is None:
-            return
-        ms = float(text.replace(" ms", ""))
-        self._plot_widget.setXRange(-ms / 1000.0, 0, padding=0)
-
-    def _on_wave_channel_changed(self, index: int) -> None:
-        """波形图通道切换。"""
-        # 切换时清空当前显示，等待新数据
-        if not _HAS_PYG or self._plot_widget is None:
-            return
-        for curve in self._plot_curves.values():
-            curve.setData([], [])
 
     def _apply_lockin_sample_config(self) -> None:
         """应用 OE1022D 采样配置。"""
@@ -1230,7 +1286,191 @@ class ODMRControlGUI(QMainWindow):
             QMessageBox.warning(self, "Config Error", str(exc))
 
     # -----------------------------------------------------------------------
-    # Page 4: Experiment Sequence
+    # Page 5: Real-time Waveform
+    # -----------------------------------------------------------------------
+
+    # 波形参数定义：(显示名, buffer key, 颜色, 默认勾选, Y轴组)
+    _WAVE_PARAMS = [
+        ("X",   "X",      "#0080c8", True,  "amp"),
+        ("Y",   "Y",      "#00a651", True,  "amp"),
+        ("R",   "R",      "#e04040", True,  "amp"),
+        ("θ",   "theta",  "#ff8c00", True,  "amp"),
+        ("freq", "freq",  "#808080", False, "other"),
+        ("noise","noise", "#c0c0c0", False, "other"),
+        ("Xh1", "Xh1",   "#4080c8", True,  "amp"),
+        ("Yh1", "Yh1",   "#40a651", True,  "amp"),
+        ("Rh1", "Rh1",   "#e08080", False, "amp"),
+        ("θh1", "θh1",   "#c08000", False, "amp"),
+        ("Xh2", "Xh2",   "#8080c8", False, "amp"),
+        ("Yh2", "Yh2",   "#80a651", False, "amp"),
+        ("Rh2", "Rh2",   "#e0a0a0", False, "amp"),
+        ("θh2", "θh2",   "#806000", False, "amp"),
+    ]
+
+    # CircularBuffer 通道列表（波形专用）
+    _WAVE_BUFFER_CHANNELS = [p[1] for p in _WAVE_PARAMS]
+
+    def _build_waveform_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        title = QLabel("实时波形 / Real-time Waveform")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        # -- Control bar -------------------------------------------------------
+        ctrl_bar = QHBoxLayout()
+        ctrl_bar.addWidget(QLabel("通道:"))
+        self._wave_ch_select = QComboBox()
+        self._wave_ch_select.addItems(["Channel A", "Channel B"])
+        self._wave_ch_select.currentIndexChanged.connect(self._on_wave_channel_changed)
+        ctrl_bar.addWidget(self._wave_ch_select)
+
+        self._wave_pause_btn = QPushButton("暂停 ⏸")
+        self._wave_pause_btn.setCheckable(True)
+        self._wave_pause_btn.clicked.connect(self._on_wave_pause_toggle)
+        ctrl_bar.addWidget(self._wave_pause_btn)
+
+        clear_btn = QPushButton("清空 ✕")
+        clear_btn.clicked.connect(self._on_wave_clear)
+        ctrl_bar.addWidget(clear_btn)
+
+        self._wave_auto_y = QCheckBox("Auto Y")
+        self._wave_auto_y.setChecked(True)
+        ctrl_bar.addWidget(self._wave_auto_y)
+
+        ctrl_bar.addStretch()
+
+        self._wave_status_label = QLabel("等待数据...")
+        self._wave_status_label.setStyleSheet("color: #888; font-size: 11px;")
+        ctrl_bar.addWidget(self._wave_status_label)
+
+        layout.addLayout(ctrl_bar)
+
+        # -- Parameter checkboxes ----------------------------------------------
+        param_group = QGroupBox("显示参数 / Display Parameters")
+        param_grid = QGridLayout(param_group)
+        param_grid.setContentsMargins(8, 12, 8, 8)
+        param_grid.setSpacing(4)
+        self._wave_checkboxes: Dict[str, QCheckBox] = {}
+
+        # Row 0: 基波
+        param_grid.addWidget(QLabel("<b>基波:</b>"), 0, 0)
+        for i, (label, key, color, default, _axis) in enumerate(self._WAVE_PARAMS[:6]):
+            cb = QCheckBox(label)
+            cb.setChecked(default)
+            cb.setStyleSheet(f"QCheckBox {{ color: {color}; }}")
+            cb.toggled.connect(lambda checked, _k=key: self._on_wave_param_toggled(_k, checked))
+            param_grid.addWidget(cb, 0, 1 + i)
+            self._wave_checkboxes[key] = cb
+
+        # Row 1: 谐波1
+        param_grid.addWidget(QLabel("<b>谐波1:</b>"), 1, 0)
+        for i, (label, key, color, default, _axis) in enumerate(self._WAVE_PARAMS[6:10]):
+            cb = QCheckBox(label)
+            cb.setChecked(default)
+            cb.setStyleSheet(f"QCheckBox {{ color: {color}; }}")
+            cb.toggled.connect(lambda checked, _k=key: self._on_wave_param_toggled(_k, checked))
+            param_grid.addWidget(cb, 1, 1 + i)
+            self._wave_checkboxes[key] = cb
+
+        # Row 2: 谐波2
+        param_grid.addWidget(QLabel("<b>谐波2:</b>"), 2, 0)
+        for i, (label, key, color, default, _axis) in enumerate(self._WAVE_PARAMS[10:]):
+            cb = QCheckBox(label)
+            cb.setChecked(default)
+            cb.setStyleSheet(f"QCheckBox {{ color: {color}; }}")
+            cb.toggled.connect(lambda checked, _k=key: self._on_wave_param_toggled(_k, checked))
+            param_grid.addWidget(cb, 2, 1 + i)
+            self._wave_checkboxes[key] = cb
+
+        layout.addWidget(param_group)
+
+        # -- Plot widget -------------------------------------------------------
+        if _HAS_PYG:
+            self._wave_plot = pg.PlotWidget()
+            self._wave_plot.setLabel("left", "幅度", units="mV")
+            self._wave_plot.setLabel("bottom", "时间", units="s")
+            self._wave_plot.addLegend()
+            self._wave_plot.showGrid(x=True, y=True, alpha=0.3)
+            # 零线
+            self._wave_zero_line = pg.InfiniteLine(
+                pos=0, angle=0, pen=pg.mkPen("#999", width=1, style=Qt.DotLine)
+            )
+            self._wave_plot.addItem(self._wave_zero_line)
+
+            self._wave_curves: Dict[str, pg.PlotDataItem] = {}
+            for label, key, color, _default, _axis in self._WAVE_PARAMS:
+                curve = self._wave_plot.plot(pen=pg.mkPen(color, width=1.5), name=label)
+                self._wave_curves[key] = curve
+
+            layout.addWidget(self._wave_plot, 1)
+        else:
+            layout.addWidget(QLabel("pyqtgraph 未安装，波形显示不可用"))
+            self._wave_plot = None
+            self._wave_curves = {}
+
+        # -- Waveform buffers --------------------------------------------------
+        self._waveform_buffers: Dict[int, CircularBuffer] = {
+            1: CircularBuffer(channels=self._WAVE_BUFFER_CHANNELS, capacity=5000),
+            2: CircularBuffer(channels=self._WAVE_BUFFER_CHANNELS, capacity=5000),
+        }
+        self._waveform_paused = False
+        self._waveform_page_active = False
+        self._waveform_rall_running = False
+        self._waveform_data_count = 0
+
+        return page
+
+    def _on_wave_pause_toggle(self, checked: bool) -> None:
+        self._waveform_paused = checked
+        self._wave_pause_btn.setText("继续 ▶" if checked else "暂停 ⏸")
+
+    def _on_wave_clear(self) -> None:
+        for buf in self._waveform_buffers.values():
+            buf.clear()
+        self._waveform_data_count = 0
+        for curve in self._wave_curves.values():
+            curve.setData([], [])
+
+    def _on_wave_param_toggled(self, key: str, checked: bool) -> None:
+        if key in self._wave_curves:
+            if not checked:
+                self._wave_curves[key].setData([], [])
+
+    def _on_wave_channel_changed(self, idx: int) -> None:
+        """通道切换：清空曲线，等待新数据。"""
+        for curve in self._wave_curves.values():
+            curve.setData([], [])
+
+    def _start_waveform_acquire(self) -> None:
+        """启动 RALL? 波形采集（页面切换到波形时调用）。"""
+        self._waveform_page_active = True
+        if not self._waveform_rall_running and self._ctrl.is_lockin_connected:
+            try:
+                self._ctrl.start_lockin_acquire(None)
+                self._waveform_rall_running = True
+                self._on_log("[Waveform] RALL? 启动", "lockin")
+            except Exception as exc:
+                self._on_error(f"[Waveform] RALL? 启动失败: {exc}")
+
+    def _stop_waveform_acquire(self) -> None:
+        """停止 RALL? 波形采集（除非正在记录数据）。"""
+        self._waveform_page_active = False
+        # 如果正在记录数据，不停止 RALL?
+        if hasattr(self, '_is_recording') and self._is_recording:
+            return
+        if self._waveform_rall_running:
+            try:
+                self._ctrl.stop_lockin_acquire()
+                self._waveform_rall_running = False
+                self._on_log("[Waveform] RALL? 停止", "lockin")
+            except Exception:
+                pass
+
+    # -----------------------------------------------------------------------
+    # Page 6: Experiment Sequence
     # -----------------------------------------------------------------------
 
     def _build_sequence_page(self) -> QWidget:
@@ -2046,6 +2286,13 @@ class ODMRControlGUI(QMainWindow):
         # 兼容旧 buffer
         self._buffer.append({"smb_freq_hz": freq_hz}, datetime.datetime.now().timestamp())
 
+        # 全局状态栏
+        if hasattr(self, '_gs_smb_rf'):
+            for led, on in [(self._gs_smb_rf, output_on), (self._gs_smb_lf, lf_on), (self._gs_smb_mod, mod_on)]:
+                led.setProperty("on", "true" if on else "false")
+                led.style().unpolish(led)
+                led.style().polish(led)
+
     def _on_laser_state_changed(self, state: dict):
         """处理激光器状态广播。"""
         power_mw = state.get("power_mw", 0.0)
@@ -2082,6 +2329,12 @@ class ODMRControlGUI(QMainWindow):
                 self._laser_output_toggle.blockSignals(True)
                 self._laser_output_toggle.setChecked(output_on)
                 self._laser_output_toggle.blockSignals(False)
+
+        # 全局状态栏
+        if hasattr(self, '_gs_laser_out'):
+            self._gs_laser_out.setProperty("on", "true" if output_on else "false")
+            self._gs_laser_out.style().unpolish(self._gs_laser_out)
+            self._gs_laser_out.style().polish(self._gs_laser_out)
 
     def _on_lockin_data_ready(self, data):
         """处理 Lockin 数据，按 channel 路由到对应显示和 buffer。"""
@@ -2124,54 +2377,140 @@ class ODMRControlGUI(QMainWindow):
             led.setProperty("on", "true" if locked else "false")
             led.setStyleSheet(f"background-color: {'#00a651' if locked else '#e04040'};")
 
+        # 全局状态栏
+        if hasattr(self, '_gs_lockin_a_ov'):
+            any_ov = status.get("input_overload", False) or status.get("gain_overload", False)
+            locked = status.get("pll_locked", False)
+            if ch == 1:
+                self._gs_lockin_a_ov.setProperty("on", "warn" if any_ov else "false")
+                self._gs_lockin_a_pll.setProperty("on", "true" if locked else "false")
+            elif ch == 2:
+                self._gs_lockin_b_ov.setProperty("on", "warn" if any_ov else "false")
+                self._gs_lockin_b_pll.setProperty("on", "true" if locked else "false")
+            for led in ([self._gs_lockin_a_ov, self._gs_lockin_a_pll] if ch == 1
+                        else [self._gs_lockin_b_ov, self._gs_lockin_b_pll]):
+                led.style().unpolish(led)
+                led.style().polish(led)
+
     def _on_lockin_batch_ready(self, batch):
+        """处理 RALL? 批次数据：喂给波形缓冲区和兼容旧缓冲区。"""
         n = len(batch.get("lockin_A_X_mv", []))
+        if n == 0:
+            return
         ts = datetime.datetime.now().timestamp()
-        for i in range(n):
-            x = float(batch["lockin_A_X_mv"][i])
-            y = float(batch["lockin_A_Y_mv"][i])
-            r = (x * x + y * y) ** 0.5
-            point = {
-                "X": x,
-                "Y": y,
-                "R": r,
-            }
-            self._buffer.append(point, ts + i * 0.001)
-            # 也写入 CH-A buffer
-            if 1 in self._lockin_ch_buffers:
-                self._lockin_ch_buffers[1].append(point, ts + i * 0.001)
+        dt = 0.05 / n  # 50ms / n points
+
+        for ch_label, ch_num in [("A", 1), ("B", 2)]:
+            prefix = f"lockin_{ch_label}_"
+            x = batch.get(f"{prefix}X_mv")
+            y = batch.get(f"{prefix}Y_mv")
+            if x is None or y is None:
+                continue
+            r = np.sqrt(x**2 + y**2)
+            theta = np.degrees(np.arctan2(y, x))
+            freq = batch.get(f"{prefix}freq_hz", np.zeros(n))
+            noise = batch.get(f"{prefix}noise_mv", np.zeros(n))
+            xh1 = batch.get(f"{prefix}Xh1_mv", np.zeros(n))
+            yh1 = batch.get(f"{prefix}Yh1_mv", np.zeros(n))
+            rh1 = np.sqrt(xh1**2 + yh1**2)
+            theta_h1 = np.degrees(np.arctan2(yh1, xh1))
+            xh2 = batch.get(f"{prefix}Xh2_mv", np.zeros(n))
+            yh2 = batch.get(f"{prefix}Yh2_mv", np.zeros(n))
+            rh2 = np.sqrt(xh2**2 + yh2**2)
+            theta_h2 = np.degrees(np.arctan2(yh2, xh2))
+
+            timestamps = [ts + i * dt for i in range(n)]
+
+            # 写入波形缓冲区
+            if ch_num in self._waveform_buffers:
+                self._waveform_buffers[ch_num].extend({
+                    "X": x.tolist(), "Y": y.tolist(), "R": r.tolist(), "theta": theta.tolist(),
+                    "freq": freq.tolist(), "noise": noise.tolist(),
+                    "Xh1": xh1.tolist(), "Yh1": yh1.tolist(), "Rh1": rh1.tolist(), "θh1": theta_h1.tolist(),
+                    "Xh2": xh2.tolist(), "Yh2": yh2.tolist(), "Rh2": rh2.tolist(), "θh2": theta_h2.tolist(),
+                }, timestamps)
+
+        # 兼容旧缓冲区（CH-A 基波）
+        if 1 in self._lockin_ch_buffers:
+            x_a = batch.get("lockin_A_X_mv", np.zeros(n))
+            y_a = batch.get("lockin_A_Y_mv", np.zeros(n))
+            r_a = np.sqrt(x_a**2 + y_a**2)
+            for i in range(n):
+                point = {"X": float(x_a[i]), "Y": float(y_a[i]), "R": float(r_a[i])}
+                self._lockin_ch_buffers[1].append(point, ts + i * dt)
+                self._buffer.append(point, ts + i * dt)
+
+        self._waveform_data_count += n
+
+    @staticmethod
+    def _si_prefix_scale(max_val: float) -> Tuple[float, str]:
+        """根据数值范围返回 (缩放因子, SI前缀)。"""
+        abs_val = abs(max_val) if max_val != 0 else 1.0
+        if abs_val < 1e-9:
+            return 1e12, "p"
+        elif abs_val < 1e-6:
+            return 1e9, "n"
+        elif abs_val < 1e-3:
+            return 1e6, "μ"
+        elif abs_val < 1.0:
+            return 1e3, "m"
+        else:
+            return 1.0, ""
 
     def _on_display_tick(self):
-        """定时刷新波形图（已迁移到采集配置页面）。"""
-        if not _HAS_PYG or self._plot_widget is None:
+        """定时刷新波形图。"""
+        if not _HAS_PYG or not hasattr(self, '_wave_plot') or self._wave_plot is None:
+            return
+        if self._waveform_paused:
             return
 
-        # 选择当前显示的通道 buffer
-        ch_idx = self._wave_channel_select.currentIndex() if hasattr(self, '_wave_channel_select') else 0
+        # 选择当前通道 buffer
+        ch_idx = self._wave_ch_select.currentIndex() if hasattr(self, '_wave_ch_select') else 0
         ch_num = ch_idx + 1
-        buf = self._lockin_ch_buffers.get(ch_num, self._buffer)
+        buf = self._waveform_buffers.get(ch_num)
+        if buf is None:
+            return
 
-        for ch in ["X", "Y", "R"]:
-            ts_arr, vals = buf.get(ch, max_points=1000, downsample=2)
+        # 更新状态标签
+        if hasattr(self, '_wave_status_label'):
+            self._wave_status_label.setText(f"数据点: {self._waveform_data_count}")
+
+        # 更新所有可见曲线
+        for _label, key, _color, _default, axis_group in self._WAVE_PARAMS:
+            cb = self._wave_checkboxes.get(key)
+            curve = self._wave_curves.get(key)
+            if cb is None or curve is None:
+                continue
+            if not cb.isChecked():
+                continue
+            ts_arr, vals = buf.get(key, max_points=2000, downsample=2)
             if len(ts_arr) > 0:
-                # 相对时间，以最新点为 0
-                ts_arr = ts_arr - ts_arr[-1]
-                self._plot_curves[ch].setData(ts_arr, vals)
+                ts_arr = ts_arr - ts_arr[-1]  # 相对时间，最新=0
+                curve.setData(ts_arr, vals)
 
-        # 自动 Y 轴缩放
-        if hasattr(self, '_wave_auto_scale') and self._wave_auto_scale.isChecked():
-            all_vals = []
-            for ch in ["X", "Y", "R"]:
-                _ts, vals = buf.get(ch, max_points=200)
+        # Auto Y 轴缩放
+        if hasattr(self, '_wave_auto_y') and self._wave_auto_y.isChecked():
+            amp_vals = []
+            for _label, key, _color, _default, axis_group in self._WAVE_PARAMS:
+                if axis_group != "amp":
+                    continue
+                cb = self._wave_checkboxes.get(key)
+                if cb is None or not cb.isChecked():
+                    continue
+                _ts, vals = buf.get(key, max_points=500)
                 if len(vals) > 0:
-                    all_vals.extend(vals)
-            if all_vals:
-                y_min, y_max = min(all_vals), max(all_vals)
-                # 对称 Y 轴，使原点居中
-                y_max_abs = max(abs(y_min), abs(y_max))
+                    amp_vals.extend(vals.tolist())
+            if amp_vals:
+                y_max_abs = max(abs(min(amp_vals)), abs(max(amp_vals)))
                 if y_max_abs > 0:
                     margin = y_max_abs * 0.1
-                    self._plot_widget.setYRange(-y_max_abs - margin, y_max_abs + margin, padding=0)
+                    self._wave_plot.setYRange(-y_max_abs - margin, y_max_abs + margin, padding=0)
+                    # 更新 Y 轴标签单位
+                    scale, prefix = self._si_prefix_scale(y_max_abs)
+                    if scale != 1.0:
+                        self._wave_plot.setLabel("left", f"幅度 ({prefix}V)")
+                    else:
+                        self._wave_plot.setLabel("left", "幅度 (V)")
 
     def _on_command_completed(self, request_id: str, success: bool, message: str, result: dict) -> None:
         """处理 CommandService 异步命令结果。"""
