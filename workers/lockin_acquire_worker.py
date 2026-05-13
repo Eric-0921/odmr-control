@@ -65,6 +65,8 @@ class LockinAcquireWorker(QObject):
             return
 
         interval_s = 0.050  # 50 ms 标准间隔
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 5
         try:
             while not self._stop_requested:
                 t_start = time.monotonic()
@@ -72,14 +74,23 @@ class LockinAcquireWorker(QObject):
                 self._drain_commands()
 
                 try:
+                    # 每批都需要重新发送 RALL? 命令
+                    self._driver.start_rall_stream()
                     raw = self._driver.read_rall_batch(timeout=1.0)
                     if len(raw) != RALL_TOTAL_BYTES:
                         self._dropped += 1
+                        consecutive_errors += 1
                         self.error_occurred.emit(
                             f"[Lockin] RALL? 数据不完整: {len(raw)}/{RALL_TOTAL_BYTES} bytes"
                         )
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            self.error_occurred.emit(
+                                f"[Lockin] 连续 {consecutive_errors} 次失败，停止采集"
+                            )
+                            break
                         continue
 
+                    consecutive_errors = 0
                     batch = self._driver.parse_rall(raw)
                     self.batch_ready.emit(batch)
                     self._batch_count += 1
@@ -98,8 +109,18 @@ class LockinAcquireWorker(QObject):
                         )
 
                 except Exception as exc:
-                    self.error_occurred.emit(f"[Lockin] RALL? 读取失败: {exc}")
                     self._dropped += 1
+                    consecutive_errors += 1
+                    # 检测端口断开
+                    if not self._driver.is_connected:
+                        self.error_occurred.emit("[Lockin] 设备连接断开，停止采集")
+                        break
+                    self.error_occurred.emit(f"[Lockin] RALL? 读取失败: {exc}")
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        self.error_occurred.emit(
+                            f"[Lockin] 连续 {consecutive_errors} 次失败，停止采集"
+                        )
+                        break
 
                 # 严格 50ms 对齐
                 elapsed = time.monotonic() - t_start

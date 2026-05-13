@@ -19,8 +19,8 @@ import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QDoubleValidator, QFont, QIntValidator
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QMenuBar, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QTabWidget,
     QTextEdit, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
@@ -283,6 +283,11 @@ class ODMRControlGUI(QMainWindow):
         act_disconn_all.triggered.connect(self._disconnect_all)
         conn_menu.addAction(act_disconn_all)
 
+        settings_menu = menubar.addMenu("设置 / Settings (&S)")
+        act_monitor_interval = QAction("监控间隔 / Monitor Interval", self)
+        act_monitor_interval.triggered.connect(self._change_monitor_interval)
+        settings_menu.addAction(act_monitor_interval)
+
     # -----------------------------------------------------------------------
     # Toolbar
     # -----------------------------------------------------------------------
@@ -292,34 +297,26 @@ class ODMRControlGUI(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
-        conn_all_btn = QPushButton("连接 / Connect")
+        conn_all_btn = QPushButton("全部连接 / Connect All")
         conn_all_btn.setObjectName("primaryBtn")
         conn_all_btn.clicked.connect(self._connect_all)
         tb.addWidget(conn_all_btn)
 
-        disconn_btn = QPushButton("断开 / Disconnect")
+        disconn_btn = QPushButton("全部断开 / Disconnect All")
         disconn_btn.clicked.connect(self._disconnect_all)
         tb.addWidget(disconn_btn)
 
-        tb.addSeparator()
+        # 弹簧将急停推到最右侧
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
 
         estop_btn = QPushButton("急停 / E-Stop")
         estop_btn.setObjectName("dangerBtn")
+        estop_btn.setMinimumHeight(32)
+        estop_btn.setMinimumWidth(120)
         estop_btn.clicked.connect(self._emergency_stop)
         tb.addWidget(estop_btn)
-
-        tb.addSeparator()
-
-        self._tb_sweep_btn = QPushButton("开始扫频 / Start Sweep")
-        self._tb_sweep_btn.setObjectName("primaryBtn")
-        self._tb_sweep_btn.clicked.connect(self._start_sweep)
-        tb.addWidget(self._tb_sweep_btn)
-
-        self._tb_stop_sweep_btn = QPushButton("停止扫频 / Stop")
-        self._tb_stop_sweep_btn.setObjectName("dangerBtn")
-        self._tb_stop_sweep_btn.clicked.connect(self._stop_sweep)
-        self._tb_stop_sweep_btn.setEnabled(False)
-        tb.addWidget(self._tb_stop_sweep_btn)
 
     # -----------------------------------------------------------------------
     # Status bar
@@ -361,14 +358,11 @@ class ODMRControlGUI(QMainWindow):
         self._nav.setMaximumWidth(260)
         nav_items = [
             ("设备连接 / Connection", 0),
-            ("实时监控 / Monitor", 1),
-            ("微波源控制 / Source", 2),
-            ("锁相控制 / Lock-in Control", 3),
-            ("采集配置 / Acquisition", 4),
-            ("实时波形 / Waveform", 5),
-            ("实验序列 / Sequence", 6),
-            ("数据记录 / Data Log", 7),
-            ("日志 / Log", 8),
+            ("参数配置 / Parameters", 1),
+            ("扫频实验 / Sweep", 2),
+            ("实时波形 / Waveform", 3),
+            ("状态监控 / Monitor", 4),
+            ("日志 / Log", 5),
         ]
         for label, idx in nav_items:
             item = QTreeWidgetItem([label])
@@ -387,17 +381,14 @@ class ODMRControlGUI(QMainWindow):
         self._global_status_bar = self._build_global_status_bar()
         right_layout.addWidget(self._global_status_bar)
 
-        # Stacked pages
+        # Stacked pages (6 pages)
         self._stack = QStackedWidget()
-        self._stack.addWidget(self._build_connection_page())
-        self._stack.addWidget(self._build_monitor_page())
-        self._stack.addWidget(self._build_source_page())
-        self._stack.addWidget(self._build_lockin_control_page())
-        self._stack.addWidget(self._build_acquisition_page())
-        self._stack.addWidget(self._build_waveform_page())
-        self._stack.addWidget(self._build_sequence_page())
-        self._stack.addWidget(self._build_data_log_page())
-        self._stack.addWidget(self._build_log_page())
+        self._stack.addWidget(self._build_connection_page())       # 0: 设备连接
+        self._stack.addWidget(self._build_param_config_page())     # 1: 参数配置
+        self._stack.addWidget(self._build_sweep_experiment_page()) # 2: 扫频实验
+        self._stack.addWidget(self._build_waveform_page())         # 3: 实时波形
+        self._stack.addWidget(self._build_monitor_page())          # 4: 状态监控
+        self._stack.addWidget(self._build_log_page())              # 5: 日志
         right_layout.addWidget(self._stack, 1)
 
         splitter.addWidget(right_widget)
@@ -410,8 +401,8 @@ class ODMRControlGUI(QMainWindow):
         if current is not None:
             idx = current.data(0, Qt.UserRole)
             self._stack.setCurrentIndex(idx)
-            # RALL? lifecycle: waveform page (idx=5) needs RALL? data
-            if idx == 5:
+            # RALL? lifecycle: waveform page (idx=3) needs RALL? data
+            if idx == 3:
                 self._start_waveform_acquire()
             else:
                 self._stop_waveform_acquire()
@@ -631,6 +622,27 @@ class ODMRControlGUI(QMainWindow):
 
         layout.addWidget(laser_group)
 
+        # Laser Control
+        laser_ctrl_group = QGroupBox("激光器控制 / Laser Control")
+        laser_ctrl_layout = QGridLayout(laser_ctrl_group)
+        laser_ctrl_layout.addWidget(QLabel("功率 (mW):"), 0, 0)
+        self._laser_power_edit = QLineEdit("0")
+        self._laser_power_edit.setValidator(QIntValidator(0, 999))
+        self._laser_power_edit.setFixedWidth(80)
+        laser_ctrl_layout.addWidget(self._laser_power_edit, 0, 1)
+        laser_power_btn = QPushButton("设 / Set")
+        laser_power_btn.setObjectName("primaryBtn")
+        laser_power_btn.clicked.connect(self._set_laser_power)
+        laser_ctrl_layout.addWidget(laser_power_btn, 0, 2)
+        self._laser_max_label = QLabel(f"Max: {self._cfg['laser'].get('max_power_mw', 150)} mW")
+        self._laser_max_label.setStyleSheet("color: #666; font-size: 11px;")
+        laser_ctrl_layout.addWidget(self._laser_max_label, 0, 3)
+        self._laser_output_toggle = QCheckBox("激光输出 / Laser Output")
+        self._laser_output_toggle.stateChanged.connect(self._toggle_laser_output)
+        laser_ctrl_layout.addWidget(self._laser_output_toggle, 1, 0, 1, 2)
+        laser_ctrl_layout.setColumnStretch(4, 1)
+        layout.addWidget(laser_ctrl_group)
+
         layout.addStretch()
         return page
 
@@ -647,79 +659,6 @@ class ODMRControlGUI(QMainWindow):
         title = QLabel("实时监控 / Real-time Monitor")
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
-
-        # -- Status Indicators -------------------------------------------------
-        indicator_group = QGroupBox("状态指示灯 / Status Indicators")
-        indicator_layout = QVBoxLayout(indicator_group)
-
-        # SMB indicators
-        smb_ind_layout = QHBoxLayout()
-        smb_ind_layout.addWidget(QLabel("SMB100A:"))
-        self._smb_indicator_labels: Dict[str, QLabel] = {}
-        for name, label_text in [
-            ("rf", "RF"),
-            ("lf_on", "LF Out"),
-            ("lf_sweep", "LF Sweep"),
-            ("mod_on", "Modulation"),
-        ]:
-            led = QLabel()
-            led.setObjectName("statusLed")
-            led.setProperty("on", "false")
-            led.setFixedSize(16, 16)
-            smb_ind_layout.addWidget(led)
-            lbl = QLabel(label_text)
-            lbl.setStyleSheet("font-size: 11px; color: #666;")
-            smb_ind_layout.addWidget(lbl)
-            self._smb_indicator_labels[name] = led
-        smb_ind_layout.addStretch()
-        indicator_layout.addLayout(smb_ind_layout)
-
-        # Lockin indicators
-        lockin_ind_layout = QHBoxLayout()
-        lockin_ind_layout.addWidget(QLabel("OE1022D:"))
-        self._lockin_indicator_labels: Dict[str, Dict[str, QLabel]] = {}
-        for ch_name, ch_num in [("CH-A", 1), ("CH-B", 2)]:
-            lockin_ind_layout.addWidget(QLabel(ch_name + ":"))
-            ch_leds: Dict[str, QLabel] = {}
-            for name, label_text in [
-                ("input_overload", "Input OV"),
-                ("gain_overload", "Gain OV"),
-                ("pll_locked", "PLL"),
-            ]:
-                led = QLabel()
-                led.setObjectName("statusLed")
-                led.setProperty("on", "false")
-                led.setFixedSize(16, 16)
-                lockin_ind_layout.addWidget(led)
-                lbl = QLabel(label_text)
-                lbl.setStyleSheet("font-size: 11px; color: #666;")
-                lockin_ind_layout.addWidget(lbl)
-                ch_leds[name] = led
-            self._lockin_indicator_labels[ch_num] = ch_leds
-            lockin_ind_layout.addSpacing(20)
-        lockin_ind_layout.addStretch()
-        indicator_layout.addLayout(lockin_ind_layout)
-
-        # Laser indicators
-        laser_ind_layout = QHBoxLayout()
-        laser_ind_layout.addWidget(QLabel("Laser:"))
-        self._laser_indicator_labels: Dict[str, QLabel] = {}
-        for name, label_text in [
-            ("laser_on", "Output"),
-        ]:
-            led = QLabel()
-            led.setObjectName("statusLed")
-            led.setProperty("on", "false")
-            led.setFixedSize(16, 16)
-            laser_ind_layout.addWidget(led)
-            lbl = QLabel(label_text)
-            lbl.setStyleSheet("font-size: 11px; color: #666;")
-            laser_ind_layout.addWidget(lbl)
-            self._laser_indicator_labels[name] = led
-        laser_ind_layout.addStretch()
-        indicator_layout.addLayout(laser_ind_layout)
-
-        layout.addWidget(indicator_group)
 
         # -- SMB100A Parameters ------------------------------------------------
         smb_params_group = QGroupBox("SMB100A 参数 / SMB100A Parameters")
@@ -763,27 +702,6 @@ class ODMRControlGUI(QMainWindow):
             self._laser_param_displays[key] = (disp, unit, fmt)
         layout.addWidget(laser_params_group)
 
-        # -- Laser Control -----------------------------------------------------
-        laser_ctrl_group = QGroupBox("激光器控制 / Laser Control")
-        laser_ctrl_layout = QGridLayout(laser_ctrl_group)
-        laser_ctrl_layout.addWidget(QLabel("功率 (mW):"), 0, 0)
-        self._laser_power_edit = QLineEdit("0")
-        self._laser_power_edit.setValidator(QIntValidator(0, 999))
-        self._laser_power_edit.setFixedWidth(80)
-        laser_ctrl_layout.addWidget(self._laser_power_edit, 0, 1)
-        laser_power_btn = QPushButton("设 / Set")
-        laser_power_btn.setObjectName("primaryBtn")
-        laser_power_btn.clicked.connect(self._set_laser_power)
-        laser_ctrl_layout.addWidget(laser_power_btn, 0, 2)
-        self._laser_max_label = QLabel(f"Max: {self._cfg['laser'].get('max_power_mw', 150)} mW")
-        self._laser_max_label.setStyleSheet("color: #666; font-size: 11px;")
-        laser_ctrl_layout.addWidget(self._laser_max_label, 0, 3)
-        self._laser_output_toggle = QCheckBox("激光输出 / Laser Output")
-        self._laser_output_toggle.stateChanged.connect(self._toggle_laser_output)
-        laser_ctrl_layout.addWidget(self._laser_output_toggle, 1, 0, 1, 2)
-        laser_ctrl_layout.setColumnStretch(4, 1)
-        layout.addWidget(laser_ctrl_group)
-
         # -- Lock-in Amplifier (Channel A/B tabs) ------------------------------
         lockin_tabs = QTabWidget()
         self._lockin_ch_displays: Dict[int, Dict[str, QLabel]] = {}
@@ -810,33 +728,37 @@ class ODMRControlGUI(QMainWindow):
             lockin_tabs.addTab(ch_page, f"Channel {'A' if ch_num == 1 else 'B'}")
         layout.addWidget(lockin_tabs)
 
-        # Monitor interval
-        interval_layout = QHBoxLayout()
-        interval_layout.addWidget(QLabel("监控间隔 (ms):"))
-        self._monitor_interval_input = QLineEdit("94")
-        self._monitor_interval_input.setValidator(QIntValidator(50, 5000))
-        self._monitor_interval_input.setFixedWidth(80)
-        interval_layout.addWidget(self._monitor_interval_input)
-        apply_btn = QPushButton("应用 / Apply")
-        apply_btn.clicked.connect(self._apply_monitor_interval)
-        interval_layout.addWidget(apply_btn)
-        interval_layout.addStretch()
-        layout.addLayout(interval_layout)
-
         layout.addStretch()
         page.setWidget(inner)
         return page
 
-    def _apply_monitor_interval(self) -> None:
-        try:
-            ms = int(self._monitor_interval_input.text())
+    def _change_monitor_interval(self) -> None:
+        from PyQt5.QtWidgets import QInputDialog
+        current_ms = 94
+        ms, ok = QInputDialog.getInt(
+            self, "监控间隔 / Monitor Interval",
+            "间隔 (ms):", current_ms, 50, 5000, 10,
+        )
+        if ok:
             self._ctrl.set_lockin_monitor_interval(ms)
             self._on_log(f"监控间隔设为 {ms} ms")
-        except ValueError:
-            QMessageBox.warning(self, "警告", "请输入有效的间隔值")
 
     # -----------------------------------------------------------------------
-    # Page 2: Microwave Source Control
+    # Page 1: Parameter Config (Source + Lock-in tabs)
+    # -----------------------------------------------------------------------
+
+    def _build_param_config_page(self) -> QWidget:
+        """参数配置页面：微波源 + 锁相 CH-A + 锁相 CH-B 三个 Tab。"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        tabs = QTabWidget()
+        tabs.addTab(self._build_source_page(), "微波源 / Microwave")
+        tabs.addTab(self._build_lockin_control_page(), "锁相控制 / Lock-in")
+        layout.addWidget(tabs)
+        return page
+
+    # -----------------------------------------------------------------------
+    # Microwave Source Control Tab
     # -----------------------------------------------------------------------
 
     def _build_source_page(self) -> QWidget:
@@ -946,40 +868,6 @@ class ODMRControlGUI(QMainWindow):
         lf_layout.addWidget(btn3, 2, 2)
         lf_layout.setColumnStretch(3, 1)
         layout.addWidget(lf_group)
-
-        # -- Sweep -------------------------------------------------------------
-        sweep_group = QGroupBox("扫频 / Sweep")
-        sweep_layout = QGridLayout(sweep_group)
-        sweep_layout.addWidget(QLabel("起始频率 (Hz):"), 0, 0)
-        self._start_freq_edit = QLineEdit(str(cfg_sweep["start_freq_hz"]))
-        sweep_layout.addWidget(self._start_freq_edit, 0, 1)
-        btn = QPushButton("设 / Set")
-        btn.setObjectName("primaryBtn")
-        btn.clicked.connect(lambda: self._set_start_freq(self._start_freq_edit.text()))
-        sweep_layout.addWidget(btn, 0, 2)
-        sweep_layout.addWidget(QLabel("终止频率 (Hz):"), 1, 0)
-        self._stop_freq_edit = QLineEdit(str(cfg_sweep["stop_freq_hz"]))
-        sweep_layout.addWidget(self._stop_freq_edit, 1, 1)
-        btn2 = QPushButton("设 / Set")
-        btn2.setObjectName("primaryBtn")
-        btn2.clicked.connect(lambda: self._set_stop_freq(self._stop_freq_edit.text()))
-        sweep_layout.addWidget(btn2, 1, 2)
-        sweep_layout.addWidget(QLabel("步进 (Hz):"), 2, 0)
-        self._step_edit = QLineEdit(str(cfg_sweep["step_hz"]))
-        sweep_layout.addWidget(self._step_edit, 2, 1)
-        btn3 = QPushButton("设 / Set")
-        btn3.setObjectName("primaryBtn")
-        btn3.clicked.connect(lambda: self._set_step(self._step_edit.text()))
-        sweep_layout.addWidget(btn3, 2, 2)
-        sweep_layout.addWidget(QLabel("驻留 (ms):"), 3, 0)
-        self._dwell_edit = QLineEdit(str(cfg_sweep["dwell_ms"]))
-        sweep_layout.addWidget(self._dwell_edit, 3, 1)
-        btn4 = QPushButton("设 / Set")
-        btn4.setObjectName("primaryBtn")
-        btn4.clicked.connect(lambda: self._set_dwell(self._dwell_edit.text()))
-        sweep_layout.addWidget(btn4, 3, 2)
-        sweep_layout.setColumnStretch(3, 1)
-        layout.addWidget(sweep_group)
 
         # -- Apply All ---------------------------------------------------------
         apply_all_btn = QPushButton("应用所有参数 / Apply All")
@@ -1187,106 +1075,13 @@ class ODMRControlGUI(QMainWindow):
         except Exception as exc:
             self._on_error(f"Lockin command failed: {exc}")
 
-    # -----------------------------------------------------------------------
-    # Page 4: Acquisition Config
-    # -----------------------------------------------------------------------
-
-    def _build_acquisition_page(self) -> QWidget:
-        page = QScrollArea()
-        page.setWidgetResizable(True)
-        inner = QWidget()
-        layout = QVBoxLayout(inner)
-
-        title = QLabel("采集配置 / Acquisition Config")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
-
-        info = QLabel(
-            "RALL? 模式：每 50ms 返回 20 参数 x 50 点 = 12288 bytes\n"
-            "SNAPD? 模式：实时监控用，返回 X/Y/R/theta 四参数"
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        dir_group = QGroupBox("存储路径 / Save Directory")
-        dir_layout = QHBoxLayout(dir_group)
-        self._save_dir_input = QLineEdit(self._cfg["acquisition"]["save_dir"])
-        dir_layout.addWidget(self._save_dir_input, 1)
-        browse_btn = QPushButton("浏览 / Browse")
-        browse_btn.clicked.connect(self._browse_save_dir)
-        dir_layout.addWidget(browse_btn)
-        layout.addWidget(dir_group)
-
-        opt_group = QGroupBox("选项 / Options")
-        opt_layout = QVBoxLayout(opt_group)
-        self._auto_save_check = QCheckBox("自动保存 / Auto Save")
-        self._auto_save_check.setChecked(self._cfg["acquisition"]["auto_save"])
-        opt_layout.addWidget(self._auto_save_check)
-        layout.addWidget(opt_group)
-
-        # -- OE1022D Sampling Config -------------------------------------------
-        sample_group = QGroupBox("OE1022D 采样配置 / Sampling Config")
-        sample_layout = QGridLayout(sample_group)
-        sample_layout.addWidget(QLabel("模式 / Mode:"), 0, 0)
-        self._lockin_sample_mode = QComboBox()
-        self._lockin_sample_mode.addItems(["RALL? (固定 1kHz)", "Buffer (可配置)"])
-        sample_layout.addWidget(self._lockin_sample_mode, 0, 1)
-        sample_layout.addWidget(QLabel("Step Time (ms):"), 1, 0)
-        self._lockin_step_time = QComboBox()
-        self._lockin_step_time.addItems(["1", "2", "5", "10", "20", "50", "100"])
-        self._lockin_step_time.setCurrentText("1")
-        sample_layout.addWidget(self._lockin_step_time, 1, 1)
-        sample_layout.addWidget(QLabel("Length:"), 2, 0)
-        self._lockin_sample_length = QLineEdit("16384")
-        sample_layout.addWidget(self._lockin_sample_length, 2, 1)
-        sample_layout.addWidget(QLabel("Trigger:"), 3, 0)
-        self._lockin_trigger_mode = QComboBox()
-        self._lockin_trigger_mode.addItems(["Internal", "External"])
-        sample_layout.addWidget(self._lockin_trigger_mode, 3, 1)
-        sample_apply = QPushButton("应用 / Apply")
-        sample_apply.setObjectName("primaryBtn")
-        sample_apply.clicked.connect(self._apply_lockin_sample_config)
-        sample_layout.addWidget(sample_apply, 4, 0, 1, 2)
-        sample_layout.setColumnStretch(2, 1)
-        layout.addWidget(sample_group)
-
-        layout.addStretch()
-        page.setWidget(inner)
-        return page
-
     def _browse_save_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择保存目录", self._save_dir_input.text())
         if d:
             self._save_dir_input.setText(d)
 
-    def _apply_lockin_sample_config(self) -> None:
-        """应用 OE1022D 采样配置。"""
-        try:
-            mode = self._lockin_sample_mode.currentIndex()  # 0=RALL?, 1=Buffer
-            step_time_ms = int(self._lockin_step_time.currentText())
-            length = int(self._lockin_sample_length.text())
-            trigger = self._lockin_trigger_mode.currentIndex()  # 0=Internal, 1=External
-            if self._cmd_service is not None:
-                self._cmd_service.submit(Command(
-                    CommandType.LOCKIN_SET_SAMPLE,
-                    {
-                        "step_time_ms": step_time_ms,
-                        "length": length,
-                        "trigger_mode": trigger,
-                        "sample_mode": mode,
-                    },
-                    source="gui",
-                ))
-            self._on_log(
-                f"Lockin sample config: mode={'RALL?' if mode == 0 else 'Buffer'}, "
-                f"step={step_time_ms}ms, length={length}, trigger={'Internal' if trigger == 0 else 'External'}",
-                "lockin"
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "Config Error", str(exc))
-
     # -----------------------------------------------------------------------
-    # Page 5: Real-time Waveform
+    # Page 3: Real-time Waveform
     # -----------------------------------------------------------------------
 
     # 波形参数定义：(显示名, buffer key, 颜色, 默认勾选, Y轴组)
@@ -1294,17 +1089,17 @@ class ODMRControlGUI(QMainWindow):
         ("X",   "X",      "#0080c8", True,  "amp"),
         ("Y",   "Y",      "#00a651", True,  "amp"),
         ("R",   "R",      "#e04040", True,  "amp"),
-        ("θ",   "theta",  "#ff8c00", True,  "amp"),
-        ("freq", "freq",  "#808080", False, "other"),
-        ("noise","noise", "#c0c0c0", False, "other"),
-        ("Xh1", "Xh1",   "#4080c8", True,  "amp"),
-        ("Yh1", "Yh1",   "#40a651", True,  "amp"),
-        ("Rh1", "Rh1",   "#e08080", False, "amp"),
-        ("θh1", "θh1",   "#c08000", False, "amp"),
-        ("Xh2", "Xh2",   "#8080c8", False, "amp"),
-        ("Yh2", "Yh2",   "#80a651", False, "amp"),
-        ("Rh2", "Rh2",   "#e0a0a0", False, "amp"),
-        ("θh2", "θh2",   "#806000", False, "amp"),
+        ("θ",    "theta",    "#ff8c00", True,  "amp"),
+        ("freq", "freq",     "#808080", False, "other"),
+        ("noise","noise",    "#c0c0c0", False, "other"),
+        ("Xh1",  "Xh1",     "#4080c8", True,  "amp"),
+        ("Yh1",  "Yh1",     "#40a651", True,  "amp"),
+        ("Rh1",  "Rh1",     "#e08080", False, "amp"),
+        ("θh1",  "theta_h1","#c08000", False, "amp"),
+        ("Xh2",  "Xh2",     "#8080c8", False, "amp"),
+        ("Yh2",  "Yh2",     "#80a651", False, "amp"),
+        ("Rh2",  "Rh2",     "#e0a0a0", False, "amp"),
+        ("θh2",  "theta_h2","#806000", False, "amp"),
     ]
 
     # CircularBuffer 通道列表（波形专用）
@@ -1421,6 +1216,41 @@ class ODMRControlGUI(QMainWindow):
         self._waveform_rall_running = False
         self._waveform_data_count = 0
 
+        # -- Recording control -------------------------------------------------
+        rec_group = QGroupBox("数据记录 / Data Recording")
+        rec_layout = QVBoxLayout(rec_group)
+
+        rec_dir_layout = QHBoxLayout()
+        rec_dir_layout.addWidget(QLabel("保存目录:"))
+        self._save_dir_input = QLineEdit(self._cfg["acquisition"]["save_dir"])
+        rec_dir_layout.addWidget(self._save_dir_input, 1)
+        browse_btn = QPushButton("浏览 / Browse")
+        browse_btn.clicked.connect(self._browse_save_dir)
+        rec_dir_layout.addWidget(browse_btn)
+        rec_layout.addLayout(rec_dir_layout)
+
+        rec_btn_layout = QHBoxLayout()
+        self._rec_toggle_btn = QPushButton("开始记录 / Start Recording")
+        self._rec_toggle_btn.setObjectName("primaryBtn")
+        self._rec_toggle_btn.setCheckable(True)
+        self._rec_toggle_btn.clicked.connect(self._toggle_recording)
+        rec_btn_layout.addWidget(self._rec_toggle_btn)
+        self._rec_status_label = QLabel("未记录 / Not recording")
+        self._rec_status_label.setAlignment(Qt.AlignCenter)
+        self._rec_status_label.setStyleSheet(
+            "padding: 8px; border-radius: 3px; font-weight: 700; background-color: #e8e8e8;"
+        )
+        rec_btn_layout.addWidget(self._rec_status_label)
+        rec_btn_layout.addStretch()
+        rec_layout.addLayout(rec_btn_layout)
+
+        self._rec_file_label = QLabel("---")
+        self._rec_file_label.setWordWrap(True)
+        self._rec_file_label.setStyleSheet("color: #666; font-size: 11px;")
+        rec_layout.addWidget(self._rec_file_label)
+
+        layout.addWidget(rec_group)
+
         return page
 
     def _on_wave_pause_toggle(self, checked: bool) -> None:
@@ -1459,7 +1289,7 @@ class ODMRControlGUI(QMainWindow):
         """停止 RALL? 波形采集（除非正在记录数据）。"""
         self._waveform_page_active = False
         # 如果正在记录数据，不停止 RALL?
-        if hasattr(self, '_is_recording') and self._is_recording:
+        if self._recording:
             return
         if self._waveform_rall_running:
             try:
@@ -1470,48 +1300,68 @@ class ODMRControlGUI(QMainWindow):
                 pass
 
     # -----------------------------------------------------------------------
-    # Page 6: Experiment Sequence
+    # Page 2: Sweep Experiment (Sweep Config + Acquisition + Controls)
     # -----------------------------------------------------------------------
 
-    def _build_sequence_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
+    def _build_sweep_experiment_page(self) -> QWidget:
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
 
-        title = QLabel("实验序列 / Experiment Sequence")
+        title = QLabel("扫频实验 / Sweep Experiment")
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
 
-        # Simple sweep config (single step)
-        sweep_group = QGroupBox("单步扫频 / Single Sweep")
-        sg_layout = QGridLayout(sweep_group)
+        cfg_sweep = self._cfg["sweep"]
 
-        sg_layout.addWidget(QLabel("循环次数 / Cycles:"), 0, 0)
+        # -- Sweep parameters -------------------------------------------------
+        sweep_group = QGroupBox("扫频参数 / Sweep Parameters")
+        sweep_layout = QGridLayout(sweep_group)
+        sweep_layout.addWidget(QLabel("起始频率 (Hz):"), 0, 0)
+        self._start_freq_edit = QLineEdit(str(cfg_sweep["start_freq_hz"]))
+        sweep_layout.addWidget(self._start_freq_edit, 0, 1)
+        sweep_layout.addWidget(QLabel("终止频率 (Hz):"), 0, 2)
+        self._stop_freq_edit = QLineEdit(str(cfg_sweep["stop_freq_hz"]))
+        sweep_layout.addWidget(self._stop_freq_edit, 0, 3)
+        sweep_layout.addWidget(QLabel("步进 (Hz):"), 1, 0)
+        self._step_edit = QLineEdit(str(cfg_sweep["step_hz"]))
+        sweep_layout.addWidget(self._step_edit, 1, 1)
+        sweep_layout.addWidget(QLabel("驻留 (ms):"), 1, 2)
+        self._dwell_edit = QLineEdit(str(cfg_sweep["dwell_ms"]))
+        sweep_layout.addWidget(self._dwell_edit, 1, 3)
+        sweep_layout.addWidget(QLabel("功率 (dBm):"), 2, 0)
+        self._sweep_power_edit = QLineEdit(str(cfg_sweep["power_dbm"]))
+        sweep_layout.addWidget(self._sweep_power_edit, 2, 1)
+        sweep_layout.setColumnStretch(4, 1)
+        layout.addWidget(sweep_group)
+
+        # -- Cycle settings ---------------------------------------------------
+        cycle_group = QGroupBox("循环设置 / Cycle Settings")
+        cycle_layout = QGridLayout(cycle_group)
+        cycle_layout.addWidget(QLabel("循环次数 / Cycles:"), 0, 0)
         self._cycle_count_input = QLineEdit("1")
         self._cycle_count_input.setValidator(QIntValidator(1, 9999))
         self._cycle_count_input.setFixedWidth(80)
-        sg_layout.addWidget(self._cycle_count_input, 0, 1)
-
-        sg_layout.addWidget(QLabel("循环间隔 (ms):"), 0, 2)
+        cycle_layout.addWidget(self._cycle_count_input, 0, 1)
+        cycle_layout.addWidget(QLabel("循环间隔 (ms):"), 0, 2)
         self._cycle_interval_input = QLineEdit("200")
         self._cycle_interval_input.setValidator(QIntValidator(0, 3600000))
         self._cycle_interval_input.setFixedWidth(80)
-        sg_layout.addWidget(self._cycle_interval_input, 0, 3)
+        cycle_layout.addWidget(self._cycle_interval_input, 0, 3)
+        layout.addWidget(cycle_group)
 
-        layout.addWidget(sweep_group)
-
-        # Control buttons
+        # -- Control buttons --------------------------------------------------
         btn_layout = QHBoxLayout()
         self._start_sweep_btn = QPushButton("开始扫频 / Start Sweep")
         self._start_sweep_btn.setObjectName("primaryBtn")
         self._start_sweep_btn.clicked.connect(self._start_sweep)
         btn_layout.addWidget(self._start_sweep_btn)
-
         self._stop_sweep_btn = QPushButton("停止扫频 / Stop Sweep")
         self._stop_sweep_btn.setObjectName("dangerBtn")
         self._stop_sweep_btn.clicked.connect(self._stop_sweep)
         self._stop_sweep_btn.setEnabled(False)
         btn_layout.addWidget(self._stop_sweep_btn)
-
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
@@ -1521,40 +1371,46 @@ class ODMRControlGUI(QMainWindow):
         self._sweep_progress.setValue(0)
         layout.addWidget(self._sweep_progress)
 
-        layout.addStretch()
-        return page
-
-    # -----------------------------------------------------------------------
-    # Page 5: Data Log
-    # -----------------------------------------------------------------------
-
-    def _build_data_log_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-
-        title = QLabel("数据记录 / Data Log")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
-
-        status_group = QGroupBox("记录状态 / Recording Status")
-        status_layout = QHBoxLayout(status_group)
-        self._rec_status_label = QLabel("未记录 / Not recording")
-        self._rec_status_label.setAlignment(Qt.AlignCenter)
-        self._rec_status_label.setStyleSheet(
-            "padding: 10px; border-radius: 3px; font-weight: 700; background-color: #e8e8e8;"
-        )
-        status_layout.addWidget(self._rec_status_label)
-        layout.addWidget(status_group)
-
-        file_group = QGroupBox("当前文件 / Current File")
-        file_layout = QVBoxLayout(file_group)
-        self._rec_file_label = QLabel("---")
-        self._rec_file_label.setWordWrap(True)
-        file_layout.addWidget(self._rec_file_label)
-        layout.addWidget(file_group)
+        # -- Acquisition settings ---------------------------------------------
+        acq_group = QGroupBox("采集设置 / Acquisition Settings")
+        acq_layout = QVBoxLayout(acq_group)
+        self._auto_save_check = QCheckBox("扫频时自动保存 / Auto Save on Sweep")
+        self._auto_save_check.setChecked(self._cfg["acquisition"]["auto_save"])
+        acq_layout.addWidget(self._auto_save_check)
+        layout.addWidget(acq_group)
 
         layout.addStretch()
+        page.setWidget(inner)
         return page
+
+    def _toggle_recording(self, checked: bool) -> None:
+        """独立于扫频的数据记录控制。"""
+        if checked:
+            if not self._ctrl.is_lockin_connected:
+                QMessageBox.warning(self, "警告", "请先连接锁相放大器")
+                self._rec_toggle_btn.setChecked(False)
+                return
+            out_dir = self._save_dir_input.text()
+            self._recorder = ODMRRecorder(out_dir)
+            self._recorder.start_recording()
+            self._rec_file_label.setText(str(self._recorder.output_dir))
+            self._rec_status_label.setText("记录中 / Recording")
+            self._rec_status_label.setStyleSheet(
+                "padding: 8px; border-radius: 3px; font-weight: 700; background-color: #cce4f7;"
+            )
+            self._rec_toggle_btn.setText("停止记录 / Stop Recording")
+            self._status_rec.setText("Record: ON")
+            self._recording = True
+        else:
+            if self._recorder is not None:
+                self._recorder.stop_recording()
+            self._rec_status_label.setText("未记录 / Not recording")
+            self._rec_status_label.setStyleSheet(
+                "padding: 8px; border-radius: 3px; font-weight: 700; background-color: #e8e8e8;"
+            )
+            self._rec_toggle_btn.setText("开始记录 / Start Recording")
+            self._status_rec.setText("Record: OFF")
+            self._recording = False
 
     # -----------------------------------------------------------------------
     # Page 6: Log
@@ -1932,46 +1788,6 @@ class ODMRControlGUI(QMainWindow):
         except Exception as exc:
             self._on_error("Set power failed: " + str(exc))
 
-    def _set_start_freq(self, val):
-        try:
-            if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_SWEEP, {"start_hz": float(val)}, source="gui"))
-            else:
-                self._ctrl.smb.set_sweep_start(float(val))
-            self._on_log("Start freq set to " + val + " Hz", "smb")
-        except Exception as exc:
-            self._on_error("Set start freq failed: " + str(exc))
-
-    def _set_stop_freq(self, val):
-        try:
-            if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_SWEEP, {"stop_hz": float(val)}, source="gui"))
-            else:
-                self._ctrl.smb.set_sweep_stop(float(val))
-            self._on_log("Stop freq set to " + val + " Hz", "smb")
-        except Exception as exc:
-            self._on_error("Set stop freq failed: " + str(exc))
-
-    def _set_step(self, val):
-        try:
-            if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_SWEEP, {"step_hz": float(val)}, source="gui"))
-            else:
-                self._ctrl.smb.set_sweep_step(float(val))
-            self._on_log("Step set to " + val + " Hz", "smb")
-        except Exception as exc:
-            self._on_error("Set step failed: " + str(exc))
-
-    def _set_dwell(self, val):
-        try:
-            if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_SWEEP, {"dwell_ms": float(val)}, source="gui"))
-            else:
-                self._ctrl.smb.set_sweep_dwell(float(val))
-            self._on_log("Dwell set to " + val + " ms", "smb")
-        except Exception as exc:
-            self._on_error("Set dwell failed: " + str(exc))
-
     def _set_cw_freq(self, val):
         try:
             if self._cmd_service is not None:
@@ -2034,12 +1850,6 @@ class ODMRControlGUI(QMainWindow):
                 return
             params = [
                 (CommandType.SMB_SET_POWER, {"power_dbm": p}),
-                (CommandType.SMB_SET_SWEEP, {
-                    "start_hz": float(self._start_freq_edit.text()),
-                    "stop_hz": float(self._stop_freq_edit.text()),
-                    "step_hz": float(self._step_edit.text()),
-                    "dwell_ms": float(self._dwell_edit.text()),
-                }),
                 (CommandType.SMB_SET_LF_VOLTAGE, {"mv": float(self._lf_amp_edit.text())}),
                 (CommandType.SMB_SET_LF_FREQ, {"freq_hz": float(self._lf_freq_edit.text())}),
                 (CommandType.SMB_SET_LF_SHAPE, {"shape": self._lf_shape_combo.currentText()}),
@@ -2050,10 +1860,6 @@ class ODMRControlGUI(QMainWindow):
                     self._cmd_service.submit(Command(ct, pr, source="gui"))
             else:
                 self._ctrl.smb.set_power(p)
-                self._ctrl.smb.set_sweep_start(float(self._start_freq_edit.text()))
-                self._ctrl.smb.set_sweep_stop(float(self._stop_freq_edit.text()))
-                self._ctrl.smb.set_sweep_step(float(self._step_edit.text()))
-                self._ctrl.smb.set_sweep_dwell(float(self._dwell_edit.text()))
                 self._ctrl.smb.set_lf_voltage(float(self._lf_amp_edit.text()))
                 self._ctrl.smb.set_lf_freq(float(self._lf_freq_edit.text()))
                 self._ctrl.smb.set_lf_shape(self._lf_shape_combo.currentText())
@@ -2105,16 +1911,16 @@ class ODMRControlGUI(QMainWindow):
         if not self._ctrl.is_laser_connected:
             QMessageBox.warning(self, "警告", "请先连接激光器")
             return
+        if self._cmd_service is None:
+            QMessageBox.warning(self, "警告", "命令总线未就绪")
+            return
         try:
             power = int(self._laser_power_edit.text())
             max_mw = self._cfg["laser"].get("max_power_mw", 150)
             if power < 0 or power > max_mw:
                 QMessageBox.warning(self, "警告", f"功率超出范围 [0, {max_mw}] mW")
                 return
-            if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.LASER_SET_POWER, {"power_mw": power}, source="gui"))
-            else:
-                self._ctrl.laser.set_power(power)
+            self._cmd_service.submit(Command(CommandType.LASER_SET_POWER, {"power_mw": power}, source="gui"))
             self._on_log(f"激光功率设为 {power} mW", "laser")
         except ValueError:
             QMessageBox.warning(self, "警告", "请输入有效的功率值")
@@ -2124,12 +1930,11 @@ class ODMRControlGUI(QMainWindow):
     def _toggle_laser_output(self, state):
         if not self._ctrl.is_laser_connected:
             return
+        if self._cmd_service is None:
+            return
         try:
             on = state == Qt.Checked
-            if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.LASER_SET_OUTPUT, {"enabled": on}, source="gui"))
-            else:
-                self._ctrl.laser.set_output(on)
+            self._cmd_service.submit(Command(CommandType.LASER_SET_OUTPUT, {"enabled": on}, source="gui"))
             self._on_log("激光输出 " + ("ON" if on else "OFF"), "laser")
         except Exception as exc:
             self._on_error("激光输出切换失败: " + str(exc))
@@ -2150,7 +1955,7 @@ class ODMRControlGUI(QMainWindow):
             stop_freq_hz=float(self._stop_freq_edit.text()),
             step_hz=float(self._step_edit.text()),
             dwell_ms=float(self._dwell_edit.text()),
-            power_dbm=float(self._power_edit.text()),
+            power_dbm=float(self._sweep_power_edit.text()),
             lf_freq_hz=float(self._lf_freq_edit.text()),
             lf_amp_mv=float(self._lf_amp_edit.text()),
             lf_shape=self._lf_shape_combo.currentText(),
@@ -2177,25 +1982,13 @@ class ODMRControlGUI(QMainWindow):
         self._sweep_engine.start()
         self._start_sweep_btn.setEnabled(False)
         self._stop_sweep_btn.setEnabled(True)
-        self._tb_sweep_btn.setEnabled(False)
-        self._tb_stop_sweep_btn.setEnabled(True)
         self._status_sweep.setText("Sweep: Running")
 
     def _stop_sweep(self):
         self._sweep_engine.stop()
-        self._ctrl.stop_lockin_acquire()
-        if self._recorder is not None and self._recorder.is_recording:
-            self._recorder.stop_recording()
-        self._start_sweep_btn.setEnabled(True)
+        self._start_sweep_btn.setEnabled(False)
         self._stop_sweep_btn.setEnabled(False)
-        self._tb_sweep_btn.setEnabled(True)
-        self._tb_stop_sweep_btn.setEnabled(False)
-        self._status_sweep.setText("Sweep: Idle")
-        self._rec_status_label.setText("Not recording")
-        self._rec_status_label.setStyleSheet(
-            "padding: 10px; border-radius: 3px; font-weight: 700; background-color: #e8e8e8;"
-        )
-        self._status_rec.setText("Record: OFF")
+        self._status_sweep.setText("Sweep: Stopping...")
 
     def _on_sweep_step_started(self, name, idx):
         self._on_log("Sweep step started: " + name + " (" + str(idx) + ")", "smb")
@@ -2203,11 +1996,12 @@ class ODMRControlGUI(QMainWindow):
     def _on_sweep_finished(self, ok):
         self._start_sweep_btn.setEnabled(True)
         self._stop_sweep_btn.setEnabled(False)
-        self._tb_sweep_btn.setEnabled(True)
-        self._tb_stop_sweep_btn.setEnabled(False)
         self._status_sweep.setText("Sweep: Idle")
-        if self._recorder is not None and self._recorder.is_recording:
-            self._recorder.stop_recording()
+        self._rec_status_label.setText("Not recording")
+        self._rec_status_label.setStyleSheet(
+            "padding: 10px; border-radius: 3px; font-weight: 700; background-color: #e8e8e8;"
+        )
+        self._status_rec.setText("Record: OFF")
         self._on_log("Sweep finished: " + ("OK" if ok else "Cancelled"), "smb")
 
     def _on_smb_state_changed(self, *args):
@@ -2267,13 +2061,6 @@ class ODMRControlGUI(QMainWindow):
             "lf_sweep": lf_sweep,
             "mod_on": mod_on,
         }
-        for name, on in indicators.items():
-            if name in self._smb_indicator_labels:
-                led = self._smb_indicator_labels[name]
-                led.setProperty("on", "true" if on else "false")
-                led.style().unpolish(led)
-                led.style().polish(led)
-
         # 更新 RF toggle（微波源控制页面）
         if output_on != self._rf_toggle.isChecked():
             self._rf_toggle.blockSignals(True)
@@ -2316,13 +2103,6 @@ class ODMRControlGUI(QMainWindow):
                     text += f" {unit}"
                 disp.setText(text)
 
-        # 更新指示灯
-        if "laser_on" in self._laser_indicator_labels:
-            led = self._laser_indicator_labels["laser_on"]
-            led.setProperty("on", "true" if output_on else "false")
-            led.style().unpolish(led)
-            led.style().polish(led)
-
         # 同步输出开关状态
         if hasattr(self, "_laser_output_toggle"):
             if output_on != self._laser_output_toggle.isChecked():
@@ -2353,30 +2133,8 @@ class ODMRControlGUI(QMainWindow):
             self._buffer.append(data, datetime.datetime.now().timestamp())
 
     def _on_lockin_status_changed(self, status):
-        """更新 Lockin 状态指示灯（过载、PLL）。"""
+        """更新全局状态栏 Lockin 指示灯（过载、PLL）。"""
         ch = status.get("channel", 1)
-        if ch not in self._lockin_indicator_labels:
-            return
-        ch_leds = self._lockin_indicator_labels[ch]
-        # input_overload: True=过载(红色), False=正常(绿色)
-        if "input_overload" in ch_leds:
-            led = ch_leds["input_overload"]
-            ov = status.get("input_overload", False)
-            led.setProperty("on", "true" if ov else "false")
-            led.setStyleSheet(f"background-color: {'#e04040' if ov else '#00a651'};")
-        # gain_overload: 同上
-        if "gain_overload" in ch_leds:
-            led = ch_leds["gain_overload"]
-            ov = status.get("gain_overload", False)
-            led.setProperty("on", "true" if ov else "false")
-            led.setStyleSheet(f"background-color: {'#e04040' if ov else '#00a651'};")
-        # pll_locked: True=锁定(绿色), False=未锁定(红色)
-        if "pll_locked" in ch_leds:
-            led = ch_leds["pll_locked"]
-            locked = status.get("pll_locked", False)
-            led.setProperty("on", "true" if locked else "false")
-            led.setStyleSheet(f"background-color: {'#00a651' if locked else '#e04040'};")
-
         # 全局状态栏
         if hasattr(self, '_gs_lockin_a_ov'):
             any_ov = status.get("input_overload", False) or status.get("gain_overload", False)
@@ -2426,8 +2184,8 @@ class ODMRControlGUI(QMainWindow):
                 self._waveform_buffers[ch_num].extend({
                     "X": x.tolist(), "Y": y.tolist(), "R": r.tolist(), "theta": theta.tolist(),
                     "freq": freq.tolist(), "noise": noise.tolist(),
-                    "Xh1": xh1.tolist(), "Yh1": yh1.tolist(), "Rh1": rh1.tolist(), "θh1": theta_h1.tolist(),
-                    "Xh2": xh2.tolist(), "Yh2": yh2.tolist(), "Rh2": rh2.tolist(), "θh2": theta_h2.tolist(),
+                    "Xh1": xh1.tolist(), "Yh1": yh1.tolist(), "Rh1": rh1.tolist(), "theta_h1": theta_h1.tolist(),
+                    "Xh2": xh2.tolist(), "Yh2": yh2.tolist(), "Rh2": rh2.tolist(), "theta_h2": theta_h2.tolist(),
                 }, timestamps)
 
         # 兼容旧缓冲区（CH-A 基波）
@@ -2441,21 +2199,6 @@ class ODMRControlGUI(QMainWindow):
                 self._buffer.append(point, ts + i * dt)
 
         self._waveform_data_count += n
-
-    @staticmethod
-    def _si_prefix_scale(max_val: float) -> Tuple[float, str]:
-        """根据数值范围返回 (缩放因子, SI前缀)。"""
-        abs_val = abs(max_val) if max_val != 0 else 1.0
-        if abs_val < 1e-9:
-            return 1e12, "p"
-        elif abs_val < 1e-6:
-            return 1e9, "n"
-        elif abs_val < 1e-3:
-            return 1e6, "μ"
-        elif abs_val < 1.0:
-            return 1e3, "m"
-        else:
-            return 1.0, ""
 
     def _on_display_tick(self):
         """定时刷新波形图。"""
@@ -2505,12 +2248,7 @@ class ODMRControlGUI(QMainWindow):
                 if y_max_abs > 0:
                     margin = y_max_abs * 0.1
                     self._wave_plot.setYRange(-y_max_abs - margin, y_max_abs + margin, padding=0)
-                    # 更新 Y 轴标签单位
-                    scale, prefix = self._si_prefix_scale(y_max_abs)
-                    if scale != 1.0:
-                        self._wave_plot.setLabel("left", f"幅度 ({prefix}V)")
-                    else:
-                        self._wave_plot.setLabel("left", "幅度 (V)")
+                    # Y 轴标签：数据已由 RALL? 驱动转换为 mV
 
     def _on_command_completed(self, request_id: str, success: bool, message: str, result: dict) -> None:
         """处理 CommandService 异步命令结果。"""
@@ -2640,6 +2378,7 @@ class ODMRControlGUI(QMainWindow):
     def closeEvent(self, event):
         reply = QMessageBox.question(self, "Exit", "Confirm exit?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
+            self._sweep_engine.stop_and_wait()
             self._ctrl.emergency_stop()
             self._ctrl.disconnect_smb()
             self._ctrl.disconnect_lockin()

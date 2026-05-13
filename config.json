@@ -5,13 +5,19 @@
     "amplifier_installed": true,
     "model": "SMB100A",
     "manufacturer": "Rohde & Schwarz",
-    "freq_range_hz": [100000, 12750000000],
-    "power_range_dbm": [-120, 30],
+    "freq_range_hz": [
+      100000,
+      12750000000
+    ],
+    "power_range_dbm": [
+      -120,
+      30
+    ],
     "max_power_with_amp_dbm": 10,
     "max_power_without_amp_dbm": 25
   },
   "lockin": {
-    "port": "COM4",
+    "port": "COM8",
     "baudrate": 921600,
     "bytesize": 8,
     "parity": "N",
@@ -19,9 +25,18 @@
     "timeout": 1.0,
     "model": "OE1022D",
     "manufacturer": "SSI",
-    "ref_freq_range_hz": [0.001, 102000],
-    "sensitivity_range_nv": [1, 1000000000],
-    "time_constant_range_s": [0.00001, 3000],
+    "ref_freq_range_hz": [
+      0.001,
+      102000
+    ],
+    "sensitivity_range_nv": [
+      1,
+      1000000000
+    ],
+    "time_constant_range_s": [
+      1e-05,
+      3000
+    ],
     "rall_total_bytes": 12288,
     "rall_params_count": 20,
     "rall_points_per_batch": 50
@@ -42,25 +57,45 @@
     "power_stability_pct": 0.117,
     "warmup_s": 600,
     "power_mode": "APC",
-    "cmd_header": [85, 170],
-    "cmd_set_power_template": [85, 170, 5, 1],
-    "cmd_laser_off": [85, 170, 3, 0, 3],
-    "cmd_laser_on": [85, 170, 3, 1, 4]
+    "cmd_header": [
+      85,
+      170
+    ],
+    "cmd_set_power_template": [
+      85,
+      170,
+      5,
+      1
+    ],
+    "cmd_laser_off": [
+      85,
+      170,
+      3,
+      0,
+      3
+    ],
+    "cmd_laser_on": [
+      85,
+      170,
+      3,
+      1,
+      4
+    ]
   },
   "laser_bindings": {},
   "lockin_bindings": {},
   "smb_bindings": {},
   "sweep": {
     "power_dbm": -30.0,
-    "start_freq_hz": 2.82e9,
-    "stop_freq_hz": 2.92e9,
-    "step_hz": 500e3,
+    "start_freq_hz": 2820000000.0,
+    "stop_freq_hz": 2920000000.0,
+    "step_hz": 500000.0,
     "dwell_ms": 500,
     "lf_freq_hz": 500.0,
     "lf_amp_mv": 137.0,
     "lf_shape": "SQUARE",
-    "fm_dev_hz": 4e6,
-    "cw_freq_hz": 2.82e9
+    "fm_dev_hz": 4000000.0,
+    "cw_freq_hz": 2820000000.0
   },
   "acquisition": {
     "monitor_interval_ms": 94,

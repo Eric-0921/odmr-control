@@ -97,7 +97,7 @@ class FakeSerial:
                 offset = i * 400
                 for j in range(SAMPLES_PER_BATCH):
                     val = 0.001 * (self._rall_counter + j)
-                    struct.pack_into("<d", raw, offset + j * 8, val)
+                    struct.pack_into(">d", raw, offset + j * 8, val)
             self._buffer = bytes(raw)
             self._rall_counter += 1
 

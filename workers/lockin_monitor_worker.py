@@ -43,6 +43,8 @@ class LockinMonitorWorker(QObject):
 
     def run(self) -> None:
         self.log_requested.emit("[Lockin] 监控线程启动 (SNAPD?)")
+        consecutive_errors = 0
+        MAX_CONSECUTIVE_ERRORS = 10
         try:
             while not self._stop_requested:
                 self._drain_commands()
@@ -53,6 +55,7 @@ class LockinMonitorWorker(QObject):
                         data = self._driver.snapd(ch, 0, 1, 2, 3)
                         data["channel"] = ch
                         self.data_ready.emit(data)
+                        consecutive_errors = 0
 
                         # 状态查询（每 10 轮查一次，避免过度查询）
                         if self._query_count % 10 == 0:
@@ -73,7 +76,16 @@ class LockinMonitorWorker(QObject):
                                 f"[Lockin] 已查询 {self._query_count} 次 SNAPD?"
                             )
                 except Exception as exc:
+                    consecutive_errors += 1
+                    if not self._driver.is_connected:
+                        self.error_occurred.emit("[Lockin] 设备连接断开，监控线程退出")
+                        break
                     self.error_occurred.emit(f"[Lockin] SNAPD? 失败: {exc}")
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        self.error_occurred.emit(
+                            f"[Lockin] 连续 {consecutive_errors} 次失败，监控线程退出"
+                        )
+                        break
                 time.sleep(self._interval_ms / 1000.0)
         except Exception as exc:
             self.error_occurred.emit(f"[Lockin] 监控线程异常: {exc}")

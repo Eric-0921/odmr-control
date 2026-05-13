@@ -134,13 +134,16 @@ class ODMRRecorder:
         self._save_columns_json()
 
     def stop_recording(self) -> None:
-        """停止记录，关闭 Writer，生成 metadata.json。"""
-        if self._writer is not None:
-            self._writer.close()
-            self._writer = None
-        if self._is_recording and self._output_dir is not None:
+        """停止记录，关闭 Writer，生成 metadata.json。幂等：多次调用安全。"""
+        with self._lock:
+            if not self._is_recording:
+                return
+            self._is_recording = False
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
+        if self._output_dir is not None:
             self._save_metadata_json()
-        self._is_recording = False
 
     def write_batch(
         self,

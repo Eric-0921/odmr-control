@@ -112,11 +112,7 @@ class _SweepRunner(QObject):
             self.error_occurred.emit("[SweepEngine] 序列异常: " + str(exc))
             completed = False
         finally:
-            self._ctrl.stop_lockin_acquire()
             self.sweep_finished.emit(completed)
-            # 恢复 SMB 轮询
-            if self._ctrl.is_smb_connected:
-                self._ctrl._start_smb_poll()
 
     def _execute_step(self, step: SweepStep) -> None:
         smb = self._ctrl.smb
@@ -240,6 +236,7 @@ class SweepEngine(QObject):
         self._recorder: Optional[ODMRRecorder] = None
         self._thread: Optional[QThread] = None
         self._runner: Optional[_SweepRunner] = None
+        self._pending_ok: bool = True
 
     def set_recorder(self, recorder: Optional[ODMRRecorder]) -> None:
         self._recorder = recorder
@@ -295,6 +292,49 @@ class SweepEngine(QObject):
             self._runner._pause_requested = False
 
     def _on_sweep_finished(self, ok: bool) -> None:
+        """runner 的 run() 已返回（sweep_finished 信号触发），通知线程退出。"""
+        self._pending_ok = ok
+
+        # 断开旧 runner 信号，防止 deleteLater 后触发已销毁对象
+        if self._runner is not None:
+            try:
+                self._runner.sweep_finished.disconnect(self._on_sweep_finished)
+            except (TypeError, RuntimeError):
+                pass
+
+        # 通知线程退出，finished 信号触发 _cleanup_after_thread
+        if self._thread is not None:
+            self._thread.finished.connect(self._cleanup_after_thread)
+            self._thread.quit()
+        else:
+            self._do_cleanup()
+
+    def _cleanup_after_thread(self) -> None:
+        """线程退出后执行清理（由 thread.finished 触发，非阻塞）。"""
+        # 断开自身，防止 stop_and_wait 场景下重复触发
+        if self._thread is not None:
+            try:
+                self._thread.finished.disconnect(self._cleanup_after_thread)
+            except (TypeError, RuntimeError):
+                pass
+        self._do_cleanup()
+
+    def _do_cleanup(self) -> None:
+        """实际清理逻辑：停止采集、恢复轮询、释放引用。"""
+        self._ctrl.stop_lockin_acquire()
+        if self._ctrl.is_smb_connected:
+            self._ctrl._start_smb_poll()
+
         self._thread = None
         self._runner = None
-        self.sweep_finished.emit(ok)
+        self.sweep_finished.emit(self._pending_ok)
+
+    def stop_and_wait(self, timeout_ms: int = 5000) -> None:
+        """停止扫频并阻塞等待线程退出。仅限 closeEvent 等非 GUI 循环场景。"""
+        if self._runner is not None:
+            self._runner._stop_requested = True
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(timeout_ms)
+        # 同步执行清理（thread.finished 可能已触发过 _do_cleanup，此处为兜底）
+        self._ctrl.stop_lockin_acquire()

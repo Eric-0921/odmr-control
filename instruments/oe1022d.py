@@ -200,41 +200,44 @@ class OE1022DDriver:
             return line
 
     def _read_exact(self, n: int, timeout: float = 2.0) -> bytes:
-        """读取恰好 n 字节，带超时保护。"""
+        """读取恰好 n 字节，带超时保护。
+
+        注意：不在读取过程中修改 self._serial.timeout，
+        Windows 上修改 timeout 属性会重置 COM 端口内部缓冲区。
+        使用构造时设定的 timeout 即可。
+        """
         with self._lock:
             if self._serial is None or not self._serial.is_open:
                 raise ConnectionError("OE1022D 未连接")
-            old_timeout = self._serial.timeout
-            self._serial.timeout = timeout
-            try:
-                data = b""
-                while len(data) < n:
-                    chunk = self._serial.read(n - len(data))
-                    if not chunk:
-                        break
-                    data += chunk
-                return data
-            finally:
-                self._serial.timeout = old_timeout
+            data = b""
+            while len(data) < n:
+                chunk = self._serial.read(n - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return data
 
     def _exchange_ascii(self, cmd: str, read_timeout: float = 2.0) -> str:
-        """发送 ASCII 命令并读取一行 ASCII 响应。"""
+        """发送 ASCII 命令并读取一行 ASCII 响应。
+
+        注意：不在读取过程中修改 self._serial.timeout，
+        Windows 上修改 timeout 属性会重置 COM 端口内部缓冲区。
+        使用构造时设定的 timeout（默认 2.0s）即可。
+        """
         with self._lock:
             # 手册要求终结符为 \r (0x0D)，但 \n 也可接受
             tx = (cmd + "\r").encode("ascii")
             self._send(tx)
-            old_timeout = self._serial.timeout
-            self._serial.timeout = read_timeout
-            try:
-                resp = self._serial.readline()
-            finally:
-                self._serial.timeout = old_timeout
+            resp = self._serial.readline()
             if self._raw_log_cb:
                 try:
                     self._raw_log_cb("RX", resp)
                 except Exception:
                     pass
-            return resp.decode("ascii", errors="replace").strip()
+            # 去除 null 字节填充和空白字符
+            text = resp.decode("ascii", errors="replace")
+            text = text.replace("\x00", "").strip()
+            return text
 
     # -- identification ------------------------------------------------------
 
@@ -291,7 +294,7 @@ class OE1022DDriver:
         data: Dict[str, np.ndarray] = {}
         for i, (col_name, _raw_unit, _unit, scale, _source, _quantity, _desc, _tags) in enumerate(RALL_PARAMS):
             offset = i * 400  # 50 samples × 8 bytes
-            samples = np.frombuffer(raw, dtype="<f8", count=SAMPLES_PER_BATCH, offset=offset).copy()
+            samples = np.frombuffer(raw, dtype=">f8", count=SAMPLES_PER_BATCH, offset=offset).copy()
             data[col_name] = samples * scale
         return data
 
