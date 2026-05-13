@@ -1,7 +1,5 @@
 PyQt5>=5.15
 pyvisa>=1.13
 pyserial>=3.5
-pyarrow>=15.0
-pandas>=2.0
 numpy>=1.24
 pyqtgraph>=0.13

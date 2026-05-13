@@ -1,7 +1,7 @@
 """OE1022D 高速采集 Worker (RALL?)
 
 在扫频期间以 50ms 间隔发送 RALL? 并读取 12288 bytes，
-解析后通过信号批量回传，同时写入 Parquet。
+解析后通过信号批量回传，同时写入 CSV。
 
 严格对齐 50ms 时序，允许 ±5ms 抖动。
 """
@@ -48,14 +48,14 @@ class LockinAcquireWorker(QObject):
         self._laser_on = False
 
     def set_smb_state(self, freq_hz: float, power_dbm: float, rf_on: bool) -> None:
-        """同步 SMB100A 当前状态，用于写入 Parquet。"""
+        """同步 SMB100A 当前状态，用于写入 CSV。"""
         with self._state_lock:
             self._smb_freq_hz = freq_hz
             self._smb_power_dbm = power_dbm
             self._smb_rf_on = rf_on
 
     def set_laser_state(self, power_mw: float, output_on: bool) -> None:
-        """同步激光器缓存状态，用于写入 Parquet。"""
+        """同步激光器缓存状态，用于写入 CSV。"""
         with self._state_lock:
             self._laser_power_mw = power_mw
             self._laser_on = output_on
@@ -157,7 +157,7 @@ class LockinAcquireWorker(QObject):
         except Exception as exc:
             self.error_occurred.emit(f"[Lockin] 采集线程异常: {exc}")
         finally:
-            # 确保 recorder 被关闭，防止 Parquet 文件损坏
+            # 确保 recorder 被关闭，防止 CSV 文件句柄泄漏
             with self._state_lock:
                 recorder = self._recorder
             if recorder is not None and recorder.is_recording:

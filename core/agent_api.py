@@ -127,7 +127,7 @@ class AgentAPI:
     def start_recording(
         self, output_dir: str = "./experiments", timeout_ms: int = 5000
     ) -> Tuple[bool, str, dict]:
-        """启动 RALL? 采集并写入 Parquet。"""
+        """启动 RALL? 采集并写入 CSV。"""
         cmd = Command(
             CommandType.ACQ_START_RECORDING,
             {"output_dir": output_dir},
@@ -138,7 +138,7 @@ class AgentAPI:
     def stop_recording(
         self, stop_acquire: bool = True, timeout_ms: int = 5000
     ) -> Tuple[bool, str, dict]:
-        """停止 Parquet 记录，可选择是否同时停止 RALL? 采集流。"""
+        """停止 CSV 记录，可选择是否同时停止 RALL? 采集流。"""
         cmd = Command(
             CommandType.ACQ_STOP_RECORDING,
             {"stop_acquire": stop_acquire},

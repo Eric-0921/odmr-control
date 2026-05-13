@@ -552,6 +552,13 @@ class ODMRControlGUI(QMainWindow):
         self._lockin_port_combo = QComboBox()
         self._lockin_port_combo.setEditable(True)
         self._lockin_port_combo.addItems([f"COM{i}" for i in range(1, 21)])
+        try:
+            from serial.tools import list_ports
+            for port in list_ports.comports():
+                if self._lockin_port_combo.findText(port.device) < 0:
+                    self._lockin_port_combo.addItem(port.device, port.device)
+        except Exception:
+            pass
         self._lockin_port_combo.setCurrentText(self._cfg["lockin"]["port"])
         lockin_layout.addWidget(self._lockin_port_combo, 0, 1)
 
@@ -2332,11 +2339,14 @@ class ODMRControlGUI(QMainWindow):
                 idn = result.get("idn", "Unknown")
                 self._lockin_status_label.setText(f"已连接 / Connected: {idn[:30]}")
                 self._lockin_status_label.setStyleSheet("color: #00a651; font-weight: 600;")
+                self._status_lockin.setText("Lockin: " + idn[:30])
                 self._on_log("OE1022D connected: " + idn, "lockin")
                 # 保存 IDN→端口绑定
                 if idn and idn != "Unknown":
                     self._cfg.setdefault("lockin_bindings", {})[idn] = ctx
                     self._on_log(f"Lockin binding saved: {idn[:30]} -> {ctx}", "lockin")
+                if getattr(self, "_waveform_page_active", False):
+                    self._start_waveform_acquire()
             else:
                 QMessageBox.critical(self, "Connection Error", message)
                 self._on_log("OE1022D connect failed: " + message, "lockin")
@@ -2348,6 +2358,8 @@ class ODMRControlGUI(QMainWindow):
             self._lockin_led.style().polish(self._lockin_led)
             self._lockin_status_label.setText("未连接 / Disconnected")
             self._lockin_status_label.setStyleSheet("color: #999;")
+            self._status_lockin.setText("Lockin: 未连接")
+            self._waveform_rall_running = False
             self._on_log("OE1022D disconnected", "lockin")
 
         elif op == "laser_connect":

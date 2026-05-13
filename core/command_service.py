@@ -502,7 +502,7 @@ class CommandService(QObject):
         }
 
     def _create_recorder(self, params: Dict[str, Any]) -> ODMRRecorder:
-        """创建并启动一次 Parquet 记录会话。"""
+        """创建并启动一次 CSV 记录会话。"""
         output_dir = params.get("output_dir") or params.get("save_dir")
         recorder = ODMRRecorder(Path(output_dir) if output_dir else None)
         recorder.start_recording()
