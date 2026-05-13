@@ -218,7 +218,7 @@ class InstrumentController(QObject):
         self._laser_worker = LaserPollWorker(self._laser, self._laser_queue, interval_ms)
         self._laser_thread = QThread(self)
         self._laser_worker.moveToThread(self._laser_thread)
-        self._laser_worker.state_updated.connect(self.laser_state_changed.emit)
+        self._laser_worker.state_updated.connect(self._on_laser_state_updated)
         self._laser_worker.log_requested.connect(self.log_requested.emit)
         self._laser_worker.error_occurred.connect(self.error_occurred.emit)
         self._laser_thread.started.connect(self._laser_worker.run)
@@ -239,6 +239,9 @@ class InstrumentController(QObject):
     def start_lockin_acquire(self, recorder: Optional[ODMRRecorder] = None) -> None:
         """启动 RALL? 高速采集（仅在扫频期间调用）。"""
         if self._lockin_acquire_thread is not None:
+            if recorder is not None and self._lockin_acquire_worker is not None:
+                self._recorder = recorder
+                self._lockin_acquire_worker.set_recorder(recorder)
             return
         self._recorder = recorder
         self._lockin_acquire_worker = LockinAcquireWorker(
@@ -261,6 +264,15 @@ class InstrumentController(QObject):
         if self._recorder is not None and self._recorder.is_recording:
             self._recorder.stop_recording()
 
+    def detach_lockin_recorder(self) -> None:
+        """停止当前 recorder，但保持 RALL? 采集线程继续运行。"""
+        recorder = self._recorder
+        self._recorder = None
+        if self._lockin_acquire_worker is not None:
+            self._lockin_acquire_worker.set_recorder(None)
+        if recorder is not None and recorder.is_recording:
+            recorder.stop_recording()
+
     def _stop_lockin_acquire(self) -> None:
         if self._lockin_acquire_worker is not None:
             self._lockin_acquire_worker.stop()
@@ -277,9 +289,20 @@ class InstrumentController(QObject):
 
     def _on_smb_state_updated(self, freq_hz: float, output_on: bool, mode: str) -> None:
         self.smb_state_changed.emit(freq_hz, output_on, mode)
+        self.update_acquire_smb_state(freq_hz, self._smb.cached_power_dbm, output_on)
+
+    def update_acquire_smb_state(self, freq_hz: float, power_dbm: float, output_on: bool) -> None:
+        """向 RALL? 采集线程同步最近的 SMB 状态。"""
         if self._lockin_acquire_worker is not None:
-            power = self._smb.cached_power_dbm
-            self._lockin_acquire_worker.set_smb_state(freq_hz, power, output_on)
+            self._lockin_acquire_worker.set_smb_state(freq_hz, power_dbm, output_on)
+
+    def _on_laser_state_updated(self, state: dict) -> None:
+        self.laser_state_changed.emit(state)
+        if self._lockin_acquire_worker is not None:
+            self._lockin_acquire_worker.set_laser_state(
+                float(state.get("power_mw", 0.0)),
+                bool(state.get("output_on", False)),
+            )
 
     def _on_acquire_finished(self) -> None:
         self._acquiring = False

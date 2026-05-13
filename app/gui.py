@@ -1279,7 +1279,10 @@ class ODMRControlGUI(QMainWindow):
         self._waveform_page_active = True
         if not self._waveform_rall_running and self._ctrl.is_lockin_connected:
             try:
-                self._ctrl.start_lockin_acquire(None)
+                if self._cmd_service is not None:
+                    self._cmd_service.submit(Command(CommandType.LOCKIN_START_ACQUIRE, source="gui"))
+                else:
+                    self._ctrl.start_lockin_acquire(None)
                 self._waveform_rall_running = True
                 self._on_log("[Waveform] RALL? 启动", "lockin")
             except Exception as exc:
@@ -1293,7 +1296,10 @@ class ODMRControlGUI(QMainWindow):
             return
         if self._waveform_rall_running:
             try:
-                self._ctrl.stop_lockin_acquire()
+                if self._cmd_service is not None:
+                    self._cmd_service.submit(Command(CommandType.LOCKIN_STOP_ACQUIRE, source="gui"))
+                else:
+                    self._ctrl.stop_lockin_acquire()
                 self._waveform_rall_running = False
                 self._on_log("[Waveform] RALL? 停止", "lockin")
             except Exception:
@@ -1391,26 +1397,59 @@ class ODMRControlGUI(QMainWindow):
                 self._rec_toggle_btn.setChecked(False)
                 return
             out_dir = self._save_dir_input.text()
-            self._recorder = ODMRRecorder(out_dir)
-            self._recorder.start_recording()
-            self._rec_file_label.setText(str(self._recorder.output_dir))
-            self._rec_status_label.setText("记录中 / Recording")
-            self._rec_status_label.setStyleSheet(
-                "padding: 8px; border-radius: 3px; font-weight: 700; background-color: #cce4f7;"
-            )
-            self._rec_toggle_btn.setText("停止记录 / Stop Recording")
-            self._status_rec.setText("Record: ON")
-            self._recording = True
+            if self._cmd_service is not None:
+                req = self._cmd_service.submit(Command(
+                    CommandType.ACQ_START_RECORDING,
+                    {"output_dir": out_dir},
+                    source="gui",
+                ))
+                self._pending_cmds[req] = ("record_start", out_dir)
+                self._rec_status_label.setText("正在启动 / Starting...")
+                self._rec_toggle_btn.setEnabled(False)
+            else:
+                self._recorder = ODMRRecorder(out_dir)
+                self._recorder.start_recording()
+                self._ctrl.start_lockin_acquire(self._recorder)
+                self._apply_recording_started(str(self._recorder.output_dir))
         else:
-            if self._recorder is not None:
-                self._recorder.stop_recording()
-            self._rec_status_label.setText("未记录 / Not recording")
-            self._rec_status_label.setStyleSheet(
-                "padding: 8px; border-radius: 3px; font-weight: 700; background-color: #e8e8e8;"
-            )
-            self._rec_toggle_btn.setText("开始记录 / Start Recording")
-            self._status_rec.setText("Record: OFF")
-            self._recording = False
+            if self._cmd_service is not None:
+                req = self._cmd_service.submit(Command(
+                    CommandType.ACQ_STOP_RECORDING,
+                    {"stop_acquire": not self._waveform_page_active},
+                    source="gui",
+                ))
+                self._pending_cmds[req] = ("record_stop", None)
+                self._rec_status_label.setText("正在停止 / Stopping...")
+                self._rec_toggle_btn.setEnabled(False)
+            else:
+                if self._recording and not self._waveform_page_active:
+                    self._ctrl.stop_lockin_acquire()
+                elif self._recorder is not None:
+                    self._recorder.stop_recording()
+                self._apply_recording_stopped()
+
+    def _apply_recording_started(self, output_dir: str) -> None:
+        self._rec_file_label.setText(output_dir)
+        self._rec_status_label.setText("记录中 / Recording")
+        self._rec_status_label.setStyleSheet(
+            "padding: 8px; border-radius: 3px; font-weight: 700; background-color: #cce4f7;"
+        )
+        self._rec_toggle_btn.setText("停止记录 / Stop Recording")
+        self._rec_toggle_btn.setChecked(True)
+        self._rec_toggle_btn.setEnabled(True)
+        self._status_rec.setText("Record: ON")
+        self._recording = True
+
+    def _apply_recording_stopped(self) -> None:
+        self._rec_status_label.setText("未记录 / Not recording")
+        self._rec_status_label.setStyleSheet(
+            "padding: 8px; border-radius: 3px; font-weight: 700; background-color: #e8e8e8;"
+        )
+        self._rec_toggle_btn.setText("开始记录 / Start Recording")
+        self._rec_toggle_btn.setChecked(False)
+        self._rec_toggle_btn.setEnabled(True)
+        self._status_rec.setText("Record: OFF")
+        self._recording = False
 
     # -----------------------------------------------------------------------
     # Page 6: Log
@@ -2336,11 +2375,32 @@ class ODMRControlGUI(QMainWindow):
             self._status_laser.setText("Laser: 未连接")
             self._on_log("Laser disconnected", "laser")
 
+        elif op == "record_start":
+            if success:
+                output_dir = result.get("output_dir", str(ctx))
+                self._apply_recording_started(output_dir)
+                self._waveform_rall_running = True
+                self._on_log(f"Recording started: {output_dir}", "lockin")
+            else:
+                self._apply_recording_stopped()
+                QMessageBox.critical(self, "Recording Error", message)
+                self._on_log("Recording start failed: " + message, "lockin")
+
+        elif op == "record_stop":
+            self._apply_recording_stopped()
+            if success:
+                self._on_log("Recording stopped", "lockin")
+            else:
+                QMessageBox.warning(self, "Recording Error", message)
+                self._on_log("Recording stop failed: " + message, "lockin")
+
     def _on_command_error(self, request_id: str, error_message: str) -> None:
         """处理 CommandService 命令错误。"""
         if request_id in self._pending_cmds:
             op, ctx = self._pending_cmds.pop(request_id)
             self._on_log(f"[Command Error] {op}: {error_message}", "smb")
+            if op in ("record_start", "record_stop"):
+                self._apply_recording_stopped()
 
     def _on_error(self, msg):
         self._on_log("[ERROR] " + msg, "smb")

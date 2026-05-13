@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import time
 
 import numpy as np
@@ -39,15 +40,30 @@ class LockinAcquireWorker(QObject):
         self._stop_requested = False
         self._batch_count = 0
         self._dropped = 0
+        self._state_lock = threading.Lock()
         self._smb_freq_hz = 0.0
         self._smb_power_dbm = 0.0
         self._smb_rf_on = False
+        self._laser_power_mw = 0.0
+        self._laser_on = False
 
     def set_smb_state(self, freq_hz: float, power_dbm: float, rf_on: bool) -> None:
         """同步 SMB100A 当前状态，用于写入 Parquet。"""
-        self._smb_freq_hz = freq_hz
-        self._smb_power_dbm = power_dbm
-        self._smb_rf_on = rf_on
+        with self._state_lock:
+            self._smb_freq_hz = freq_hz
+            self._smb_power_dbm = power_dbm
+            self._smb_rf_on = rf_on
+
+    def set_laser_state(self, power_mw: float, output_on: bool) -> None:
+        """同步激光器缓存状态，用于写入 Parquet。"""
+        with self._state_lock:
+            self._laser_power_mw = power_mw
+            self._laser_on = output_on
+
+    def set_recorder(self, recorder: ODMRRecorder | None) -> None:
+        """采集不中断时切换/附加 recorder。"""
+        with self._state_lock:
+            self._recorder = recorder
 
     def run(self) -> None:
         self.log_requested.emit("[Lockin] 采集线程启动 (RALL?)")
@@ -95,12 +111,22 @@ class LockinAcquireWorker(QObject):
                     self.batch_ready.emit(batch)
                     self._batch_count += 1
 
-                    if self._recorder is not None and self._recorder.is_recording:
-                        self._recorder.write_batch(
+                    with self._state_lock:
+                        recorder = self._recorder
+                        smb_freq_hz = self._smb_freq_hz
+                        smb_power_dbm = self._smb_power_dbm
+                        smb_rf_on = self._smb_rf_on
+                        laser_power_mw = self._laser_power_mw
+                        laser_on = self._laser_on
+
+                    if recorder is not None and recorder.is_recording:
+                        recorder.write_batch(
                             batch,
-                            smb_freq_hz=self._smb_freq_hz,
-                            smb_power_dbm=self._smb_power_dbm,
-                            smb_rf_on=self._smb_rf_on,
+                            smb_freq_hz=smb_freq_hz,
+                            smb_power_dbm=smb_power_dbm,
+                            smb_rf_on=smb_rf_on,
+                            laser_power_mw=laser_power_mw,
+                            laser_on=laser_on,
                         )
 
                     if self._batch_count % 200 == 0:
@@ -132,9 +158,11 @@ class LockinAcquireWorker(QObject):
             self.error_occurred.emit(f"[Lockin] 采集线程异常: {exc}")
         finally:
             # 确保 recorder 被关闭，防止 Parquet 文件损坏
-            if self._recorder is not None and self._recorder.is_recording:
+            with self._state_lock:
+                recorder = self._recorder
+            if recorder is not None and recorder.is_recording:
                 try:
-                    self._recorder.stop_recording()
+                    recorder.stop_recording()
                     self.log_requested.emit("[Lockin] Recorder stopped in finally")
                 except Exception as exc:
                     self.error_occurred.emit(f"[Lockin] Recorder stop failed: {exc}")

@@ -65,6 +65,7 @@ class CommandType(Enum):
     ACQ_SET_SAMPLING = auto()         # {interval_ms}
     ACQ_START_RECORDING = auto()      # {output_dir, filename_prefix}
     ACQ_STOP_RECORDING = auto()
+    ACQ_QUERY_STATE = auto()
 
     # ===== 系统 =====
     SYS_EMERGENCY_STOP = auto()

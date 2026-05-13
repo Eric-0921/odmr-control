@@ -11,6 +11,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
@@ -18,6 +19,7 @@ from PyQt5.QtCore import QObject, QThread, pyqtSignal
 from core.commands import Command, CommandType
 from core.instrument_controller import InstrumentController
 from core.timestamp_sync import TimestampSyncHub, TimestampedSample
+from data.recorder import ODMRRecorder
 
 
 class SafetyError(Exception):
@@ -58,6 +60,7 @@ class CommandService(QObject):
         self._cmd_queue: queue.Queue = queue.Queue()
         self._worker_thread: Optional[QThread] = None
         self._running = False
+        self._acq_recorder: Optional[ODMRRecorder] = None
 
         # 时间戳同步中心
         self._ts_hub = TimestampSyncHub()
@@ -292,12 +295,15 @@ class CommandService(QObject):
             }
 
         if ct == CommandType.LOCKIN_START_ACQUIRE:
-            # 暂不实现 recorder 传递，后续 Part 5 完善
-            self._ctrl.start_lockin_acquire(None)
-            return {}
+            recorder = self._create_recorder(p) if p.get("record", False) else None
+            self._ctrl.start_lockin_acquire(recorder)
+            if recorder is not None:
+                self._acq_recorder = recorder
+            return self._acq_result(recorder)
 
         if ct == CommandType.LOCKIN_STOP_ACQUIRE:
             self._ctrl.stop_lockin_acquire()
+            self._acq_recorder = None
             return {}
 
         if ct == CommandType.LOCKIN_SET_TIME_CONSTANT:
@@ -364,7 +370,7 @@ class CommandService(QObject):
 
         if ct == CommandType.LOCKIN_SET_SAMPLE:
             # OE1022D 采样参数配置（当前为占位，驱动层命令待完善）
-            self._on_log(
+            self.log_requested.emit(
                 f"[Lockin] Sample config: step_time={p.get('step_time_ms')}ms, "
                 f"length={p.get('length')}, trigger={'Internal' if p.get('trigger_mode') == 0 else 'External'}"
             )
@@ -372,13 +378,36 @@ class CommandService(QObject):
 
         # ===== 采集 =====
         if ct == CommandType.ACQ_SET_SAMPLING:
+            interval_ms = int(p.get("interval_ms", 50))
+            if interval_ms < 10:
+                raise ValueError("采样间隔不能小于 10 ms")
             return {}
 
         if ct == CommandType.ACQ_START_RECORDING:
-            return {}
+            recorder = self._create_recorder(p)
+            self._acq_recorder = recorder
+            self._ctrl.start_lockin_acquire(recorder)
+            return self._acq_result(recorder)
 
         if ct == CommandType.ACQ_STOP_RECORDING:
-            return {}
+            stop_acquire = bool(p.get("stop_acquire", True))
+            recorder = self._acq_recorder
+            if stop_acquire:
+                self._ctrl.stop_lockin_acquire()
+            else:
+                self._ctrl.detach_lockin_recorder()
+            self._acq_recorder = None
+            return self._acq_result(recorder)
+
+        if ct == CommandType.ACQ_QUERY_STATE:
+            recorder = self._acq_recorder
+            result = {
+                "acquiring": self._ctrl.is_acquiring,
+                "recording": bool(recorder is not None and recorder.is_recording),
+            }
+            if recorder is not None and recorder.output_dir is not None:
+                result["output_dir"] = str(recorder.output_dir)
+            return result
 
         # ===== 激光器 =====
         if ct == CommandType.LASER_CONNECT:
@@ -470,6 +499,22 @@ class CommandService(QObject):
             "power_dbm": smb.cached_power_dbm,
             "output_on": smb.cached_output_on,
             "mode": smb.cached_mode,
+        }
+
+    def _create_recorder(self, params: Dict[str, Any]) -> ODMRRecorder:
+        """创建并启动一次 Parquet 记录会话。"""
+        output_dir = params.get("output_dir") or params.get("save_dir")
+        recorder = ODMRRecorder(Path(output_dir) if output_dir else None)
+        recorder.start_recording()
+        return recorder
+
+    @staticmethod
+    def _acq_result(recorder: Optional[ODMRRecorder]) -> dict:
+        if recorder is None:
+            return {"recording": False}
+        return {
+            "recording": recorder.is_recording,
+            "output_dir": str(recorder.output_dir) if recorder.output_dir is not None else "",
         }
 
     # -- signal forwarding ---------------------------------------------------

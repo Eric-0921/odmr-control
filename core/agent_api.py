@@ -110,6 +110,49 @@ class AgentAPI:
         cmd = Command(CommandType.LOCKIN_QUERY_STATUS, {"channel": channel}, source="agent")
         return self._svc.submit_sync(cmd, timeout_ms)
 
+    def start_lockin_acquisition(
+        self, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """启动 OE1022D RALL? 采集流，不写文件。"""
+        cmd = Command(CommandType.LOCKIN_START_ACQUIRE, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def stop_lockin_acquisition(
+        self, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """停止 OE1022D RALL? 采集流。"""
+        cmd = Command(CommandType.LOCKIN_STOP_ACQUIRE, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def start_recording(
+        self, output_dir: str = "./experiments", timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """启动 RALL? 采集并写入 Parquet。"""
+        cmd = Command(
+            CommandType.ACQ_START_RECORDING,
+            {"output_dir": output_dir},
+            source="agent",
+        )
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def stop_recording(
+        self, stop_acquire: bool = True, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """停止 Parquet 记录，可选择是否同时停止 RALL? 采集流。"""
+        cmd = Command(
+            CommandType.ACQ_STOP_RECORDING,
+            {"stop_acquire": stop_acquire},
+            source="agent",
+        )
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def get_acquisition_state(
+        self, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """查询 RALL? 采集和记录状态。"""
+        cmd = Command(CommandType.ACQ_QUERY_STATE, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
     def set_lockin_time_constant(
         self, channel: int, index: int, timeout_ms: int = 5000
     ) -> Tuple[bool, str, dict]:
