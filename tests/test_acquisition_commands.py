@@ -71,7 +71,9 @@ class TestAcquisitionCommands(unittest.TestCase):
             lines = (Path(tmp) / "data.csv").read_text(encoding="utf-8-sig").splitlines()
             self.assertIn("当前日期:", lines[0])
             self.assertIn("CH-A", lines[1])
+            self.assertIn("MagneticField", lines[1])
             self.assertIn("ADC1", lines[2])
+            self.assertIn("X_target_field_nT", lines[2])
             self.assertGreaterEqual(len(lines), 4)
 
     def test_stop_recording_can_detach_without_stopping_acquire(self):

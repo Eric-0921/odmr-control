@@ -67,6 +67,21 @@ class CommandType(Enum):
     ACQ_STOP_RECORDING = auto()
     ACQ_QUERY_STATE = auto()
 
+    # ===== 磁场控制 =====
+    MAG_CONNECT_AXIS = auto()         # {axis, port, baudrate}
+    MAG_DISCONNECT_AXIS = auto()      # {axis}
+    MAG_CONNECT_ALL = auto()          # {ports: {X,Y,Z}, baudrate}
+    MAG_DISCONNECT_ALL = auto()
+    MAG_SET_FIELD = auto()            # {axis, field_nT}
+    MAG_SET_FIELD_3D = auto()         # {x_nT, y_nT, z_nT}
+    MAG_SET_CURRENT = auto()          # {axis, current_mA}
+    MAG_SET_ZERO_OFFSET = auto()      # {axis, zero_offset_mA}
+    MAG_SET_COIL_CONSTANT = auto()    # {axis, coil_constant}
+    MAG_SET_OUTPUT = auto()           # {axis, enabled}
+    MAG_LOCK_ZERO = auto()            # {axis, locked}
+    MAG_QUERY_STATE = auto()          # {axis?} -> 三轴状态
+    MAG_EMERGENCY_STOP = auto()
+
     # ===== 系统 =====
     SYS_EMERGENCY_STOP = auto()
     SYS_QUERY_ALL_STATUS = auto()     # 查询所有已连接设备状态

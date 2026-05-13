@@ -153,6 +153,70 @@ class AgentAPI:
         cmd = Command(CommandType.ACQ_QUERY_STATE, source="agent")
         return self._svc.submit_sync(cmd, timeout_ms)
 
+    # -- 磁场控制快捷方法 ----------------------------------------------------
+
+    def connect_magnetic_axis(
+        self,
+        axis: str,
+        port: str,
+        baudrate: int = 9600,
+        coil_constant: Optional[float] = None,
+        zero_offset_mA: Optional[float] = None,
+        timeout_ms: int = 5000,
+    ) -> Tuple[bool, str, dict]:
+        """连接单个磁场轴并可选应用线圈常数/零偏。"""
+        params: Dict[str, Any] = {"axis": axis, "port": port, "baudrate": baudrate}
+        if coil_constant is not None:
+            params["coil_constant"] = coil_constant
+        if zero_offset_mA is not None:
+            params["zero_offset_mA"] = zero_offset_mA
+        cmd = Command(CommandType.MAG_CONNECT_AXIS, params, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def set_magnetic_field(
+        self, axis: str, field_nT: float, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """设置单轴目标磁场 (nT)。"""
+        cmd = Command(CommandType.MAG_SET_FIELD, {"axis": axis, "field_nT": field_nT}, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def set_magnetic_field_3d(
+        self,
+        x_nT: float = 0.0,
+        y_nT: float = 0.0,
+        z_nT: float = 0.0,
+        timeout_ms: int = 5000,
+    ) -> Tuple[bool, str, dict]:
+        """设置三轴目标磁场 (nT)。"""
+        cmd = Command(
+            CommandType.MAG_SET_FIELD_3D,
+            {"x_nT": x_nT, "y_nT": y_nT, "z_nT": z_nT},
+            source="agent",
+        )
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def set_magnetic_output(
+        self, axis: str, enabled: bool, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """开关单轴磁场电源输出。"""
+        cmd = Command(CommandType.MAG_SET_OUTPUT, {"axis": axis, "enabled": enabled}, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def lock_magnetic_zero(
+        self, axis: str, locked: bool, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """切换单轴零偏叠加锁定。"""
+        cmd = Command(CommandType.MAG_LOCK_ZERO, {"axis": axis, "locked": locked}, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
+    def get_magnetic_state(
+        self, axis: Optional[str] = None, timeout_ms: int = 5000
+    ) -> Tuple[bool, str, dict]:
+        """查询磁场状态。axis 为空时返回三轴快照。"""
+        params = {"axis": axis} if axis else {}
+        cmd = Command(CommandType.MAG_QUERY_STATE, params, source="agent")
+        return self._svc.submit_sync(cmd, timeout_ms)
+
     def set_lockin_time_constant(
         self, channel: int, index: int, timeout_ms: int = 5000
     ) -> Tuple[bool, str, dict]:

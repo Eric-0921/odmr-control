@@ -199,6 +199,7 @@ class ODMRControlGUI(QMainWindow):
             self._cmd_service.lockin_status_broadcast.connect(self._on_lockin_status_changed)
             self._cmd_service.lockin_batch_broadcast.connect(self._on_lockin_batch_ready)
             self._cmd_service.laser_state_broadcast.connect(self._on_laser_state_changed)
+            self._cmd_service.mag_state_broadcast.connect(self._on_mag_state_changed)
             self._cmd_service.error_occurred.connect(self._on_error)
             self._cmd_service.log_requested.connect(self._on_log)
         else:
@@ -211,6 +212,7 @@ class ODMRControlGUI(QMainWindow):
             self._ctrl.log_requested.connect(self._on_log)
             self._ctrl.lockin_status_changed.connect(self._on_lockin_status_changed)
             self._ctrl.laser_state_changed.connect(self._on_laser_state_changed)
+            self._ctrl.mag_state_changed.connect(self._on_mag_state_changed)
 
         self._sweep_engine = SweepEngine(self._ctrl, self)
         self._sweep_engine.step_started.connect(self._on_sweep_step_started)
@@ -361,8 +363,9 @@ class ODMRControlGUI(QMainWindow):
             ("参数配置 / Parameters", 1),
             ("扫频实验 / Sweep", 2),
             ("实时波形 / Waveform", 3),
-            ("状态监控 / Monitor", 4),
-            ("日志 / Log", 5),
+            ("磁场控制 / Magnetic Field", 4),
+            ("状态监控 / Monitor", 5),
+            ("日志 / Log", 6),
         ]
         for label, idx in nav_items:
             item = QTreeWidgetItem([label])
@@ -381,14 +384,15 @@ class ODMRControlGUI(QMainWindow):
         self._global_status_bar = self._build_global_status_bar()
         right_layout.addWidget(self._global_status_bar)
 
-        # Stacked pages (6 pages)
+        # Stacked pages
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_connection_page())       # 0: 设备连接
         self._stack.addWidget(self._build_param_config_page())     # 1: 参数配置
         self._stack.addWidget(self._build_sweep_experiment_page()) # 2: 扫频实验
         self._stack.addWidget(self._build_waveform_page())         # 3: 实时波形
-        self._stack.addWidget(self._build_monitor_page())          # 4: 状态监控
-        self._stack.addWidget(self._build_log_page())              # 5: 日志
+        self._stack.addWidget(self._build_mag_field_page())        # 4: 磁场控制
+        self._stack.addWidget(self._build_monitor_page())          # 5: 状态监控
+        self._stack.addWidget(self._build_log_page())              # 6: 日志
         right_layout.addWidget(self._stack, 1)
 
         splitter.addWidget(right_widget)
@@ -474,6 +478,16 @@ class ODMRControlGUI(QMainWindow):
         self._gs_laser_out = _led()
         layout.addWidget(self._gs_laser_out)
         layout.addWidget(_txt("Out"))
+
+        layout.addWidget(_sep())
+
+        layout.addWidget(_txt("Bxyz:"))
+        self._gs_mag_x = _led()
+        self._gs_mag_y = _led()
+        self._gs_mag_z = _led()
+        for led, label in ((self._gs_mag_x, "X"), (self._gs_mag_y, "Y"), (self._gs_mag_z, "Z")):
+            layout.addWidget(led)
+            layout.addWidget(_txt(label))
 
         layout.addWidget(_sep())
 
@@ -749,6 +763,221 @@ class ODMRControlGUI(QMainWindow):
         if ok:
             self._ctrl.set_lockin_monitor_interval(ms)
             self._on_log(f"监控间隔设为 {ms} ms")
+
+    # -----------------------------------------------------------------------
+    # Page 4: Magnetic Field
+    # -----------------------------------------------------------------------
+
+    def _build_mag_field_page(self) -> QWidget:
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+
+        title = QLabel("磁场控制 / Magnetic Field Control")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        cfg = self._cfg.get("magnetic_field", {})
+        axes_cfg = cfg.get("axes", {})
+        self._mag_controls: Dict[str, Dict[str, QWidget]] = {}
+
+        conn_group = QGroupBox("三轴线圈连接与标定 / 3-axis Coil Connection")
+        conn_layout = QGridLayout(conn_group)
+        headers = ["轴 / Axis", "串口 / Port", "线圈常数 (nT/mA)", "零偏 (mA)", "实测电流 (mA)", "目标场 (nT)", "输出", "锁零", ""]
+        for col, text in enumerate(headers):
+            conn_layout.addWidget(QLabel(text), 0, col)
+
+        for row, axis in enumerate(("X", "Y", "Z"), start=1):
+            axis_cfg = axes_cfg.get(axis, {})
+            conn_layout.addWidget(QLabel(axis), row, 0)
+
+            port = QComboBox()
+            port.setEditable(True)
+            port.addItems([f"COM{i}" for i in range(1, 21)])
+            try:
+                from serial.tools import list_ports
+                for info in list_ports.comports():
+                    if port.findText(info.device) < 0:
+                        port.addItem(info.device)
+            except Exception:
+                pass
+            port.setCurrentText(str(axis_cfg.get("port", f"COM{row}")))
+            conn_layout.addWidget(port, row, 1)
+
+            coil = QLineEdit(str(axis_cfg.get("coil_constant", 143.26)))
+            coil.setValidator(QDoubleValidator(0.000001, 1e9, 6))
+            coil.setFixedWidth(110)
+            conn_layout.addWidget(coil, row, 2)
+
+            zero = QLineEdit(str(axis_cfg.get("zero_offset_mA", 0.0)))
+            zero.setValidator(QDoubleValidator(0.0, 5000.0, 5))
+            zero.setFixedWidth(90)
+            conn_layout.addWidget(zero, row, 3)
+
+            current = QLabel("0.000")
+            current.setObjectName("smallData")
+            conn_layout.addWidget(current, row, 4)
+
+            target = QLabel("0.00")
+            target.setObjectName("smallData")
+            conn_layout.addWidget(target, row, 5)
+
+            output = QCheckBox()
+            output.stateChanged.connect(lambda _state, a=axis: self._set_mag_output(a))
+            conn_layout.addWidget(output, row, 6, alignment=Qt.AlignCenter)
+
+            lock = QCheckBox()
+            lock.stateChanged.connect(lambda _state, a=axis: self._set_mag_lock_zero(a))
+            conn_layout.addWidget(lock, row, 7, alignment=Qt.AlignCenter)
+
+            btn = QPushButton("连接 / Connect")
+            btn.setObjectName("primaryBtn")
+            btn.clicked.connect(lambda _checked=False, a=axis: self._toggle_mag_axis(a))
+            conn_layout.addWidget(btn, row, 8)
+
+            self._mag_controls[axis] = {
+                "port": port,
+                "coil": coil,
+                "zero": zero,
+                "current": current,
+                "target": target,
+                "output": output,
+                "lock": lock,
+                "button": btn,
+            }
+
+        layout.addWidget(conn_group)
+
+        target_group = QGroupBox("场强设定 / Field Setpoints")
+        target_layout = QGridLayout(target_group)
+        self._mag_field_edits: Dict[str, QLineEdit] = {}
+        for col, axis in enumerate(("X", "Y", "Z")):
+            target_layout.addWidget(QLabel(f"{axis} (nT):"), 0, col * 2)
+            edit = QLineEdit("0")
+            edit.setValidator(QDoubleValidator(0.0, 1e12, 3))
+            edit.setFixedWidth(120)
+            target_layout.addWidget(edit, 0, col * 2 + 1)
+            self._mag_field_edits[axis] = edit
+        apply_btn = QPushButton("应用三轴场 / Apply Bxyz")
+        apply_btn.setObjectName("primaryBtn")
+        apply_btn.clicked.connect(self._apply_mag_field_3d)
+        target_layout.addWidget(apply_btn, 0, 6)
+        zero_btn = QPushButton("三轴归零 / Zero Field")
+        zero_btn.clicked.connect(self._zero_mag_field)
+        target_layout.addWidget(zero_btn, 0, 7)
+        stop_btn = QPushButton("关闭磁场输出 / Field E-Stop")
+        stop_btn.setObjectName("dangerBtn")
+        stop_btn.clicked.connect(self._mag_emergency_stop)
+        target_layout.addWidget(stop_btn, 0, 8)
+        target_layout.setColumnStretch(9, 1)
+        layout.addWidget(target_group)
+
+        import_group = QGroupBox("自动化 JSON / Automation JSON")
+        import_layout = QHBoxLayout(import_group)
+        self._mag_json_path = QLineEdit("")
+        self._mag_json_path.setPlaceholderText("选择包含 magnetic_field.axes 或 sequence.steps 的 JSON 文件")
+        import_layout.addWidget(self._mag_json_path, 1)
+        browse = QPushButton("浏览 / Browse")
+        browse.clicked.connect(self._browse_mag_json)
+        import_layout.addWidget(browse)
+        load = QPushButton("导入参数 / Import")
+        load.clicked.connect(self._import_mag_json)
+        import_layout.addWidget(load)
+        layout.addWidget(import_group)
+
+        layout.addStretch()
+        page.setWidget(inner)
+        return page
+
+    def _toggle_mag_axis(self, axis: str) -> None:
+        controls = self._mag_controls[axis]
+        if self._ctrl.mag.is_connected(axis):
+            self._submit_mag_command(CommandType.MAG_DISCONNECT_AXIS, {"axis": axis}, f"mag_disconnect_{axis}")
+            return
+        params = {
+            "axis": axis,
+            "port": controls["port"].currentText().strip(),
+            "baudrate": int(self._cfg.get("magnetic_field", {}).get("baudrate", 9600)),
+            "coil_constant": float(controls["coil"].text()),
+            "zero_offset_mA": float(controls["zero"].text()),
+        }
+        self._submit_mag_command(CommandType.MAG_CONNECT_AXIS, params, f"mag_connect_{axis}")
+
+    def _apply_mag_field_3d(self) -> None:
+        params = {
+            "x_nT": float(self._mag_field_edits["X"].text()),
+            "y_nT": float(self._mag_field_edits["Y"].text()),
+            "z_nT": float(self._mag_field_edits["Z"].text()),
+        }
+        self._submit_mag_command(CommandType.MAG_SET_FIELD_3D, params, "mag_set_field")
+
+    def _zero_mag_field(self) -> None:
+        for edit in self._mag_field_edits.values():
+            edit.setText("0")
+        self._apply_mag_field_3d()
+
+    def _set_mag_output(self, axis: str) -> None:
+        if not hasattr(self, "_mag_controls"):
+            return
+        enabled = self._mag_controls[axis]["output"].isChecked()
+        self._submit_mag_command(CommandType.MAG_SET_OUTPUT, {"axis": axis, "enabled": enabled}, f"mag_output_{axis}")
+
+    def _set_mag_lock_zero(self, axis: str) -> None:
+        if not hasattr(self, "_mag_controls"):
+            return
+        locked = self._mag_controls[axis]["lock"].isChecked()
+        self._submit_mag_command(CommandType.MAG_LOCK_ZERO, {"axis": axis, "locked": locked}, f"mag_lock_{axis}")
+
+    def _mag_emergency_stop(self) -> None:
+        self._submit_mag_command(CommandType.MAG_EMERGENCY_STOP, {}, "mag_estop")
+
+    def _submit_mag_command(self, cmd_type: CommandType, params: Dict[str, Any], op: str) -> None:
+        if self._cmd_service is not None:
+            req = self._cmd_service.submit(Command(cmd_type, params, source="gui"))
+            self._pending_cmds[req] = (op, params)
+            return
+        try:
+            service = CommandService(self._ctrl, self._cfg)
+            service._execute(Command(cmd_type, params, source="gui"))
+        except Exception as exc:
+            QMessageBox.warning(self, "Magnetic Field Error", str(exc))
+            self._on_log(f"[Mag] {exc}", "smb")
+
+    def _browse_mag_json(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "导入磁场 JSON", "", "JSON Files (*.json);;All Files (*)")
+        if path:
+            self._mag_json_path.setText(path)
+
+    def _import_mag_json(self) -> None:
+        import json
+        path = self._mag_json_path.text().strip()
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            mag = data.get("magnetic_field", data)
+            axes = mag.get("axes", {})
+            for axis, axis_cfg in axes.items():
+                axis = axis.upper()
+                if axis not in self._mag_controls:
+                    continue
+                controls = self._mag_controls[axis]
+                if "port" in axis_cfg:
+                    controls["port"].setCurrentText(str(axis_cfg["port"]))
+                if "coil_constant" in axis_cfg:
+                    controls["coil"].setText(str(axis_cfg["coil_constant"]))
+                if "zero_offset_mA" in axis_cfg:
+                    controls["zero"].setText(str(axis_cfg["zero_offset_mA"]))
+            if "field_nT" in mag:
+                for axis, value in mag["field_nT"].items():
+                    axis = axis.upper()
+                    if axis in self._mag_field_edits:
+                        self._mag_field_edits[axis].setText(str(value))
+            self._cfg["magnetic_field"] = {**self._cfg.get("magnetic_field", {}), **mag}
+            self._on_log(f"[Mag] Imported automation JSON: {path}", "smb")
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Error", str(exc))
 
     # -----------------------------------------------------------------------
     # Page 1: Parameter Config (Source + Lock-in tabs)
@@ -1501,6 +1730,10 @@ class ODMRControlGUI(QMainWindow):
             self._toggle_lockin_connection()
         if not self._ctrl.is_laser_connected:
             self._toggle_laser_connection()
+        if hasattr(self, "_mag_controls"):
+            for axis in ("X", "Y", "Z"):
+                if not self._ctrl.mag.is_connected(axis):
+                    self._toggle_mag_axis(axis)
 
     def _disconnect_all(self):
         if self._ctrl.is_smb_connected:
@@ -1509,6 +1742,8 @@ class ODMRControlGUI(QMainWindow):
             self._toggle_lockin_connection()
         if self._ctrl.is_laser_connected:
             self._toggle_laser_connection()
+        if self._ctrl.is_mag_connected:
+            self._submit_mag_command(CommandType.MAG_DISCONNECT_ALL, {}, "mag_disconnect_all")
 
     def _toggle_smb_connection(self):
         if self._ctrl.is_smb_connected:
@@ -2157,6 +2392,34 @@ class ODMRControlGUI(QMainWindow):
             self._gs_laser_out.style().unpolish(self._gs_laser_out)
             self._gs_laser_out.style().polish(self._gs_laser_out)
 
+    def _on_mag_state_changed(self, state: dict) -> None:
+        """处理三轴磁场状态广播。"""
+        axes = state.get("axes", state if isinstance(state, dict) else {})
+        if hasattr(self, "_mag_controls"):
+            for axis in ("X", "Y", "Z"):
+                status = axes.get(axis, {})
+                controls = self._mag_controls.get(axis)
+                if not controls:
+                    continue
+                connected = bool(status.get("connected", False))
+                output_on = bool(status.get("output_on", False))
+                lock_zero = bool(status.get("lock_zero", False))
+                controls["button"].setText("断开 / Disconnect" if connected else "连接 / Connect")
+                controls["current"].setText(f"{float(status.get('total_current_mA', 0.0)):.3f}")
+                controls["target"].setText(f"{float(status.get('target_field_nT', 0.0)):.2f}")
+                controls["output"].blockSignals(True)
+                controls["output"].setChecked(output_on)
+                controls["output"].blockSignals(False)
+                controls["lock"].blockSignals(True)
+                controls["lock"].setChecked(lock_zero)
+                controls["lock"].blockSignals(False)
+        if hasattr(self, "_gs_mag_x"):
+            for axis, led in (("X", self._gs_mag_x), ("Y", self._gs_mag_y), ("Z", self._gs_mag_z)):
+                connected = bool(axes.get(axis, {}).get("connected", False))
+                led.setProperty("on", "true" if connected else "false")
+                led.style().unpolish(led)
+                led.style().polish(led)
+
     def _on_lockin_data_ready(self, data):
         """处理 Lockin 数据，按 channel 路由到对应显示和 buffer。"""
         ch = data.get("channel", 1)
@@ -2408,6 +2671,22 @@ class ODMRControlGUI(QMainWindow):
                 QMessageBox.warning(self, "Recording Error", message)
                 self._on_log("Recording stop failed: " + message, "lockin")
 
+        elif op.startswith("mag_"):
+            if success:
+                if isinstance(result, dict):
+                    if "state" in result and isinstance(result["state"], dict):
+                        state = result["state"]
+                    else:
+                        state = result
+                    if "axis" in state and "axes" not in state:
+                        self._on_mag_state_changed({"axes": {state["axis"]: state}})
+                    else:
+                        self._on_mag_state_changed(state)
+                self._on_log(f"[Mag] {op} OK", "smb")
+            else:
+                QMessageBox.warning(self, "Magnetic Field Error", message)
+                self._on_log(f"[Mag] {op} failed: {message}", "smb")
+
     def _on_command_error(self, request_id: str, error_message: str) -> None:
         """处理 CommandService 命令错误。"""
         if request_id in self._pending_cmds:
@@ -2415,6 +2694,8 @@ class ODMRControlGUI(QMainWindow):
             self._on_log(f"[Command Error] {op}: {error_message}", "smb")
             if op in ("record_start", "record_stop"):
                 self._apply_recording_stopped()
+            if op.startswith("mag_"):
+                QMessageBox.warning(self, "Magnetic Field Error", error_message)
 
     def _on_error(self, msg):
         self._on_log("[ERROR] " + msg, "smb")
@@ -2446,6 +2727,16 @@ class ODMRControlGUI(QMainWindow):
         cfg["lockin"]["baudrate"] = int(self._lockin_baud_combo.currentText())
         cfg["acquisition"]["save_dir"] = self._save_dir_input.text()
         cfg["acquisition"]["auto_save"] = self._auto_save_check.isChecked()
+        if hasattr(self, "_mag_controls"):
+            mag_cfg = cfg.setdefault("magnetic_field", {})
+            mag_cfg["baudrate"] = int(mag_cfg.get("baudrate", 9600))
+            axes_cfg = mag_cfg.setdefault("axes", {})
+            for axis, controls in self._mag_controls.items():
+                axes_cfg[axis] = {
+                    "port": controls["port"].currentText(),
+                    "coil_constant": float(controls["coil"].text()),
+                    "zero_offset_mA": float(controls["zero"].text()),
+                }
         save_config(cfg)
         self._on_log("Config saved", "smb")
 
@@ -2457,6 +2748,7 @@ class ODMRControlGUI(QMainWindow):
             self._ctrl.disconnect_smb()
             self._ctrl.disconnect_lockin()
             self._ctrl.disconnect_laser()
+            self._ctrl.mag.disconnect_all()
             event.accept()
         else:
             event.ignore()

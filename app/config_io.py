@@ -42,6 +42,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "warmup_s": 600,
         "power_mode": "APC",
     },
+    "magnetic_field": {
+        "baudrate": 9600,
+        "poll_interval_ms": 500,
+        "axes": {
+            "X": {"port": "COM1", "coil_constant": 143.26, "zero_offset_mA": 0.0},
+            "Y": {"port": "COM2", "coil_constant": 143.26, "zero_offset_mA": 0.0},
+            "Z": {"port": "COM3", "coil_constant": 143.26, "zero_offset_mA": 0.0},
+        },
+        "sequence": {
+            "settle_seconds": 0.5,
+            "return_to_zero": True,
+        },
+    },
     "lockin_bindings": {},  # {idn_string: com_port}
     "smb_bindings": {},  # {serial_number: visa_address}
     "sweep": {

@@ -42,6 +42,20 @@ CH_FIELDS = [
 ADC_FIELDS = ["ADC1", "ADC2", "ADC3", "ADC4"]
 SMB_FIELDS = ["smb_freq_hz", "smb_power_dbm", "smb_rf_on"]
 LASER_FIELDS = ["laser_power_mw", "laser_on"]
+MAG_FIELDS = [
+    "X_target_field_nT",
+    "X_total_current_mA",
+    "X_output_on",
+    "X_lock_zero",
+    "Y_target_field_nT",
+    "Y_total_current_mA",
+    "Y_output_on",
+    "Y_lock_zero",
+    "Z_target_field_nT",
+    "Z_total_current_mA",
+    "Z_output_on",
+    "Z_lock_zero",
+]
 SYSTEM_FIELDS = ["sample_index", "time_s", "batch_index"]
 
 
@@ -120,6 +134,7 @@ class ODMRRecorder:
         smb_rf_on: bool = False,
         laser_power_mw: float = 0.0,
         laser_on: bool = False,
+        mag_state: Optional[Dict[str, Any]] = None,
     ) -> None:
         """写入一批 RALL? 数据（50 点）。线程安全。"""
         with self._lock:
@@ -141,6 +156,7 @@ class ODMRRecorder:
                     "1" if smb_rf_on else "0",
                     self._fmt(laser_power_mw),
                     "1" if laser_on else "0",
+                    *self._mag_values(mag_state),
                     str(self._total_points + i),
                     self._fmt(t_batch + i * 0.001),
                     str(self._batch_count),
@@ -166,10 +182,11 @@ class ODMRRecorder:
             ["ADC"] + [""] * (len(ADC_FIELDS) - 1) +
             ["SMB"] + [""] * (len(SMB_FIELDS) - 1) +
             ["Laser"] + [""] * (len(LASER_FIELDS) - 1) +
+            ["MagneticField"] + [""] * (len(MAG_FIELDS) - 1) +
             ["System"] + [""] * (len(SYSTEM_FIELDS) - 1)
         )
         self._writer.writerow(
-            CH_FIELDS + CH_FIELDS + ADC_FIELDS + SMB_FIELDS + LASER_FIELDS + SYSTEM_FIELDS
+            CH_FIELDS + CH_FIELDS + ADC_FIELDS + SMB_FIELDS + LASER_FIELDS + MAG_FIELDS + SYSTEM_FIELDS
         )
 
     @staticmethod
@@ -214,6 +231,19 @@ class ODMRRecorder:
             self._fmt(self._array_value(data, "aux_adc4_v", i)),
         ]
 
+    def _mag_values(self, state: Optional[Dict[str, Any]]) -> list[str]:
+        axes = (state or {}).get("axes", {})
+        values: list[str] = []
+        for axis in ("X", "Y", "Z"):
+            status = axes.get(axis, {})
+            values.extend([
+                self._fmt(float(status.get("target_field_nT", 0.0))),
+                self._fmt(float(status.get("total_current_mA", 0.0))),
+                "1" if status.get("output_on", False) else "0",
+                "1" if status.get("lock_zero", False) else "0",
+            ])
+        return values
+
     @staticmethod
     def _array_value(data: Dict[str, np.ndarray], key: str, i: int) -> float:
         arr = data.get(key)
@@ -239,6 +269,7 @@ class ODMRRecorder:
             ("ADC", ADC_FIELDS),
             ("SMB", SMB_FIELDS),
             ("Laser", LASER_FIELDS),
+            ("MagneticField", MAG_FIELDS),
             ("System", SYSTEM_FIELDS),
         ]:
             for field in fields:
@@ -258,7 +289,7 @@ class ODMRRecorder:
             return
         duration = time.monotonic() - self._start_time
         meta = {
-            "instrument": "OE1022D+SMB100A+Laser",
+            "instrument": "OE1022D+SMB100A+Laser+MagneticField",
             "command": "RALL?",
             "storage_format": "CSV (UTF-8 BOM)",
             "data_file": "data.csv",
@@ -269,7 +300,7 @@ class ODMRRecorder:
             "total_points": self._total_points,
             "duration_s": round(duration, 3),
             "acquisition_time": datetime.now().isoformat(),
-            "layout": "OE1022D LabVIEW-style grouped CSV with CH-A, CH-B and ADC columns",
+            "layout": "OE1022D LabVIEW-style grouped CSV with CH-A, CH-B, ADC, source, laser and magnetic-field columns",
         }
         with open(self._output_dir / "metadata.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
