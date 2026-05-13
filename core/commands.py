@@ -110,6 +110,9 @@ class CommandType(Enum):
     EXPERIMENT_RESUME = auto()
     EXPERIMENT_STOP = auto()
     EXPERIMENT_QUERY_STATE = auto()
+    EXPERIMENT_WAIT = auto()           # {duration_s?, condition?}
+    EXPERIMENT_CONDITION_EVAL = auto() # {condition} -> {met: bool}
+    EXPERIMENT_MODIFY_STEP = auto()    # {step_index, overrides}
 
 
 @dataclass(frozen=True)

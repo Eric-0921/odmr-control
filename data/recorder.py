@@ -5,6 +5,11 @@
 - 第二行: CH-A / CH-B / ADC / SMB / Laser / System 分组
 - 第三行: 字段名
 - 后续行: 每个 RALL? sample 一行
+
+采样率说明:
+  OE1022D RALL? 协议固定为 50ms/batch x 50 points = 1 kHz 采样率。
+  这是硬件限制 (12288 bytes / batch, 20 params x 50 points x ~12 bytes)。
+  不可通过软件配置修改。
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -58,11 +63,25 @@ MAG_FIELDS = [
 ]
 SYSTEM_FIELDS = ["sample_index", "time_s", "batch_index"]
 
+# 所有可选列组，顺序决定 CSV 列顺序
+ALL_COLUMN_GROUPS: List[str] = ["CH-A", "CH-B", "ADC", "SMB", "Laser", "MagneticField", "System"]
+
+# 列组到字段的映射
+_COLUMN_GROUP_FIELDS: Dict[str, List[str]] = {
+    "CH-A": CH_FIELDS,
+    "CH-B": CH_FIELDS,
+    "ADC": ADC_FIELDS,
+    "SMB": SMB_FIELDS,
+    "Laser": LASER_FIELDS,
+    "MagneticField": MAG_FIELDS,
+    "System": SYSTEM_FIELDS,
+}
+
 
 class ODMRRecorder:
     """CSV 数据记录器，支持实时追加。线程安全。"""
 
-    def __init__(self, output_dir: Path | str | None = None) -> None:
+    def __init__(self, output_dir: Path | str | None = None, column_groups: List[str] | None = None) -> None:
         self._output_dir: Optional[Path] = None
         self._csv_file = None
         self._writer: Optional[csv.writer] = None
@@ -72,6 +91,7 @@ class ODMRRecorder:
         self._start_datetime: Optional[datetime] = None
         self._is_recording = False
         self._lock = threading.Lock()
+        self._column_groups = column_groups if column_groups else list(ALL_COLUMN_GROUPS)
 
         if output_dir is not None:
             self.set_output_dir(output_dir)
@@ -93,6 +113,9 @@ class ODMRRecorder:
     def set_output_dir(self, path: Path | str) -> None:
         self._output_dir = Path(path)
         self._output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _has_group(self, group: str) -> bool:
+        return group in self._column_groups
 
     def start_recording(self) -> None:
         """开始记录，创建 UTF-8 CSV。"""
@@ -147,20 +170,31 @@ class ODMRRecorder:
             t_batch = time.monotonic() - self._start_time
             for i in range(n):
                 row = []
-                row.extend(self._channel_values(rall_data, "A", i))
-                row.extend(self._channel_values(rall_data, "B", i))
-                row.extend(self._adc_values(rall_data, i))
-                row.extend([
-                    self._fmt(smb_freq_hz),
-                    self._fmt(smb_power_dbm),
-                    "1" if smb_rf_on else "0",
-                    self._fmt(laser_power_mw),
-                    "1" if laser_on else "0",
-                    *self._mag_values(mag_state),
-                    str(self._total_points + i),
-                    self._fmt(t_batch + i * 0.001),
-                    str(self._batch_count),
-                ])
+                if self._has_group("CH-A"):
+                    row.extend(self._channel_values(rall_data, "A", i))
+                if self._has_group("CH-B"):
+                    row.extend(self._channel_values(rall_data, "B", i))
+                if self._has_group("ADC"):
+                    row.extend(self._adc_values(rall_data, i))
+                if self._has_group("SMB"):
+                    row.extend([
+                        self._fmt(smb_freq_hz),
+                        self._fmt(smb_power_dbm),
+                        "1" if smb_rf_on else "0",
+                    ])
+                if self._has_group("Laser"):
+                    row.extend([
+                        self._fmt(laser_power_mw),
+                        "1" if laser_on else "0",
+                    ])
+                if self._has_group("MagneticField"):
+                    row.extend(self._mag_values(mag_state))
+                if self._has_group("System"):
+                    row.extend([
+                        str(self._total_points + i),
+                        self._fmt(t_batch + i * 0.001),
+                        str(self._batch_count),
+                    ])
                 self._writer.writerow(row)
 
             if self._csv_file is not None:
@@ -176,18 +210,16 @@ class ODMRRecorder:
         self._writer.writerow([
             "当前日期:", date_text, "", "当前时间:", time_text, "", "采样间隔:", "0.001 s"
         ])
-        self._writer.writerow(
-            ["CH-A"] + [""] * (len(CH_FIELDS) - 1) +
-            ["CH-B"] + [""] * (len(CH_FIELDS) - 1) +
-            ["ADC"] + [""] * (len(ADC_FIELDS) - 1) +
-            ["SMB"] + [""] * (len(SMB_FIELDS) - 1) +
-            ["Laser"] + [""] * (len(LASER_FIELDS) - 1) +
-            ["MagneticField"] + [""] * (len(MAG_FIELDS) - 1) +
-            ["System"] + [""] * (len(SYSTEM_FIELDS) - 1)
-        )
-        self._writer.writerow(
-            CH_FIELDS + CH_FIELDS + ADC_FIELDS + SMB_FIELDS + LASER_FIELDS + MAG_FIELDS + SYSTEM_FIELDS
-        )
+        group_row: list[str] = []
+        field_row: list[str] = []
+        for group in ALL_COLUMN_GROUPS:
+            if not self._has_group(group):
+                continue
+            fields = _COLUMN_GROUP_FIELDS[group]
+            group_row.extend([group] + [""] * (len(fields) - 1))
+            field_row.extend(fields)
+        self._writer.writerow(group_row)
+        self._writer.writerow(field_row)
 
     @staticmethod
     def _batch_len(rall_data: Dict[str, np.ndarray]) -> int:
@@ -263,16 +295,10 @@ class ODMRRecorder:
         if self._output_dir is None:
             return
         columns: Dict[str, Any] = {}
-        for group, fields in [
-            ("CH-A", CH_FIELDS),
-            ("CH-B", CH_FIELDS),
-            ("ADC", ADC_FIELDS),
-            ("SMB", SMB_FIELDS),
-            ("Laser", LASER_FIELDS),
-            ("MagneticField", MAG_FIELDS),
-            ("System", SYSTEM_FIELDS),
-        ]:
-            for field in fields:
+        for group in ALL_COLUMN_GROUPS:
+            if not self._has_group(group):
+                continue
+            for field in _COLUMN_GROUP_FIELDS[group]:
                 columns[f"{group}_{field}"] = {"group": group, "name": field}
         doc = {
             "version": "2.0",
@@ -280,6 +306,7 @@ class ODMRRecorder:
             "encoding": "utf-8-sig",
             "data_file": "data.csv",
             "columns": columns,
+            "column_groups": self._column_groups,
         }
         with open(self._output_dir / "columns.json", "w", encoding="utf-8") as f:
             json.dump(doc, f, ensure_ascii=False, indent=2)

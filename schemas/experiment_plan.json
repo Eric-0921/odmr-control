@@ -1,0 +1,363 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://odmr-control/schema/experiment_plan.json",
+  "title": "ODMR Experiment Plan",
+  "description": "ODMR Control 实验计划 JSON Schema 定义",
+  "type": "object",
+  "required": ["sequence"],
+  "properties": {
+    "metadata": {
+      "$ref": "#/definitions/metadata"
+    },
+    "sequence": {
+      "$ref": "#/definitions/sequence"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "metadata": {
+      "type": "object",
+      "description": "实验元数据（可选）",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "实验名称"
+        },
+        "description": {
+          "type": "string",
+          "description": "实验描述"
+        },
+        "domain": {
+          "type": "string",
+          "description": "实验领域，如 ODMR, NMR, optical 等"
+        },
+        "mode": {
+          "type": "string",
+          "description": "实验模式，如 sweep, static, scan 等"
+        },
+        "author": {
+          "type": "string",
+          "description": "实验创建者"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "创建时间（ISO 8601 格式）"
+        },
+        "tags": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "标签列表"
+        }
+      },
+      "additionalProperties": true
+    },
+    "sequence": {
+      "type": "object",
+      "description": "实验序列定义",
+      "required": ["steps"],
+      "properties": {
+        "loop_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "循环次数，0 表示无限循环"
+        },
+        "loop_delay": {
+          "type": "number",
+          "minimum": 0,
+          "description": "每次循环之间的延迟（秒）"
+        },
+        "return_to_zero": {
+          "type": "boolean",
+          "description": "实验结束后是否将磁场归零"
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/definitions/step"
+          },
+          "description": "实验步骤列表，不能为空"
+        }
+      },
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "description": "单个实验步骤",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "步骤名称"
+        },
+        "magnetic_field": {
+          "$ref": "#/definitions/magnetic_field"
+        },
+        "microwave": {
+          "$ref": "#/definitions/microwave"
+        },
+        "lockin": {
+          "$ref": "#/definitions/lockin"
+        },
+        "laser": {
+          "$ref": "#/definitions/laser"
+        },
+        "timing": {
+          "$ref": "#/definitions/timing"
+        },
+        "acquisition": {
+          "$ref": "#/definitions/acquisition"
+        }
+      },
+      "additionalProperties": true
+    },
+    "magnetic_field": {
+      "type": "object",
+      "description": "磁场设定（笛卡尔坐标或球坐标，二选一）",
+      "anyOf": [
+        {
+          "required": ["x_nT", "y_nT", "z_nT"],
+          "properties": {
+            "x_nT": {"type": "number", "description": "X 轴磁场（纳特斯拉）"},
+            "y_nT": {"type": "number", "description": "Y 轴磁场（纳特斯拉）"},
+            "z_nT": {"type": "number", "description": "Z 轴磁场（纳特斯拉）"}
+          },
+          "additionalProperties": true
+        },
+        {
+          "required": ["magnitude_nT", "theta_deg", "phi_deg"],
+          "properties": {
+            "magnitude_nT": {"type": "number", "minimum": 0, "description": "磁场强度（纳特斯拉）"},
+            "theta_deg": {"type": "number", "description": "极角（度）"},
+            "phi_deg": {"type": "number", "description": "方位角（度）"}
+          },
+          "additionalProperties": true
+        },
+        {
+          "required": ["field_x_nT", "field_y_nT", "field_z_nT"],
+          "properties": {
+            "field_x_nT": {"type": "number", "description": "X 轴磁场（兼容别名）"},
+            "field_y_nT": {"type": "number", "description": "Y 轴磁场（兼容别名）"},
+            "field_z_nT": {"type": "number", "description": "Z 轴磁场（兼容别名）"}
+          },
+          "additionalProperties": true
+        }
+      ]
+    },
+    "microwave": {
+      "type": "object",
+      "description": "微波源（SMB100A）配置",
+      "properties": {
+        "frequency_hz": {
+          "type": "number",
+          "minimum": 100000,
+          "maximum": 12750000000,
+          "description": "CW 频率（Hz），范围 100kHz - 12.75GHz"
+        },
+        "power_dbm": {
+          "type": "number",
+          "description": "输出功率（dBm），需通过功率限制检查"
+        },
+        "phase_deg": {
+          "type": "number",
+          "description": "相位（度）"
+        },
+        "level_offset_db": {
+          "type": "number",
+          "description": "电平偏移（dB）"
+        },
+        "rf_output": {
+          "type": "boolean",
+          "description": "射频输出开关"
+        },
+        "lf": {
+          "type": "object",
+          "description": "低频信号发生器配置",
+          "properties": {
+            "frequency_hz": {"type": "number", "minimum": 0},
+            "voltage_mv": {"type": "number"},
+            "shape": {"type": "string", "enum": ["SINE", "SQUARE", "TRIANGLE", "SAWTOOTH"]},
+            "impedance": {"type": "string"},
+            "output": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "modulation": {
+          "type": "object",
+          "description": "调制配置",
+          "properties": {
+            "fm_deviation_hz": {"type": "number"},
+            "fm_source": {"type": "string"},
+            "fm_enabled": {"type": "boolean"}
+          },
+          "additionalProperties": true
+        },
+        "sweep": {
+          "type": "object",
+          "description": "扫频配置",
+          "properties": {
+            "start_hz": {"type": "number", "description": "起始频率（Hz）"},
+            "stop_hz": {"type": "number", "description": "终止频率（Hz）"},
+            "step_hz": {"type": "number", "exclusiveMinimum": 0, "description": "步进频率（Hz）"},
+            "dwell_ms": {"type": "number", "minimum": 0, "description": "驻留时间（ms）"},
+            "shape": {"type": "string", "enum": ["SAWTOOTH", "TRIANGLE"], "description": "扫频波形"},
+            "retrace": {"type": "boolean", "description": "回扫使能"},
+            "trigger": {"type": "string", "enum": ["IMM", "EXT", "BUS"], "description": "触发源"},
+            "execute": {"type": "boolean", "description": "是否立即执行扫频"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "lockin": {
+      "type": "object",
+      "description": "锁相放大器（OE1022D）配置",
+      "properties": {
+        "channel": {
+          "type": "integer",
+          "enum": [1, 2],
+          "description": "通道号"
+        },
+        "input": {
+          "type": "object",
+          "description": "输入配置",
+          "properties": {
+            "mode": {"type": "string"},
+            "coupling": {"type": "string"},
+            "ground": {"type": "string"},
+            "filter": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "ref": {
+          "type": "object",
+          "description": "参考源配置",
+          "properties": {
+            "source": {"type": "string"},
+            "frequency_hz": {"type": "number"},
+            "phase_deg": {"type": "number"}
+          },
+          "additionalProperties": true
+        },
+        "gain_tc": {
+          "type": "object",
+          "description": "增益和时间常数配置",
+          "properties": {
+            "sensitivity": {"type": "string"},
+            "time_constant": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "output": {
+          "type": "object",
+          "description": "输出配置",
+          "properties": {
+            "x_offset": {"type": "number"},
+            "y_offset": {"type": "number"}
+          },
+          "additionalProperties": true
+        },
+        "auto": {
+          "type": "object",
+          "description": "自动配置",
+          "properties": {
+            "gain": {"type": "boolean"},
+            "reserve": {"type": "boolean"},
+            "phase": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+    "laser": {
+      "type": "object",
+      "description": "激光器（MSL-U）配置",
+      "properties": {
+        "power_mw": {
+          "type": "number",
+          "minimum": 0,
+          "description": "激光功率（mW）"
+        },
+        "output": {
+          "type": "boolean",
+          "description": "激光输出开关"
+        }
+      },
+      "additionalProperties": false
+    },
+    "timing": {
+      "type": "object",
+      "description": "步骤时序配置",
+      "properties": {
+        "settle_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "磁场/设备稳定等待时间（秒）"
+        },
+        "hold_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "保持时间（秒）"
+        },
+        "trigger": {
+          "type": "string",
+          "enum": ["immediate", "manual", "delay"],
+          "description": "步骤触发模式"
+        },
+        "delay_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "延迟触发等待时间（秒），仅 trigger=delay 时有效"
+        }
+      },
+      "additionalProperties": false
+    },
+    "acquisition": {
+      "type": "object",
+      "description": "数据采集配置",
+      "properties": {
+        "start_trigger": {
+          "type": "string",
+          "enum": ["step_start", "setpoints_applied", "magnetic_settled", "microwave_output_on", "microwave_sweep_start", "inline", "disabled"],
+          "description": "采集启动触发条件"
+        },
+        "stop_trigger": {
+          "type": "string",
+          "enum": ["hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end", "disabled"],
+          "description": "采集停止触发条件"
+        },
+        "start_recording": {
+          "type": "boolean",
+          "description": "是否启动 Parquet 数据记录"
+        },
+        "stop_recording": {
+          "type": "boolean",
+          "description": "是否停止 Parquet 数据记录"
+        },
+        "start_stream": {
+          "type": "boolean",
+          "description": "是否启动锁相数据流"
+        },
+        "output_dir": {
+          "type": "string",
+          "description": "数据输出目录"
+        },
+        "stop_acquire": {
+          "type": "boolean",
+          "description": "停止采集时是否同时停止数据流"
+        },
+        "column_groups": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["CH-A", "CH-B", "ADC", "SMB", "Laser", "MagneticField", "System"]
+          },
+          "description": "要录制的数据列组，默认全部。可选择性录制以减小文件体积"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

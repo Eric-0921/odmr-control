@@ -448,12 +448,12 @@ class OE1022DDriver:
         self._exchange_ascii(f"PHASD {channel},{index}")
 
     def set_ref_source(self, channel: int = 1, source: int = 0) -> None:
-        """参考源: 0=External, 1=Internal"""
-        self._exchange_ascii(f"RSLPD {channel},{source}")
+        """参考源: 0=External, 1=Internal, 2=Internal Sweep"""
+        self._exchange_ascii(f"FMODD {channel},{source}")
 
     def set_ref_slope(self, channel: int = 1, slope: int = 0) -> None:
-        """参考斜率: 0=Sine, 1=Pos TTL, 2=Neg TTL"""
-        self._exchange_ascii(f"RMODD {channel},{slope}")
+        """外部参考触发方式（仅 External 模式有效）: 0=TTL Rising, 1=TTL Falling, 2=Sine Zero Cross"""
+        self._exchange_ascii(f"RSLPD {channel},{slope}")
 
     def set_ref_frequency(self, channel: int = 1, freq_hz: float = 1000.0) -> None:
         """参考频率，单位 Hz（仅内部源有效）。"""

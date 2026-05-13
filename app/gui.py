@@ -20,7 +20,8 @@ import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QDoubleValidator, QFont, QIntValidator
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+    QAbstractItemView, QAction, QApplication, QCheckBox, QComboBox,
+    QDialog, QDialogButtonBox, QFileDialog, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QMenuBar, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QTabWidget,
@@ -29,6 +30,7 @@ from PyQt5.QtWidgets import (
 )
 
 from app.config_io import load_config, save_config
+from app.unit_selector import UnitSelector, FrequencyUnitSelector, MagneticFieldUnitSelector, PowerUnitSelector, TimeUnitSelector
 from core.command_service import CommandService
 from core.commands import Command, CommandType
 from core.instrument_controller import InstrumentController
@@ -50,6 +52,16 @@ try:
     _HAS_PYG = True
 except ImportError:
     _HAS_PYG = False
+
+
+# ---------------------------------------------------------------------------
+# Laser power unit conversion
+# ---------------------------------------------------------------------------
+
+LASER_POWER_UNITS = {
+    "mW": 1.0,
+    "W": 1e3,  # 1 W = 1000 mW
+}
 
 
 # ---------------------------------------------------------------------------
@@ -671,11 +683,12 @@ class ODMRControlGUI(QMainWindow):
         # Laser Control
         laser_ctrl_group = QGroupBox("激光器控制 / Laser Control")
         laser_ctrl_layout = QGridLayout(laser_ctrl_group)
-        laser_ctrl_layout.addWidget(QLabel("功率 (mW):"), 0, 0)
-        self._laser_power_edit = QLineEdit("0")
-        self._laser_power_edit.setValidator(QIntValidator(0, 999))
-        self._laser_power_edit.setFixedWidth(80)
-        laser_ctrl_layout.addWidget(self._laser_power_edit, 0, 1)
+        laser_ctrl_layout.addWidget(QLabel("功率:"), 0, 0)
+        self._laser_power_selector = UnitSelector(
+            0.0, LASER_POWER_UNITS, "mW",
+            validator=QIntValidator(0, 999),
+        )
+        laser_ctrl_layout.addWidget(self._laser_power_selector, 0, 1)
         laser_power_btn = QPushButton("设 / Set")
         laser_power_btn.setObjectName("primaryBtn")
         laser_power_btn.clicked.connect(self._set_laser_power)
@@ -779,13 +792,19 @@ class ODMRControlGUI(QMainWindow):
         return page
 
     def _change_monitor_interval(self) -> None:
-        from PyQt5.QtWidgets import QInputDialog
-        current_ms = 94
-        ms, ok = QInputDialog.getInt(
-            self, "监控间隔 / Monitor Interval",
-            "间隔 (ms):", current_ms, 50, 5000, 10,
-        )
-        if ok:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("监控间隔 / Monitor Interval")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("间隔 / Interval:"))
+        selector = TimeUnitSelector(94.0e-3)  # 94 ms -> base s
+        layout.addWidget(selector)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec_() == QDialog.Accepted:
+            ms = int(selector.value_in_base_unit() * 1000)  # s -> ms
+            ms = max(50, min(5000, ms))
             self._ctrl.set_lockin_monitor_interval(ms)
             self._on_log(f"监控间隔设为 {ms} ms")
 
@@ -803,9 +822,21 @@ class ODMRControlGUI(QMainWindow):
 
         self._mag_controls: Dict[str, Dict[str, QWidget]] = {}
         self._mag_field_edits: Dict[str, QLineEdit] = {}
+        self._mag_field_selectors: Dict[str, MagneticFieldUnitSelector] = {}
         self._mag_current_edits: Dict[str, QLineEdit] = {}
         self._mag_status_labels: Dict[str, QLabel] = {}
         self._preset_mgr = PresetManager()
+
+        # 统一单位选择
+        unit_layout = QHBoxLayout()
+        unit_layout.addWidget(QLabel("显示单位 / Display Unit:"))
+        self._mag_unit_combo = QComboBox()
+        self._mag_unit_combo.addItems(["nT", "μT", "mT", "T", "G", "Oe"])
+        self._mag_unit_combo.setCurrentText("nT")
+        self._mag_unit_combo.currentTextChanged.connect(self._on_mag_unit_changed)
+        unit_layout.addWidget(self._mag_unit_combo)
+        unit_layout.addStretch()
+        layout.addLayout(unit_layout)
 
         tabs = QTabWidget()
         tabs.addTab(self._build_mag_connection_tab(), "Connection")
@@ -905,7 +936,7 @@ class ODMRControlGUI(QMainWindow):
         layout = QVBoxLayout(page)
         group = QGroupBox("零偏、输出、锁零和复现磁场 / Zero, Output, Lock and Field")
         grid = QGridLayout(group)
-        headers = ["轴", "零偏 mA", "目标 nT", "复现 mA", "回读总 mA", "估算复现 mA", "估算场 nT", "输出", "锁零", "动作"]
+        headers = ["轴", "零偏 mA", "目标", "复现 mA", "回读总 mA", "估算复现 mA", "估算场", "输出", "锁零", "动作"]
         for col, text in enumerate(headers):
             grid.addWidget(QLabel(text), 0, col)
         for row, axis in enumerate(("X", "Y", "Z"), start=1):
@@ -914,10 +945,9 @@ class ODMRControlGUI(QMainWindow):
             zero.setValidator(QDoubleValidator(0, 5000, 5))
             grid.addWidget(zero, row, 1)
             self._mag_controls[axis]["zero_manual"] = zero
-            field = QLineEdit("0")
-            field.setValidator(QDoubleValidator(-1e12, 1e12, 3))
-            grid.addWidget(field, row, 2)
-            self._mag_field_edits[axis] = field
+            field_selector = MagneticFieldUnitSelector(0.0, "nT")
+            grid.addWidget(field_selector, row, 2)
+            self._mag_field_selectors[axis] = field_selector
             current = QLineEdit("0")
             current.setValidator(QDoubleValidator(-5000, 5000, 5))
             grid.addWidget(current, row, 3)
@@ -970,13 +1000,14 @@ class ODMRControlGUI(QMainWindow):
         layout = QVBoxLayout(page)
         group = QGroupBox("球坐标与笛卡尔磁场转换 / Spherical and Cartesian Field")
         grid = QGridLayout(group)
-        self._mag_vec_mag = QLineEdit("0")
+        self._mag_vec_mag = MagneticFieldUnitSelector(0.0, "nT")
         self._mag_vec_theta = QLineEdit("0")
         self._mag_vec_phi = QLineEdit("0")
-        for col, (label, edit) in enumerate((("B (nT)", self._mag_vec_mag), ("theta (deg)", self._mag_vec_theta), ("phi (deg)", self._mag_vec_phi))):
-            edit.setValidator(QDoubleValidator(-1e12, 1e12, 3))
+        for col, (label, widget) in enumerate((("B", self._mag_vec_mag), ("theta (deg)", self._mag_vec_theta), ("phi (deg)", self._mag_vec_phi))):
+            if isinstance(widget, QLineEdit):
+                widget.setValidator(QDoubleValidator(-1e12, 1e12, 3))
             grid.addWidget(QLabel(label), 0, col * 2)
-            grid.addWidget(edit, 0, col * 2 + 1)
+            grid.addWidget(widget, 0, col * 2 + 1)
         calc = QPushButton("转换并填入 / Convert to Bxyz")
         calc.clicked.connect(self._mag_vector_to_manual)
         grid.addWidget(calc, 0, 6)
@@ -1089,7 +1120,7 @@ class ODMRControlGUI(QMainWindow):
         )
         self._submit_mag_command(
             CommandType.MAG_SET_FIELD,
-            {"axis": axis, "field_nT": float(self._mag_field_edits[axis].text())},
+            {"axis": axis, "field_nT": self._mag_field_selectors[axis].value_in_base_unit()},
             f"mag_field_{axis}",
         )
 
@@ -1101,8 +1132,8 @@ class ODMRControlGUI(QMainWindow):
         ))
         values = {"X": field.x_nT, "Y": field.y_nT, "Z": field.z_nT}
         for axis, value in values.items():
-            if axis in self._mag_field_edits:
-                self._mag_field_edits[axis].setText(f"{value:.3f}")
+            if axis in self._mag_field_selectors:
+                self._mag_field_selectors[axis].set_value_in_base_unit(value)
         self._mag_vec_result.setText(f"Bx={field.x_nT:.3f}, By={field.y_nT:.3f}, Bz={field.z_nT:.3f} nT")
 
     def _refresh_mag_presets(self) -> None:
@@ -1116,8 +1147,8 @@ class ODMRControlGUI(QMainWindow):
         if preset is None:
             return
         for axis, value in (("X", preset.x_nT), ("Y", preset.y_nT), ("Z", preset.z_nT)):
-            if axis in self._mag_field_edits:
-                self._mag_field_edits[axis].setText(f"{value:.3f}")
+            if axis in self._mag_field_selectors:
+                self._mag_field_selectors[axis].set_value_in_base_unit(value)
         self._mag_preset_info.setPlainText(f"{preset.name}\n{preset.description}\nX={preset.x_nT}, Y={preset.y_nT}, Z={preset.z_nT} nT")
 
     def _save_mag_preset(self) -> None:
@@ -1127,9 +1158,9 @@ class ODMRControlGUI(QMainWindow):
             return
         preset = FieldPreset(
             name=name.strip(),
-            x_nT=float(self._mag_field_edits["X"].text()),
-            y_nT=float(self._mag_field_edits["Y"].text()),
-            z_nT=float(self._mag_field_edits["Z"].text()),
+            x_nT=self._mag_field_selectors["X"].value_in_base_unit(),
+            y_nT=self._mag_field_selectors["Y"].value_in_base_unit(),
+            z_nT=self._mag_field_selectors["Z"].value_in_base_unit(),
         )
         self._preset_mgr.save_preset(preset)
         self._refresh_mag_presets()
@@ -1225,15 +1256,15 @@ class ODMRControlGUI(QMainWindow):
 
     def _apply_mag_field_3d(self) -> None:
         params = {
-            "x_nT": float(self._mag_field_edits["X"].text()),
-            "y_nT": float(self._mag_field_edits["Y"].text()),
-            "z_nT": float(self._mag_field_edits["Z"].text()),
+            "x_nT": self._mag_field_selectors["X"].value_in_base_unit(),
+            "y_nT": self._mag_field_selectors["Y"].value_in_base_unit(),
+            "z_nT": self._mag_field_selectors["Z"].value_in_base_unit(),
         }
         self._submit_mag_command(CommandType.MAG_SET_FIELD_3D, params, "mag_set_field")
 
     def _zero_mag_field(self) -> None:
-        for edit in self._mag_field_edits.values():
-            edit.setText("0")
+        for selector in self._mag_field_selectors.values():
+            selector.set_value_in_base_unit(0.0)
         self._apply_mag_field_3d()
 
     def _set_mag_output(self, axis: str) -> None:
@@ -1352,18 +1383,24 @@ class ODMRControlGUI(QMainWindow):
         smb_grid = QGridLayout(smb)
         self._exp_mw_enable = QCheckBox("启用微波")
         smb_grid.addWidget(self._exp_mw_enable, 0, 0)
-        labels_widgets = [
-            ("Start Hz", "_exp_mw_start", "2.82e9"),
-            ("Stop Hz", "_exp_mw_stop", "2.92e9"),
-            ("Step Hz", "_exp_mw_step", "1e6"),
-            ("Dwell ms", "_exp_mw_dwell", "50"),
-            ("Power dBm", "_exp_mw_power", "-30"),
-        ]
-        for idx, (label, attr, default) in enumerate(labels_widgets):
-            smb_grid.addWidget(QLabel(label + ":"), 1 + idx // 3, (idx % 3) * 2)
-            edit = QLineEdit(default)
-            setattr(self, attr, edit)
-            smb_grid.addWidget(edit, 1 + idx // 3, (idx % 3) * 2 + 1)
+        # 频率参数使用 FrequencyUnitSelector (base unit: Hz)
+        self._exp_mw_start_selector = FrequencyUnitSelector(2.82e9)
+        self._exp_mw_stop_selector = FrequencyUnitSelector(2.92e9)
+        self._exp_mw_step_selector = FrequencyUnitSelector(1e6)
+        # 功率使用 PowerUnitSelector (base unit: dBm)
+        self._exp_mw_power_selector = PowerUnitSelector(-30.0)
+        # 驻留时间使用 TimeUnitSelector (base unit: s)
+        self._exp_mw_dwell_selector = TimeUnitSelector(50.0e-3)  # 50 ms
+        smb_grid.addWidget(QLabel("Start freq:"), 1, 0)
+        smb_grid.addWidget(self._exp_mw_start_selector, 1, 1)
+        smb_grid.addWidget(QLabel("Stop freq:"), 1, 2)
+        smb_grid.addWidget(self._exp_mw_stop_selector, 1, 3)
+        smb_grid.addWidget(QLabel("Step freq:"), 1, 4)
+        smb_grid.addWidget(self._exp_mw_step_selector, 1, 5)
+        smb_grid.addWidget(QLabel("Dwell:"), 2, 0)
+        smb_grid.addWidget(self._exp_mw_dwell_selector, 2, 1)
+        smb_grid.addWidget(QLabel("Power:"), 2, 2)
+        smb_grid.addWidget(self._exp_mw_power_selector, 2, 3)
         self._exp_mw_execute = QCheckBox("内部扫频执行 / Execute sweep")
         self._exp_mw_execute.setChecked(True)
         smb_grid.addWidget(self._exp_mw_execute, 3, 0, 1, 2)
@@ -1378,28 +1415,41 @@ class ODMRControlGUI(QMainWindow):
         self._exp_field_mode.addItems(["Bxyz 网格", "B-theta-phi 向量"])
         mag_grid.addWidget(QLabel("扫描坐标:"), 0, 0)
         mag_grid.addWidget(self._exp_field_mode, 0, 1)
+        self._exp_field_selectors = {}
         for row, axis in enumerate(("X", "Y", "Z"), start=1):
-            mag_grid.addWidget(QLabel(f"{axis} start/stop/step nT:"), row, 0)
+            mag_grid.addWidget(QLabel(f"{axis} start/stop/step:"), row, 0)
+            self._exp_field_selectors[axis] = {}
             for col, suffix in enumerate(("start", "stop", "step"), start=1):
-                edit = QLineEdit("0" if suffix != "step" else "1000")
-                setattr(self, f"_exp_{axis.lower()}_{suffix}", edit)
-                mag_grid.addWidget(edit, row, col)
+                selector = MagneticFieldUnitSelector(0.0 if suffix != "step" else 1000.0)
+                self._exp_field_selectors[axis][suffix] = selector
+                mag_grid.addWidget(selector, row, col)
+        # B-theta-phi 向量参数
+        self._exp_b_selectors = {}
+        for col, suffix in enumerate(("start", "stop", "step")):
+            default_val = float(("0", "10000", "1000")[col])
+            selector = MagneticFieldUnitSelector(default_val)
+            self._exp_b_selectors[suffix] = selector
+        mag_grid.addWidget(QLabel("B start/stop/step:"), 1, 5)
+        mag_grid.addWidget(self._exp_b_selectors["start"], 1, 6)
+        mag_grid.addWidget(self._exp_b_selectors["stop"], 1, 7)
+        mag_grid.addWidget(self._exp_b_selectors["step"], 1, 8)
+        # theta/phi 保持 deg（角度标准单位）
         for row, (label, attr, default) in enumerate((
-            ("B start/stop/step nT", "b", ("0", "10000", "1000")),
             ("theta deg", "theta", ("90", "90", "0")),
             ("phi deg", "phi", ("0", "0", "0")),
-        ), start=1):
+        ), start=2):
             mag_grid.addWidget(QLabel(label + ":"), row, 5)
             for col, suffix in enumerate(("start", "stop", "step"), start=6):
                 edit = QLineEdit(default[col - 6])
                 setattr(self, f"_exp_{attr}_{suffix}", edit)
                 mag_grid.addWidget(edit, row, col)
-        mag_grid.addWidget(QLabel("Settle s:"), 4, 0)
-        self._exp_settle_edit = QLineEdit("0.5")
-        mag_grid.addWidget(self._exp_settle_edit, 4, 1)
-        mag_grid.addWidget(QLabel("Hold s:"), 4, 2)
-        self._exp_hold_edit = QLineEdit("1.0")
-        mag_grid.addWidget(self._exp_hold_edit, 4, 3)
+        # Settle/Hold 使用 TimeUnitSelector (base unit: s)
+        self._exp_settle_selector = TimeUnitSelector(0.5)
+        self._exp_hold_selector = TimeUnitSelector(1.0)
+        mag_grid.addWidget(QLabel("Settle:"), 4, 0)
+        mag_grid.addWidget(self._exp_settle_selector, 4, 1)
+        mag_grid.addWidget(QLabel("Hold:"), 4, 2)
+        mag_grid.addWidget(self._exp_hold_selector, 4, 3)
         layout.addWidget(mag)
 
         acq = QGroupBox("OE1022D 采集触发 / Lock-in Acquisition Trigger")
@@ -1421,16 +1471,56 @@ class ODMRControlGUI(QMainWindow):
         acq_grid.addWidget(self._exp_lockin_channel, 1, 1)
         layout.addWidget(acq)
 
+        # --- Quick Generation ---
+        quick_group = QGroupBox("快速生成 / Quick Generate")
+        quick_layout = QHBoxLayout(quick_group)
+        for text, cb in (
+            ("Bxyz 网格扫描", self._exp_quick_generate_bxyz),
+            ("B-theta-phi 向量扫描", self._exp_quick_generate_vector),
+            ("ODMR 扫频", self._exp_quick_generate_odmr),
+        ):
+            btn = QPushButton(text)
+            btn.clicked.connect(cb)
+            quick_layout.addWidget(btn)
+        quick_layout.addStretch()
+        layout.addWidget(quick_group)
+
+        # --- Step List ---
+        self._exp_steps: List[Dict[str, Any]] = []
+
+        step_group = QGroupBox("步骤列表 / Step List")
+        step_layout = QVBoxLayout(step_group)
+
         self._exp_step_table = QTableWidget(0, 8)
         self._exp_step_table.setHorizontalHeaderLabels(["#", "Name", "Bx", "By", "Bz", "MW", "Start", "Stop"])
         self._exp_step_table.setMinimumHeight(180)
-        layout.addWidget(self._exp_step_table)
+        self._exp_step_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._exp_step_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._exp_step_table.doubleClicked.connect(lambda: self._exp_edit_selected_step())
+        step_layout.addWidget(self._exp_step_table)
 
+        step_btns = QHBoxLayout()
+        for text, cb in (
+            ("添加 / Add", self._exp_add_step),
+            ("删除 / Delete", self._exp_delete_selected_step),
+            ("编辑 / Edit", self._exp_edit_selected_step),
+            ("上移 / Up", self._exp_move_step_up),
+            ("下移 / Down", self._exp_move_step_down),
+        ):
+            btn = QPushButton(text)
+            btn.clicked.connect(cb)
+            step_btns.addWidget(btn)
+        step_btns.addStretch()
+        step_layout.addLayout(step_btns)
+        layout.addWidget(step_group)
+
+        # --- Import/Export and Control ---
         buttons = QHBoxLayout()
         for text, cb, primary in (
-            ("生成 JSON / Generate", self._exp_generate_preview, True),
-            ("加载 JSON / Load", self._exp_load_json, False),
-            ("保存 JSON / Save", self._exp_save_json, False),
+            ("导入步骤 / Import Steps", self._exp_import_steps, False),
+            ("导出步骤 / Export Steps", self._exp_export_steps, False),
+            ("加载方案 / Load Plan", self._exp_load_json, False),
+            ("保存方案 / Save Plan", self._exp_save_json, False),
             ("校验 / Validate", self._exp_validate_plan, False),
             ("启动 / Start", self._exp_start_plan, True),
             ("暂停 / Pause", lambda: self._submit_experiment_command(CommandType.EXPERIMENT_PAUSE, {}, "experiment_pause"), False),
@@ -1453,7 +1543,6 @@ class ODMRControlGUI(QMainWindow):
         layout.addWidget(self._exp_json_preview)
 
         self._exp_apply_mode_defaults()
-        self._exp_generate_preview()
         page.setWidget(inner)
         return page
 
@@ -1465,13 +1554,13 @@ class ODMRControlGUI(QMainWindow):
             self._exp_acq_start_combo.setCurrentText("microwave_sweep_start")
             self._exp_acq_stop_combo.setCurrentText("microwave_sweep_complete")
             self._exp_field_mode.setCurrentText("Bxyz 网格")
-            self._exp_hold_edit.setText(self._estimate_mw_sweep_seconds())
+            self._exp_hold_selector.set_value_in_base_unit(float(self._estimate_mw_sweep_seconds()))
         elif "全光" in mode:
             self._exp_mw_enable.setChecked(False)
             self._exp_field_mode.setCurrentText("B-theta-phi 向量")
             self._exp_acq_start_combo.setCurrentText("magnetic_settled")
             self._exp_acq_stop_combo.setCurrentText("hold_elapsed")
-            self._exp_hold_edit.setText("1.0")
+            self._exp_hold_selector.set_value_in_base_unit(1.0)
             self._exp_name_edit.setText("all_optical_nv_current_calibration")
         else:
             self._exp_mw_enable.setChecked(False)
@@ -1500,92 +1589,57 @@ class ODMRControlGUI(QMainWindow):
 
     def _estimate_mw_sweep_seconds(self) -> str:
         try:
-            start = float(self._exp_mw_start.text())
-            stop = float(self._exp_mw_stop.text())
-            step = float(self._exp_mw_step.text())
-            dwell_ms = float(self._exp_mw_dwell.text())
-            points = len(self._exp_float_series(start, stop, step))
-            return f"{max(points * dwell_ms / 1000.0, 0.05):.3f}"
+            start_hz = self._exp_mw_start_selector.value_in_base_unit()
+            stop_hz = self._exp_mw_stop_selector.value_in_base_unit()
+            step_hz = self._exp_mw_step_selector.value_in_base_unit()
+            dwell_s = self._exp_mw_dwell_selector.value_in_base_unit()
+            points = len(self._exp_float_series(start_hz, stop_hz, step_hz))
+            return f"{max(points * dwell_s, 0.05):.3f}"
         except Exception:
             return "1.0"
 
     def _exp_generate_plan(self) -> Dict[str, Any]:
-        mode = self._exp_mode_combo.currentText()
-        field_mode = self._exp_field_mode.currentText()
+        """Build experiment plan from self._exp_steps with defaults applied."""
+        output_dir = self._exp_output_dir.text().strip() or "./experiments"
+        settle_s = self._exp_settle_selector.value_in_base_unit()
+        hold_s = self._exp_hold_selector.value_in_base_unit()
         start_trigger = self._exp_acq_start_combo.currentText()
         stop_trigger = self._exp_acq_stop_combo.currentText()
-        output_dir = self._exp_output_dir.text().strip() or "./experiments"
-        settle_s = float(self._exp_settle_edit.text())
-        hold_s = float(self._exp_hold_edit.text())
-        if self._exp_mw_enable.isChecked():
-            hold_s = max(hold_s, float(self._estimate_mw_sweep_seconds()))
-
-        fields = []
-        if field_mode.startswith("Bxyz"):
-            xs = self._exp_float_series(float(self._exp_x_start.text()), float(self._exp_x_stop.text()), float(self._exp_x_step.text()))
-            ys = self._exp_float_series(float(self._exp_y_start.text()), float(self._exp_y_stop.text()), float(self._exp_y_step.text()))
-            zs = self._exp_float_series(float(self._exp_z_start.text()), float(self._exp_z_stop.text()), float(self._exp_z_step.text()))
-            for x in xs:
-                for y in ys:
-                    for z in zs:
-                        fields.append({"x_nT": x, "y_nT": y, "z_nT": z})
-        else:
-            bs = self._exp_float_series(float(self._exp_b_start.text()), float(self._exp_b_stop.text()), float(self._exp_b_step.text()))
-            thetas = self._exp_float_series(float(self._exp_theta_start.text()), float(self._exp_theta_stop.text()), float(self._exp_theta_step.text()))
-            phis = self._exp_float_series(float(self._exp_phi_start.text()), float(self._exp_phi_stop.text()), float(self._exp_phi_step.text()))
-            for b in bs:
-                for theta in thetas:
-                    for phi in phis:
-                        fields.append({"magnitude_nT": b, "theta_deg": theta, "phi_deg": phi})
-
-        microwave = None
-        if self._exp_mw_enable.isChecked():
-            microwave = {
-                "power_dbm": float(self._exp_mw_power.text()),
-                "rf_output": self._exp_mw_rf_output.isChecked(),
-                "sweep": {
-                    "start_hz": float(self._exp_mw_start.text()),
-                    "stop_hz": float(self._exp_mw_stop.text()),
-                    "step_hz": float(self._exp_mw_step.text()),
-                    "dwell_ms": float(self._exp_mw_dwell.text()),
-                    "shape": "SAWTOOTH",
-                    "spacing": "LIN",
-                    "trigger": "IMM",
-                    "execute": self._exp_mw_execute.isChecked(),
-                },
-            }
+        lockin_ch = int(self._exp_lockin_channel.currentText())
+        record = self._exp_record_check.isChecked()
 
         steps = []
-        for idx, field in enumerate(fields):
-            step_name = f"{'odmr' if microwave else 'optical'}_{idx + 1:04d}"
-            step = {
-                "name": step_name,
-                "magnetic_field": field,
-                "timing": {"settle_s": settle_s, "hold_s": hold_s, "trigger": "immediate"},
-                "lockin": {"channel": int(self._exp_lockin_channel.currentText())},
-                "acquisition": {
-                    "start_recording": self._exp_record_check.isChecked(),
-                    "stop_recording": self._exp_record_check.isChecked(),
-                    "start_trigger": start_trigger,
-                    "stop_trigger": stop_trigger,
-                    "output_dir": str(Path(output_dir) / step_name),
-                    "stop_acquire": False,
-                },
-            }
-            if microwave is not None:
-                step["microwave"] = microwave
-            steps.append(step)
+        for idx, step in enumerate(self._exp_steps):
+            s = dict(step)  # shallow copy
+            s.setdefault("name", f"step_{idx + 1:04d}")
+            # Timing defaults
+            timing = s.setdefault("timing", {})
+            timing.setdefault("settle_s", settle_s)
+            timing.setdefault("hold_s", hold_s)
+            timing.setdefault("trigger", "immediate")
+            # Acquisition defaults
+            acq = s.setdefault("acquisition", {})
+            acq.setdefault("start_recording", record)
+            acq.setdefault("stop_recording", record)
+            acq.setdefault("start_trigger", start_trigger)
+            acq.setdefault("stop_trigger", stop_trigger)
+            acq.setdefault("output_dir", str(Path(output_dir) / s.get("name", f"step_{idx + 1:04d}")))
+            acq.setdefault("stop_acquire", False)
+            # Lockin defaults
+            lockin = s.setdefault("lockin", {})
+            lockin.setdefault("channel", lockin_ch)
+            steps.append(s)
 
         return {
             "metadata": {
                 "name": self._exp_name_edit.text().strip() or "nv_experiment",
                 "domain": "diamond_nv_odmr_all_optical",
-                "mode": mode,
+                "mode": self._exp_mode_combo.currentText(),
                 "generated_by": "odmr-control-gui",
             },
             "devices": {
-                "smb100a": {"enabled": self._exp_mw_enable.isChecked()},
-                "lockin": {"model": "OE1022D", "channel": int(self._exp_lockin_channel.currentText())},
+                "smb100a": {"enabled": any("microwave" in s for s in steps)},
+                "lockin": {"model": "OE1022D", "channel": lockin_ch},
                 "magnetic_field": {"axes": ["X", "Y", "Z"]},
             },
             "defaults": {"settle_s": settle_s, "hold_s": hold_s},
@@ -1594,24 +1648,27 @@ class ODMRControlGUI(QMainWindow):
             "safety": {"on_error": "rf_off_mag_off_stop_recording"},
         }
 
-    def _exp_populate_step_table(self, plan: Dict[str, Any]) -> None:
-        steps = plan.get("sequence", {}).get("steps", [])
+    def _exp_rebuild_table(self) -> None:
+        """Rebuild step table from self._exp_steps."""
         self._exp_step_table.setRowCount(0)
-        for idx, step in enumerate(steps[:200]):
+        for idx, step in enumerate(self._exp_steps[:200]):
             self._exp_step_table.insertRow(idx)
             field = self._resolve_preview_field(step.get("magnetic_field", {}))
+            has_mw = "microwave" in step
             values = [
                 idx + 1,
                 step.get("name", ""),
                 f"{field.get('x_nT', 0):.3g}",
                 f"{field.get('y_nT', 0):.3g}",
                 f"{field.get('z_nT', 0):.3g}",
-                "sweep" if "microwave" in step else "off",
+                "sweep" if has_mw else "off",
                 step.get("acquisition", {}).get("start_trigger", ""),
                 step.get("acquisition", {}).get("stop_trigger", ""),
             ]
             for col, value in enumerate(values):
                 self._exp_step_table.setItem(idx, col, QTableWidgetItem(str(value)))
+        count = len(self._exp_steps)
+        self._exp_status_label.setText(f"步骤列表: {count} 步 / {count} steps")
 
     @staticmethod
     def _resolve_preview_field(field: Dict[str, Any]) -> Dict[str, float]:
@@ -1629,18 +1686,22 @@ class ODMRControlGUI(QMainWindow):
         }
 
     def _exp_generate_preview(self) -> None:
+        """Build plan from step list and show in preview."""
         try:
             plan = self._exp_generate_plan()
             self._exp_json_preview.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
-            self._exp_populate_step_table(plan)
-            self._exp_status_label.setText(f"Generated: {len(plan['sequence']['steps'])} steps")
+            self._exp_rebuild_table()
         except Exception as exc:
-            QMessageBox.warning(self, "Experiment JSON Error", str(exc))
+            QMessageBox.warning(self, "实验 JSON 错误 / Experiment JSON Error", str(exc))
 
     def _exp_current_plan(self) -> Dict[str, Any]:
+        """Get current plan: prefer JSON preview text, fallback to building from steps."""
         text = self._exp_json_preview.toPlainText().strip()
         if text:
-            return json.loads(text)
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                pass
         return self._exp_generate_plan()
 
     def _exp_validate_plan(self) -> None:
@@ -1658,25 +1719,461 @@ class ODMRControlGUI(QMainWindow):
             QMessageBox.warning(self, "Start Error", str(exc))
 
     def _exp_save_json(self) -> None:
+        """Save the full experiment plan as JSON."""
         try:
-            self._exp_generate_preview()
-            path, _ = QFileDialog.getSaveFileName(self, "Save Experiment JSON", "", "JSON Files (*.json);;All Files (*)")
+            plan = self._exp_generate_plan()
+            self._exp_json_preview.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
+            path, _ = QFileDialog.getSaveFileName(self, "保存实验方案 / Save Experiment JSON", "", "JSON Files (*.json);;All Files (*)")
             if path:
-                Path(path).write_text(self._exp_json_preview.toPlainText(), encoding="utf-8")
+                Path(path).write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+                self._exp_status_label.setText(f"保存: {path}")
         except Exception as exc:
-            QMessageBox.warning(self, "Save Error", str(exc))
+            QMessageBox.warning(self, "保存错误 / Save Error", str(exc))
 
     def _exp_load_json(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load Experiment JSON", "", "JSON Files (*.json);;All Files (*)")
+        """Load experiment plan from JSON file and populate step list."""
+        path, _ = QFileDialog.getOpenFileName(self, "加载实验方案 / Load Experiment JSON", "", "JSON Files (*.json);;All Files (*)")
         if not path:
             return
         try:
             plan = json.loads(Path(path).read_text(encoding="utf-8"))
-            self._exp_json_preview.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
-            self._exp_populate_step_table(plan)
-            self._exp_status_label.setText(f"Loaded: {path}")
+            # Extract steps from plan (support both plan format and raw step list)
+            seq = plan.get("sequence", {})
+            if isinstance(seq, dict):
+                self._exp_steps = list(seq.get("steps", []))
+            elif isinstance(seq, list):
+                self._exp_steps = list(seq)
+            else:
+                self._exp_steps = []
+            # Update profile from metadata
+            metadata = plan.get("metadata", {})
+            if "name" in metadata:
+                self._exp_name_edit.setText(metadata["name"])
+            self._exp_rebuild_table()
+            self._exp_sync_plan_preview()
+            self._exp_status_label.setText(f"加载: {len(self._exp_steps)} 步 / Loaded from {path}")
         except Exception as exc:
-            QMessageBox.warning(self, "Load Error", str(exc))
+            QMessageBox.warning(self, "加载错误 / Load Error", str(exc))
+
+    # --- Step list quick generation ---
+
+    def _exp_quick_generate_bxyz(self) -> None:
+        """Generate Bxyz grid scan steps from current GUI parameters."""
+        xs = self._exp_float_series(
+            self._exp_field_selectors["X"]["start"].value_in_base_unit(),
+            self._exp_field_selectors["X"]["stop"].value_in_base_unit(),
+            self._exp_field_selectors["X"]["step"].value_in_base_unit(),
+        )
+        ys = self._exp_float_series(
+            self._exp_field_selectors["Y"]["start"].value_in_base_unit(),
+            self._exp_field_selectors["Y"]["stop"].value_in_base_unit(),
+            self._exp_field_selectors["Y"]["step"].value_in_base_unit(),
+        )
+        zs = self._exp_float_series(
+            self._exp_field_selectors["Z"]["start"].value_in_base_unit(),
+            self._exp_field_selectors["Z"]["stop"].value_in_base_unit(),
+            self._exp_field_selectors["Z"]["step"].value_in_base_unit(),
+        )
+
+        self._exp_steps = []
+        idx = 0
+        for x in xs:
+            for y in ys:
+                for z in zs:
+                    idx += 1
+                    self._exp_steps.append({
+                        "name": f"bxyz_{idx:04d}",
+                        "magnetic_field": {"x_nT": x, "y_nT": y, "z_nT": z},
+                    })
+        self._exp_rebuild_table()
+        self._exp_sync_plan_preview()
+
+    def _exp_quick_generate_vector(self) -> None:
+        """Generate B-theta-phi vector scan steps from current GUI parameters."""
+        bs = self._exp_float_series(
+            self._exp_b_selectors["start"].value_in_base_unit(),
+            self._exp_b_selectors["stop"].value_in_base_unit(),
+            self._exp_b_selectors["step"].value_in_base_unit(),
+        )
+        thetas = self._exp_float_series(float(self._exp_theta_start.text()), float(self._exp_theta_stop.text()), float(self._exp_theta_step.text()))
+        phis = self._exp_float_series(float(self._exp_phi_start.text()), float(self._exp_phi_stop.text()), float(self._exp_phi_step.text()))
+
+        self._exp_steps = []
+        idx = 0
+        for b in bs:
+            for theta in thetas:
+                for phi in phis:
+                    idx += 1
+                    self._exp_steps.append({
+                        "name": f"vector_{idx:04d}",
+                        "magnetic_field": {"magnitude_nT": b, "theta_deg": theta, "phi_deg": phi},
+                    })
+        self._exp_rebuild_table()
+        self._exp_sync_plan_preview()
+
+    def _exp_quick_generate_odmr(self) -> None:
+        """Generate ODMR sweep steps with Bxyz grid from current GUI parameters."""
+        xs = self._exp_float_series(
+            self._exp_field_selectors["X"]["start"].value_in_base_unit(),
+            self._exp_field_selectors["X"]["stop"].value_in_base_unit(),
+            self._exp_field_selectors["X"]["step"].value_in_base_unit(),
+        )
+        ys = self._exp_float_series(
+            self._exp_field_selectors["Y"]["start"].value_in_base_unit(),
+            self._exp_field_selectors["Y"]["stop"].value_in_base_unit(),
+            self._exp_field_selectors["Y"]["step"].value_in_base_unit(),
+        )
+        zs = self._exp_float_series(
+            self._exp_field_selectors["Z"]["start"].value_in_base_unit(),
+            self._exp_field_selectors["Z"]["stop"].value_in_base_unit(),
+            self._exp_field_selectors["Z"]["step"].value_in_base_unit(),
+        )
+
+        microwave = {
+            "power_dbm": self._exp_mw_power_selector.value_in_base_unit(),
+            "rf_output": self._exp_mw_rf_output.isChecked(),
+            "sweep": {
+                "start_hz": self._exp_mw_start_selector.value_in_base_unit(),
+                "stop_hz": self._exp_mw_stop_selector.value_in_base_unit(),
+                "step_hz": self._exp_mw_step_selector.value_in_base_unit(),
+                "dwell_ms": self._exp_mw_dwell_selector.value_in_base_unit() * 1000,  # s -> ms
+                "shape": "SAWTOOTH",
+                "spacing": "LIN",
+                "trigger": "IMM",
+                "execute": self._exp_mw_execute.isChecked(),
+            },
+        }
+
+        self._exp_steps = []
+        idx = 0
+        for x in xs:
+            for y in ys:
+                for z in zs:
+                    idx += 1
+                    self._exp_steps.append({
+                        "name": f"odmr_{idx:04d}",
+                        "magnetic_field": {"x_nT": x, "y_nT": y, "z_nT": z},
+                        "microwave": dict(microwave),
+                    })
+        self._exp_rebuild_table()
+        self._exp_sync_plan_preview()
+
+    # --- Step list management ---
+
+    def _exp_add_step(self) -> None:
+        """Add a new blank step to the step list."""
+        idx = len(self._exp_steps) + 1
+        self._exp_steps.append({
+            "name": f"step_{idx:04d}",
+            "magnetic_field": {"x_nT": 0, "y_nT": 0, "z_nT": 0},
+        })
+        self._exp_rebuild_table()
+        self._exp_sync_plan_preview()
+
+    def _exp_delete_selected_step(self) -> None:
+        """Delete the currently selected step."""
+        row = self._exp_step_table.currentRow()
+        if 0 <= row < len(self._exp_steps):
+            self._exp_steps.pop(row)
+            self._exp_rebuild_table()
+            self._exp_sync_plan_preview()
+
+    def _exp_edit_selected_step(self) -> None:
+        """Open editor dialog for the currently selected step."""
+        row = self._exp_step_table.currentRow()
+        if 0 <= row < len(self._exp_steps):
+            self._exp_open_step_editor(row)
+
+    def _exp_move_step_up(self) -> None:
+        """Move the selected step one position up."""
+        row = self._exp_step_table.currentRow()
+        if row > 0:
+            self._exp_steps[row], self._exp_steps[row - 1] = self._exp_steps[row - 1], self._exp_steps[row]
+            self._exp_rebuild_table()
+            self._exp_step_table.setCurrentCell(row - 1, 0)
+            self._exp_sync_plan_preview()
+
+    def _exp_move_step_down(self) -> None:
+        """Move the selected step one position down."""
+        row = self._exp_step_table.currentRow()
+        if 0 <= row < len(self._exp_steps) - 1:
+            self._exp_steps[row], self._exp_steps[row + 1] = self._exp_steps[row + 1], self._exp_steps[row]
+            self._exp_rebuild_table()
+            self._exp_step_table.setCurrentCell(row + 1, 0)
+            self._exp_sync_plan_preview()
+
+    def _exp_sync_plan_preview(self) -> None:
+        """Build plan from step list and update the JSON preview."""
+        try:
+            plan = self._exp_generate_plan()
+            self._exp_json_preview.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            self._exp_status_label.setText(f"Preview error: {exc}")
+
+    def _exp_open_step_editor(self, step_idx: int) -> None:
+        """Open a dialog to edit a single step's properties."""
+        step = self._exp_steps[step_idx]
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"编辑步骤 / Edit Step: {step.get('name', '')}")
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        dlg.setMinimumWidth(600)
+        form = QVBoxLayout(dlg)
+
+        grid = QGridLayout()
+        row = 0
+
+        # Name
+        grid.addWidget(QLabel("名称:"), row, 0)
+        name_edit = QLineEdit(step.get("name", ""))
+        grid.addWidget(name_edit, row, 1, 1, 3)
+        row += 1
+
+        # Magnetic field - Cartesian
+        grid.addWidget(QLabel("--- 磁场 Cartesian ---"), row, 0, 1, 4)
+        row += 1
+        mf = step.get("magnetic_field", {})
+        field_selectors: Dict[str, QWidget] = {}
+        for axis in ("x_nT", "y_nT", "z_nT"):
+            grid.addWidget(QLabel(f"{axis}:"), row, 0)
+            selector = MagneticFieldUnitSelector(float(mf.get(axis, 0) or 0))
+            field_selectors[axis] = selector
+            grid.addWidget(selector, row, 1, 1, 2)
+            row += 1
+        # Magnetic field - Spherical
+        grid.addWidget(QLabel("--- 磁场 Spherical ---"), row, 0, 1, 4)
+        row += 1
+        for key in ("magnitude_nT", "theta_deg", "phi_deg"):
+            grid.addWidget(QLabel(f"{key}:"), row, 0)
+            if key == "magnitude_nT":
+                selector = MagneticFieldUnitSelector(float(mf.get(key, 0) or 0))
+                field_selectors[key] = selector
+                grid.addWidget(selector, row, 1, 1, 2)
+            else:
+                edit = QLineEdit(str(mf.get(key, "")))
+                edit.setValidator(QDoubleValidator())
+                field_selectors[key] = edit
+                grid.addWidget(edit, row, 1)
+            row += 1
+
+        # Microwave
+        grid.addWidget(QLabel("--- 微波 / Microwave ---"), row, 0, 1, 4)
+        row += 1
+        mw = step.get("microwave", {})
+        mw_enable = QCheckBox("启用微波 / Enable MW")
+        mw_enable.setChecked(bool(mw))
+        grid.addWidget(mw_enable, row, 0, 1, 2)
+        row += 1
+        grid.addWidget(QLabel("功率 / Power:"), row, 0)
+        mw_power_selector = PowerUnitSelector(float(mw.get("power_dbm", -30)))
+        grid.addWidget(mw_power_selector, row, 1, 1, 2)
+        row += 1
+        sweep = mw.get("sweep", {})
+        sweep_selectors: Dict[str, UnitSelector] = {}
+        for key, label, default in [
+            ("start_hz", "扫频起始 / Start:", 2.82e9),
+            ("stop_hz", "扫频终止 / Stop:", 2.92e9),
+            ("step_hz", "扫频步进 / Step:", 1e6),
+            ("dwell_ms", "驻留时间 / Dwell:", 50e-3),
+        ]:
+            grid.addWidget(QLabel(label), row, 0)
+            if key == "dwell_ms":
+                selector = TimeUnitSelector(float(sweep.get(key, default) or default))
+            else:
+                selector = FrequencyUnitSelector(float(sweep.get(key, default) or default))
+            sweep_selectors[key] = selector
+            grid.addWidget(selector, row, 1, 1, 2)
+            row += 1
+
+        # Timing
+        grid.addWidget(QLabel("--- 时序 / Timing ---"), row, 0, 1, 4)
+        row += 1
+        timing = step.get("timing", {})
+        grid.addWidget(QLabel("稳定时间 / Settle:"), row, 0)
+        settle_selector = TimeUnitSelector(float(timing.get("settle_s", 0.5)))
+        grid.addWidget(settle_selector, row, 1, 1, 2)
+        row += 1
+        grid.addWidget(QLabel("保持时间 / Hold:"), row, 0)
+        hold_selector = TimeUnitSelector(float(timing.get("hold_s", 1.0)))
+        grid.addWidget(hold_selector, row, 1, 1, 2)
+        row += 1
+
+        # Acquisition
+        grid.addWidget(QLabel("--- 采集 / Acquisition ---"), row, 0, 1, 4)
+        row += 1
+        acq = step.get("acquisition", {})
+        acq_enable = QCheckBox("启用采集 / Enable Acquisition")
+        acq_enable.setChecked(bool(acq))
+        grid.addWidget(acq_enable, row, 0, 1, 2)
+        row += 1
+
+        grid.addWidget(QLabel("Start trigger:"), row, 0)
+        acq_start_combo = QComboBox()
+        acq_start_combo.addItems([
+            "step_start", "setpoints_applied", "magnetic_settled",
+            "microwave_output_on", "microwave_sweep_start", "disabled",
+        ])
+        acq_start_combo.setCurrentText(acq.get("start_trigger", "step_start"))
+        grid.addWidget(acq_start_combo, row, 1)
+        row += 1
+
+        grid.addWidget(QLabel("Stop trigger:"), row, 0)
+        acq_stop_combo = QComboBox()
+        acq_stop_combo.addItems([
+            "hold_elapsed", "timed", "microwave_sweep_complete",
+            "manual", "step_end", "disabled",
+        ])
+        acq_stop_combo.setCurrentText(acq.get("stop_trigger", "hold_elapsed"))
+        grid.addWidget(acq_stop_combo, row, 1)
+        row += 1
+
+        start_rec_check = QCheckBox("启动录制 / Start recording")
+        start_rec_check.setChecked(acq.get("start_recording", True))
+        grid.addWidget(start_rec_check, row, 0, 1, 2)
+        row += 1
+
+        stop_rec_check = QCheckBox("停止录制 / Stop recording")
+        stop_rec_check.setChecked(acq.get("stop_recording", True))
+        grid.addWidget(stop_rec_check, row, 0, 1, 2)
+        row += 1
+
+        grid.addWidget(QLabel("录制列组 / Column groups:"), row, 0, 1, 4)
+        row += 1
+        from data.recorder import ALL_COLUMN_GROUPS
+        col_group_checks: Dict[str, QCheckBox] = {}
+        saved_groups = acq.get("column_groups", ALL_COLUMN_GROUPS)
+        for g_idx, group in enumerate(ALL_COLUMN_GROUPS):
+            cb = QCheckBox(group)
+            cb.setChecked(group in saved_groups)
+            col_group_checks[group] = cb
+            grid.addWidget(cb, row, g_idx % 4)
+            if g_idx % 4 == 3:
+                row += 1
+        if len(ALL_COLUMN_GROUPS) % 4 != 0:
+            row += 1
+
+        # Lock-in
+        grid.addWidget(QLabel("--- 锁相 / Lock-in ---"), row, 0, 1, 4)
+        row += 1
+        lockin = step.get("lockin", {})
+        grid.addWidget(QLabel("Channel:"), row, 0)
+        lockin_ch_combo = QComboBox()
+        lockin_ch_combo.addItems(["1", "2"])
+        lockin_ch_combo.setCurrentText(str(lockin.get("channel", 1)))
+        grid.addWidget(lockin_ch_combo, row, 1)
+        row += 1
+
+        form.addLayout(grid)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addWidget(buttons)
+
+        if dlg.exec_() == QDialog.Accepted:
+            # Update step name
+            step["name"] = name_edit.text().strip() or step.get("name", "unnamed")
+
+            # Update magnetic field
+            new_mf: Dict[str, float] = {}
+            for axis in ("x_nT", "y_nT", "z_nT"):
+                val = field_selectors[axis].value_in_base_unit()
+                if val != 0.0:
+                    new_mf[axis] = val
+            magnitude = field_selectors["magnitude_nT"].value_in_base_unit()
+            if magnitude != 0.0:
+                new_mf["magnitude_nT"] = magnitude
+            for key in ("theta_deg", "phi_deg"):
+                widget = field_selectors[key]
+                if isinstance(widget, QLineEdit):
+                    val = widget.text().strip()
+                    if val:
+                        new_mf[key] = float(val)
+            step["magnetic_field"] = new_mf
+
+            # Update microwave
+            if mw_enable.isChecked():
+                mw_cfg: Dict[str, Any] = {"power_dbm": mw_power_selector.value_in_base_unit()}
+                sweep_cfg: Dict[str, Any] = {}
+                for key, selector in sweep_selectors.items():
+                    val = selector.value_in_base_unit()
+                    if key == "dwell_ms":
+                        # TimeUnitSelector 基础单位是秒，sweep_cfg 需要毫秒
+                        sweep_cfg[key] = val * 1000.0
+                    else:
+                        sweep_cfg[key] = val
+                if sweep_cfg:
+                    sweep_cfg["shape"] = "SAWTOOTH"
+                    sweep_cfg["spacing"] = "LIN"
+                    sweep_cfg["trigger"] = "IMM"
+                    sweep_cfg["execute"] = True
+                    mw_cfg["sweep"] = sweep_cfg
+                step["microwave"] = mw_cfg
+            else:
+                step.pop("microwave", None)
+
+            # Update timing
+            step["timing"] = {
+                "settle_s": settle_selector.value_in_base_unit(),
+                "hold_s": hold_selector.value_in_base_unit(),
+                "trigger": "immediate",
+            }
+
+            # Update acquisition
+            if acq_enable.isChecked():
+                selected_groups = [g for g, cb in col_group_checks.items() if cb.isChecked()]
+                step["acquisition"] = {
+                    "start_trigger": acq_start_combo.currentText(),
+                    "stop_trigger": acq_stop_combo.currentText(),
+                    "start_recording": start_rec_check.isChecked(),
+                    "stop_recording": stop_rec_check.isChecked(),
+                }
+                if selected_groups and set(selected_groups) != set(ALL_COLUMN_GROUPS):
+                    step["acquisition"]["column_groups"] = selected_groups
+            else:
+                step.pop("acquisition", None)
+
+            # Update lock-in
+            step["lockin"] = {"channel": int(lockin_ch_combo.currentText())}
+
+            self._exp_steps[step_idx] = step
+            self._exp_rebuild_table()
+            self._exp_sync_plan_preview()
+
+    def _exp_import_steps(self) -> None:
+        """Import step list from a JSON file (raw list or plan format)."""
+        path, _ = QFileDialog.getOpenFileName(self, "导入步骤 / Import Steps", "", "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                self._exp_steps = data
+            elif isinstance(data, dict):
+                seq = data.get("sequence", {})
+                if isinstance(seq, dict):
+                    self._exp_steps = seq.get("steps", [])
+                elif isinstance(seq, list):
+                    self._exp_steps = seq
+                else:
+                    self._exp_steps = data.get("steps", [])
+            self._exp_rebuild_table()
+            self._exp_sync_plan_preview()
+            self._exp_status_label.setText(f"导入: {len(self._exp_steps)} 步 / Imported from {path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "导入错误 / Import Error", str(exc))
+
+    def _exp_export_steps(self) -> None:
+        """Export the step list to a JSON file."""
+        if not self._exp_steps:
+            QMessageBox.warning(self, "导出错误 / Export Error", "步骤列表为空 / Step list is empty")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "导出步骤 / Export Steps", "", "JSON Files (*.json);;All Files (*)")
+        if path:
+            try:
+                Path(path).write_text(json.dumps(self._exp_steps, ensure_ascii=False, indent=2), encoding="utf-8")
+                self._exp_status_label.setText(f"导出: {len(self._exp_steps)} 步 / Exported to {path}")
+            except Exception as exc:
+                QMessageBox.warning(self, "导出错误 / Export Error", str(exc))
 
     def _submit_experiment_command(self, cmd_type: CommandType, params: Dict[str, Any], op: str) -> None:
         if self._cmd_service is not None:
@@ -1740,12 +2237,12 @@ class ODMRControlGUI(QMainWindow):
         # -- RF Frequency ------------------------------------------------------
         freq_group = QGroupBox("RF 频率 / Frequency")
         freq_layout = QGridLayout(freq_group)
-        freq_layout.addWidget(QLabel("CW 频率 (Hz):"), 0, 0)
-        self._cw_freq_edit = QLineEdit(str(cfg_sweep["cw_freq_hz"]))
-        freq_layout.addWidget(self._cw_freq_edit, 0, 1)
+        freq_layout.addWidget(QLabel("CW 频率:"), 0, 0)
+        self._cw_freq_selector = FrequencyUnitSelector(cfg_sweep["cw_freq_hz"])
+        freq_layout.addWidget(self._cw_freq_selector, 0, 1)
         btn = QPushButton("设 / Set")
         btn.setObjectName("primaryBtn")
-        btn.clicked.connect(lambda: self._set_cw_freq(self._cw_freq_edit.text()))
+        btn.clicked.connect(self._set_cw_freq)
         freq_layout.addWidget(btn, 0, 2)
         freq_layout.addWidget(QLabel("相位 (deg):"), 1, 0)
         self._rf_phase_edit = QLineEdit("0")
@@ -1759,16 +2256,16 @@ class ODMRControlGUI(QMainWindow):
         # -- RF Power (with safety limit display) ------------------------------
         power_group = QGroupBox("RF 功率 / Level")
         power_layout = QGridLayout(power_group)
-        power_layout.addWidget(QLabel("功率 (dBm):"), 0, 0)
-        self._power_edit = QLineEdit(str(cfg_sweep["power_dbm"]))
-        self._power_edit.textChanged.connect(self._on_power_text_changed)
-        power_layout.addWidget(self._power_edit, 0, 1)
+        power_layout.addWidget(QLabel("功率:"), 0, 0)
+        self._power_selector = PowerUnitSelector(cfg_sweep["power_dbm"])
+        self._power_selector.value_changed.connect(self._on_power_value_changed)
+        power_layout.addWidget(self._power_selector, 0, 1)
         self._power_limit_label = QLabel(f"Max: {self._max_power_dbm:.0f} dBm")
         self._power_limit_label.setStyleSheet("color: #666; font-size: 11px;")
         power_layout.addWidget(self._power_limit_label, 0, 2)
         btn = QPushButton("设 / Set")
         btn.setObjectName("primaryBtn")
-        btn.clicked.connect(lambda: self._set_power(self._power_edit.text()))
+        btn.clicked.connect(self._set_power)
         power_layout.addWidget(btn, 0, 3)
         # Amplifier note
         amp_note = QLabel(
@@ -1801,12 +2298,12 @@ class ODMRControlGUI(QMainWindow):
         # -- LF Generator ------------------------------------------------------
         lf_group = QGroupBox("LF 发生器 / LF Generator")
         lf_layout = QGridLayout(lf_group)
-        lf_layout.addWidget(QLabel("LF 频率 (Hz):"), 0, 0)
-        self._lf_freq_edit = QLineEdit(str(cfg_sweep["lf_freq_hz"]))
-        lf_layout.addWidget(self._lf_freq_edit, 0, 1)
+        lf_layout.addWidget(QLabel("LF 频率:"), 0, 0)
+        self._lf_freq_selector = FrequencyUnitSelector(cfg_sweep["lf_freq_hz"])
+        lf_layout.addWidget(self._lf_freq_selector, 0, 1)
         btn = QPushButton("设 / Set")
         btn.setObjectName("primaryBtn")
-        btn.clicked.connect(lambda: self._set_lf_freq(self._lf_freq_edit.text()))
+        btn.clicked.connect(self._set_lf_freq)
         lf_layout.addWidget(btn, 0, 2)
         lf_layout.addWidget(QLabel("LF 幅度 (mV):"), 1, 0)
         self._lf_amp_edit = QLineEdit(str(cfg_sweep["lf_amp_mv"]))
@@ -1923,6 +2420,8 @@ class ODMRControlGUI(QMainWindow):
                     w = QComboBox()
                     w.addItems(args[0])
                     w.setCurrentIndex(default)
+                elif wtype == "selector":
+                    w = args[0]  # args[0] is the pre-built UnitSelector widget
                 else:
                     w = QLineEdit(str(default))
                 gl.addWidget(w, row, 1)
@@ -1959,8 +2458,8 @@ class ODMRControlGUI(QMainWindow):
             [
                 ("参考相位（-180°~+180°, 精度0.01°）\nPhase (deg)", "phase", "0", "line"),
                 ("参考信号源：外部 / 内部\nSource (0=Ext,1=Int)", "ref_source", 0, "combo", ["External", "Internal"]),
-                ("外部参考类型：正弦 / 上升沿 / 下降沿\nSlope (0=Sine,1=PosTTL,2=NegTTL)", "slope", 0, "combo", ["Sine", "Pos TTL", "Neg TTL"]),
-                ("内部参考频率（1mHz~102kHz）\nFrequency (Hz)", "freq", "1000", "line"),
+                ("外部参考触发：TTL上升沿 / TTL下降沿 / 正弦过零检测\nSlope (0=TTL Rising,1=TTL Falling,2=Sine Zero Cross)", "slope", 0, "combo", ["TTL Rising", "TTL Falling", "Sine Zero Cross"]),
+                ("内部参考频率\nFrequency", "freq", None, "selector", FrequencyUnitSelector(1000.0)),
                 ("谐波检测次数（限制: 次数×频率<102kHz）\nHarmonic", "harmonic", "1", "line"),
             ]
         )
@@ -2060,7 +2559,12 @@ class ODMRControlGUI(QMainWindow):
         w_slope = self._lockin_ref_widgets["slope"][0]
         params["slope"] = w_slope.currentIndex() if isinstance(w_slope, QComboBox) else 0
         w_freq = self._lockin_ref_widgets["freq"][0]
-        params["freq_hz"] = float(w_freq.text()) if isinstance(w_freq, QLineEdit) else 1000.0
+        if isinstance(w_freq, FrequencyUnitSelector):
+            params["freq_hz"] = w_freq.value_in_base_unit()
+        elif isinstance(w_freq, QLineEdit):
+            params["freq_hz"] = float(w_freq.text())
+        else:
+            params["freq_hz"] = 1000.0
         w_harm = self._lockin_ref_widgets["harmonic"][0]
         params["harmonic"] = int(w_harm.text()) if isinstance(w_harm, QLineEdit) else 1
         self._send_lockin_cmd(CommandType.LOCKIN_SET_REF_PHASE, params)
@@ -2383,21 +2887,21 @@ class ODMRControlGUI(QMainWindow):
         # -- Sweep parameters -------------------------------------------------
         sweep_group = QGroupBox("扫频参数 / Sweep Parameters")
         sweep_layout = QGridLayout(sweep_group)
-        sweep_layout.addWidget(QLabel("起始频率 (Hz):"), 0, 0)
-        self._start_freq_edit = QLineEdit(str(cfg_sweep["start_freq_hz"]))
-        sweep_layout.addWidget(self._start_freq_edit, 0, 1)
-        sweep_layout.addWidget(QLabel("终止频率 (Hz):"), 0, 2)
-        self._stop_freq_edit = QLineEdit(str(cfg_sweep["stop_freq_hz"]))
-        sweep_layout.addWidget(self._stop_freq_edit, 0, 3)
-        sweep_layout.addWidget(QLabel("步进 (Hz):"), 1, 0)
-        self._step_edit = QLineEdit(str(cfg_sweep["step_hz"]))
-        sweep_layout.addWidget(self._step_edit, 1, 1)
+        sweep_layout.addWidget(QLabel("起始频率:"), 0, 0)
+        self._start_freq_selector = FrequencyUnitSelector(cfg_sweep["start_freq_hz"])
+        sweep_layout.addWidget(self._start_freq_selector, 0, 1)
+        sweep_layout.addWidget(QLabel("终止频率:"), 0, 2)
+        self._stop_freq_selector = FrequencyUnitSelector(cfg_sweep["stop_freq_hz"])
+        sweep_layout.addWidget(self._stop_freq_selector, 0, 3)
+        sweep_layout.addWidget(QLabel("步进:"), 1, 0)
+        self._step_selector = FrequencyUnitSelector(cfg_sweep["step_hz"])
+        sweep_layout.addWidget(self._step_selector, 1, 1)
         sweep_layout.addWidget(QLabel("驻留 (ms):"), 1, 2)
         self._dwell_edit = QLineEdit(str(cfg_sweep["dwell_ms"]))
         sweep_layout.addWidget(self._dwell_edit, 1, 3)
-        sweep_layout.addWidget(QLabel("功率 (dBm):"), 2, 0)
-        self._sweep_power_edit = QLineEdit(str(cfg_sweep["power_dbm"]))
-        sweep_layout.addWidget(self._sweep_power_edit, 2, 1)
+        sweep_layout.addWidget(QLabel("功率:"), 2, 0)
+        self._sweep_power_selector = PowerUnitSelector(cfg_sweep["power_dbm"])
+        sweep_layout.addWidget(self._sweep_power_selector, 2, 1)
         sweep_layout.setColumnStretch(4, 1)
         layout.addWidget(sweep_group)
 
@@ -2575,6 +3079,26 @@ class ODMRControlGUI(QMainWindow):
 
     def _toggle_smb_connection(self):
         if self._ctrl.is_smb_connected:
+            # 断开前确认是否关闭输出
+            reply = QMessageBox.question(
+                self, "断开 SMB100A / Disconnect SMB100A",
+                "断开前是否关闭 RF 输出、LF 输出和调制？\n"
+                "Close RF output, LF output and modulation before disconnecting?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Yes:
+                try:
+                    if self._cmd_service is not None:
+                        req = self._cmd_service.submit(Command(CommandType.SMB_EMERGENCY_STOP, source="gui"))
+                        self._pending_cmds[req] = ("smb_emergency_stop", None)
+                    else:
+                        self._ctrl.smb.emergency_stop()
+                    self._on_log("[SMB] 已关闭 RF/LF/Modulation 输出", "smb")
+                except Exception as exc:
+                    self._on_log(f"[SMB] 关闭输出失败: {exc}", "smb")
             # Disconnect
             if self._cmd_service is not None:
                 cmd = Command(CommandType.SMB_DISCONNECT, source="gui")
@@ -2663,6 +3187,15 @@ class ODMRControlGUI(QMainWindow):
 
     def _toggle_laser_connection(self):
         if self._ctrl.is_laser_connected:
+            # 断开前确认关闭激光
+            reply = QMessageBox.question(
+                self, "断开激光器 / Disconnect Laser",
+                "断开前将关闭激光输出。\nLaser output will be turned off before disconnecting.\n\n确认断开？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
             # Disconnect
             if self._cmd_service is not None:
                 cmd = Command(CommandType.LASER_DISCONNECT, source="gui")
@@ -2856,26 +3389,21 @@ class ODMRControlGUI(QMainWindow):
         else:
             self._on_log("[E-Stop] Verification failed: " + str(result), "smb")
 
-    def _on_power_text_changed(self, text: str) -> None:
-        """功率输入框颜色警告。"""
-        try:
-            p = float(text)
-        except ValueError:
-            self._power_edit.setStyleSheet("")
-            return
+    def _on_power_value_changed(self, p: float) -> None:
+        """功率值变化时的颜色警告（基于 dBm 基础值）。"""
         ratio = p / self._max_power_dbm if self._max_power_dbm != 0 else 0
         if p > self._max_power_dbm:
-            self._power_edit.setStyleSheet("color: #e04040; font-weight: bold; border: 2px solid #e04040;")
+            self._power_selector.setStyleSheet("color: #e04040; font-weight: bold; border: 2px solid #e04040;")
         elif ratio > 0.95:
-            self._power_edit.setStyleSheet("color: #e04040; font-weight: bold;")
+            self._power_selector.setStyleSheet("color: #e04040; font-weight: bold;")
         elif ratio > 0.80:
-            self._power_edit.setStyleSheet("color: #ff8c00;")
+            self._power_selector.setStyleSheet("color: #ff8c00;")
         else:
-            self._power_edit.setStyleSheet("")
+            self._power_selector.setStyleSheet("")
 
-    def _set_power(self, val):
+    def _set_power(self):
         try:
-            p = float(val)
+            p = self._power_selector.value_in_base_unit()
             if p > self._max_power_dbm:
                 QMessageBox.warning(
                     self, "功率限制 / Power Limit",
@@ -2888,27 +3416,29 @@ class ODMRControlGUI(QMainWindow):
                 self._cmd_service.submit(cmd)
             else:
                 self._ctrl.smb.set_power(p)
-            self._on_log("Power set to " + val + " dBm", "smb")
+            self._on_log("Power set to " + str(p) + " dBm", "smb")
         except Exception as exc:
             self._on_error("Set power failed: " + str(exc))
 
-    def _set_cw_freq(self, val):
+    def _set_cw_freq(self):
         try:
+            freq_hz = self._cw_freq_selector.value_in_base_unit()
             if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_FREQUENCY, {"freq_hz": float(val)}, source="gui"))
+                self._cmd_service.submit(Command(CommandType.SMB_SET_FREQUENCY, {"freq_hz": freq_hz}, source="gui"))
             else:
-                self._ctrl.smb.set_freq_cw(float(val))
-            self._on_log("CW freq set to " + val + " Hz", "smb")
+                self._ctrl.smb.set_freq_cw(freq_hz)
+            self._on_log("CW freq set to " + str(freq_hz) + " Hz", "smb")
         except Exception as exc:
             self._on_error("Set CW freq failed: " + str(exc))
 
-    def _set_lf_freq(self, val):
+    def _set_lf_freq(self):
         try:
+            freq_hz = self._lf_freq_selector.value_in_base_unit()
             if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_LF_FREQ, {"freq_hz": float(val)}, source="gui"))
+                self._cmd_service.submit(Command(CommandType.SMB_SET_LF_FREQ, {"freq_hz": freq_hz}, source="gui"))
             else:
-                self._ctrl.smb.set_lf_freq(float(val))
-            self._on_log("LF freq set to " + val + " Hz", "smb")
+                self._ctrl.smb.set_lf_freq(freq_hz)
+            self._on_log("LF freq set to " + str(freq_hz) + " Hz", "smb")
         except Exception as exc:
             self._on_error("Set LF freq failed: " + str(exc))
 
@@ -2945,17 +3475,18 @@ class ODMRControlGUI(QMainWindow):
 
     def _apply_all_params(self):
         try:
-            p = float(self._power_edit.text())
+            p = self._power_selector.value_in_base_unit()
             if p > self._max_power_dbm:
                 QMessageBox.warning(
                     self, "功率限制 / Power Limit",
                     f"功率 {p} dBm 超过安全限制 {self._max_power_dbm} dBm"
                 )
                 return
+            lf_freq_hz = self._lf_freq_selector.value_in_base_unit()
             params = [
                 (CommandType.SMB_SET_POWER, {"power_dbm": p}),
                 (CommandType.SMB_SET_LF_VOLTAGE, {"mv": float(self._lf_amp_edit.text())}),
-                (CommandType.SMB_SET_LF_FREQ, {"freq_hz": float(self._lf_freq_edit.text())}),
+                (CommandType.SMB_SET_LF_FREQ, {"freq_hz": lf_freq_hz}),
                 (CommandType.SMB_SET_LF_SHAPE, {"shape": self._lf_shape_combo.currentText()}),
                 (CommandType.SMB_SET_FM_DEVIATION, {"hz": float(self._fm_dev_edit.text())}),
             ]
@@ -2965,7 +3496,7 @@ class ODMRControlGUI(QMainWindow):
             else:
                 self._ctrl.smb.set_power(p)
                 self._ctrl.smb.set_lf_voltage(float(self._lf_amp_edit.text()))
-                self._ctrl.smb.set_lf_freq(float(self._lf_freq_edit.text()))
+                self._ctrl.smb.set_lf_freq(lf_freq_hz)
                 self._ctrl.smb.set_lf_shape(self._lf_shape_combo.currentText())
                 self._ctrl.smb.set_fm_deviation(float(self._fm_dev_edit.text()))
             self._on_log("All parameters applied", "smb")
@@ -2974,13 +3505,13 @@ class ODMRControlGUI(QMainWindow):
 
     def _collect_smb_config_page(self) -> Dict[str, Any]:
         return {
-            "frequency_hz": float(self._cw_freq_edit.text()),
-            "power_dbm": float(self._power_edit.text()),
+            "frequency_hz": self._cw_freq_selector.value_in_base_unit(),
+            "power_dbm": self._power_selector.value_in_base_unit(),
             "phase_deg": float(self._rf_phase_edit.text()),
             "level_offset_db": float(self._rf_offset_edit.text()),
             "rf_output": self._rf_toggle.isChecked(),
             "lf": {
-                "frequency_hz": float(self._lf_freq_edit.text()),
+                "frequency_hz": self._lf_freq_selector.value_in_base_unit(),
                 "voltage_mv": float(self._lf_amp_edit.text()),
                 "shape": self._lf_shape_combo.currentText(),
                 "impedance": self._lf_impedance_combo.currentText(),
@@ -3088,7 +3619,7 @@ class ODMRControlGUI(QMainWindow):
             QMessageBox.warning(self, "警告", "命令总线未就绪")
             return
         try:
-            power = int(self._laser_power_edit.text())
+            power = int(self._laser_power_selector.value_in_base_unit())
             max_mw = self._cfg["laser"].get("max_power_mw", 150)
             if power < 0 or power > max_mw:
                 QMessageBox.warning(self, "警告", f"功率超出范围 [0, {max_mw}] mW")
@@ -3124,12 +3655,12 @@ class ODMRControlGUI(QMainWindow):
             interval_ms = 0
         step = SweepStep(
             name="sweep",
-            start_freq_hz=float(self._start_freq_edit.text()),
-            stop_freq_hz=float(self._stop_freq_edit.text()),
-            step_hz=float(self._step_edit.text()),
+            start_freq_hz=self._start_freq_selector.value_in_base_unit(),
+            stop_freq_hz=self._stop_freq_selector.value_in_base_unit(),
+            step_hz=self._step_selector.value_in_base_unit(),
             dwell_ms=float(self._dwell_edit.text()),
-            power_dbm=float(self._sweep_power_edit.text()),
-            lf_freq_hz=float(self._lf_freq_edit.text()),
+            power_dbm=self._sweep_power_selector.value_in_base_unit(),
+            lf_freq_hz=self._lf_freq_selector.value_in_base_unit(),
             lf_amp_mv=float(self._lf_amp_edit.text()),
             lf_shape=self._lf_shape_combo.currentText(),
             fm_dev_hz=float(self._fm_dev_edit.text()),
@@ -3307,7 +3838,11 @@ class ODMRControlGUI(QMainWindow):
                 if "current" in controls:
                     controls["current"].setText(f"{float(status.get('total_current_mA', 0.0)):.3f}")
                 if "target" in controls:
-                    controls["target"].setText(f"{float(status.get('target_field_nT', 0.0)):.2f}")
+                    target_nT = float(status.get('target_field_nT', 0.0))
+                    unit = self._mag_unit_combo.currentText() if hasattr(self, '_mag_unit_combo') else "nT"
+                    conversion = {"nT": 1, "μT": 1e-3, "mT": 1e-6, "T": 1e-9, "G": 1e-5, "Oe": 1e-5}
+                    factor = conversion.get(unit, 1)
+                    controls["target"].setText(f"{target_nT * factor:.2f} {unit}")
                 if "est_recur" in controls:
                     est = status.get("estimated_recur_current_mA")
                     controls["est_recur"].setText("---" if est is None else f"{float(est):.3f}")
@@ -3325,6 +3860,14 @@ class ODMRControlGUI(QMainWindow):
                 led.setProperty("on", "true" if connected else "false")
                 led.style().unpolish(led)
                 led.style().polish(led)
+
+    def _on_mag_unit_changed(self, unit: str) -> None:
+        """磁场显示单位变更时，更新所有 UnitSelector 的显示单位。"""
+        if hasattr(self, '_mag_field_selectors'):
+            for selector in self._mag_field_selectors.values():
+                selector.set_unit(unit)
+        if hasattr(self, '_mag_vec_mag') and isinstance(self._mag_vec_mag, MagneticFieldUnitSelector):
+            self._mag_vec_mag.set_unit(unit)
 
     def _on_lockin_data_ready(self, data):
         """处理 Lockin 数据，按 channel 路由到对应显示和 buffer。"""
@@ -3618,6 +4161,11 @@ class ODMRControlGUI(QMainWindow):
                 ports = [item.get("port", "") for item in devices if item.get("port")]
                 if not ports and isinstance(result, dict):
                     ports = result.get("ports", [])
+                if op == "mag_auto_detect":
+                    dev_desc = ", ".join(
+                        f"{d.get('port','?')}({d.get('idn','?')[:30]})" for d in devices
+                    )
+                    self._on_log(f"[Mag] 扫描到 {len(devices)} 个设备: {dev_desc}", "smb")
                 if hasattr(self, "_mag_controls"):
                     for controls in self._mag_controls.values():
                         combo = controls["port"]
@@ -3635,10 +4183,19 @@ class ODMRControlGUI(QMainWindow):
                             continue
                         port = match.get("port", "")
                         idn = match.get("idn", "")
+                        combo = controls["port"]
                         if port:
-                            controls["port"].setCurrentText(port)
+                            # 确保端口在下拉列表中
+                            if combo.findText(port) < 0:
+                                combo.addItem(port)
+                            combo.setCurrentText(port)
+                            # 验证设置是否成功
+                            if combo.currentText() != port:
+                                self._on_log(f"[Mag] 警告: {axis}轴端口设置失败 ({port})", "smb")
                         controls["binding"].setText(idn or "--")
                         bindings[axis] = {"port": port, "idn": idn}
+                        if op == "mag_auto_detect":
+                            self._on_log(f"[Mag] {axis}轴 → {port} ({idn[:30] if idn else '未匹配'})", "smb")
                 self._on_log(f"[Mag] {op} OK", "smb")
             else:
                 QMessageBox.warning(self, "Magnetic Field Error", message)
@@ -3728,10 +4285,16 @@ class ODMRControlGUI(QMainWindow):
             axes_cfg = mag_cfg.setdefault("axes", {})
             for axis, controls in self._mag_controls.items():
                 axes_cfg[axis] = {
-                    "port": controls["port"].currentText(),
                     "coil_constant": float(controls["coil"].text()),
                     "zero_offset_mA": float(controls["zero"].text()),
                 }
+            # 持久化磁场设备绑定（IDN + port）
+            bindings = mag_cfg.setdefault("bindings", {})
+            for axis, controls in self._mag_controls.items():
+                port = controls["port"].currentText().strip()
+                idn = controls["binding"].text().strip()
+                if idn and idn != "---":
+                    bindings[axis] = {"idn": idn, "port": port}
         save_config(cfg)
         self._on_log("Config saved", "smb")
 

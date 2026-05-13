@@ -8,17 +8,24 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import queue
 import threading
 import time
-import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None  # type: ignore[assignment]
+
 from core.commands import Command, CommandType
 from core.instrument_controller import InstrumentController
+from core.mag_field_controller import FieldController
 from core.mag_sequence_engine import FieldSequence, FieldStep, SequenceEngine
 from core.vector_field import SphericalField, spherical_to_cartesian
 from core.timestamp_sync import TimestampSyncHub, TimestampedSample
@@ -690,6 +697,42 @@ class CommandService(QObject):
         if ct == CommandType.EXPERIMENT_QUERY_STATE:
             return self._experiment_state.copy()
 
+        if ct == CommandType.EXPERIMENT_WAIT:
+            duration = float(p.get("duration_s", 0.0))
+            condition = p.get("condition")
+            if condition:
+                timeout = duration if duration > 0 else 300.0
+                met = self._wait_for_condition(condition, timeout)
+                return {"condition_met": met, "timeout_s": timeout}
+            elif duration > 0:
+                self._interruptible_experiment_sleep(duration)
+                return {"waited_s": duration}
+            return {"waited_s": 0}
+
+        if ct == CommandType.EXPERIMENT_CONDITION_EVAL:
+            condition = p.get("condition", p)
+            met = self._evaluate_condition(condition)
+            return {"condition_met": met, "condition": condition}
+
+        if ct == CommandType.EXPERIMENT_MODIFY_STEP:
+            step_index = int(p.get("step_index", -1))
+            overrides = p.get("overrides", {})
+            if self._experiment_plan is not None:
+                sequence = self._experiment_plan.get("sequence", {})
+                steps = sequence.get("steps", sequence if isinstance(sequence, list) else [])
+                name = p.get("step_name", "")
+                if name:
+                    step_index = self._find_step_index(steps, name)
+                if 0 <= step_index < len(steps):
+                    step = steps[step_index]
+                    for key, value in overrides.items():
+                        if key in step and isinstance(step[key], dict) and isinstance(value, dict):
+                            step[key].update(value)
+                        else:
+                            step[key] = value
+                    return {"modified_step": step_index, "overrides_applied": list(overrides.keys())}
+            return {"error": "无法修改步骤：索引无效或实验计划未加载"}
+
         raise NotImplementedError(f"未实现的命令类型: {ct.name}")
 
     # -- safety checks -------------------------------------------------------
@@ -820,13 +863,16 @@ class CommandService(QObject):
             raise ValueError(f"无效磁场轴: {axis}")
         return value
 
-    def _mag_axis_bindings(self) -> Dict[str, str]:
+    def _mag_axis_bindings(self) -> Dict[str, Dict[str, str]]:
+        """返回统一格式的轴绑定: {"X": {"idn": "...", "port": "..."}, ...}
+
+        兼容旧格式（纯字符串 IDN）和新格式（含 idn + port 的 dict）。
+        """
         raw = self._config.get("magnetic_field", {}).get("bindings", {})
-        result: Dict[str, str] = {}
-        for axis in ("X", "Y", "Z"):
-            value = raw.get(axis, "")
-            result[axis] = value.get("idn", "") if isinstance(value, dict) else str(value)
-        return result
+        return {
+            axis: FieldController._normalize_binding(raw.get(axis, ""))
+            for axis in ("X", "Y", "Z")
+        }
 
     def _apply_mag_axis_config(self, axis: str, params: Dict[str, Any]) -> None:
         cfg = self._config.get("magnetic_field", {}).get("axes", {}).get(axis, {})
@@ -872,35 +918,250 @@ class CommandService(QObject):
                 raise ValueError("plan 必须是 dict")
             return plan
         if "path" in params:
-            return json.loads(Path(params["path"]).read_text(encoding="utf-8"))
+            return json.loads(Path(params["path"]).read_text(encoding="utf-8-sig"))
         return params
 
+    @staticmethod
+    def _load_experiment_plan_schema() -> Optional[Dict[str, Any]]:
+        """加载实验计划 JSON Schema（如果文件存在且 jsonschema 可用）。"""
+        schema_path = Path(__file__).resolve().parent.parent / "schemas" / "experiment_plan.json"
+        if not schema_path.exists():
+            return None
+        try:
+            return json.loads(schema_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
     def _validate_experiment_plan(self, plan: Dict[str, Any]) -> dict:
-        errors = []
-        sequence = plan.get("sequence", [])
+        """验证实验计划的完整性和正确性。
+
+        验证层级：
+        1. 结构完整性验证（主验证，错误始终报告）
+        2. 字段值域验证（主验证）
+        3. 业务逻辑验证（主验证）
+        4. JSON Schema 验证（补充验证，仅报告主验证未覆盖的结构性问题）
+        """
+        errors: list[str] = []
+
+        # -- 层级 1: 结构完整性验证 ------------------------------------
+        if not isinstance(plan, dict):
+            errors.append("实验计划必须是对象（dict）")
+            return {"valid": False, "errors": errors, "steps": 0}
+
+        metadata = plan.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            errors.append("metadata 必须是对象")
+
+        sequence = plan.get("sequence")
+        if sequence is None:
+            errors.append("sequence.steps 不能为空")
+            return {"valid": False, "errors": errors, "steps": 0}
+
         if isinstance(sequence, dict):
             steps = sequence.get("steps", [])
-        else:
+            loop_count = sequence.get("loop_count")
+            if loop_count is not None:
+                if not isinstance(loop_count, int) or loop_count < 0:
+                    errors.append(f"sequence.loop_count 必须为非负整数，当前值: {loop_count}")
+        elif isinstance(sequence, list):
+            # 兼容旧格式：sequence 直接是步骤列表
             steps = sequence
-        if not isinstance(steps, list) or not steps:
+        else:
+            errors.append("sequence 必须是对象或数组")
+            return {"valid": False, "errors": errors, "steps": 0}
+
+        if not isinstance(steps, list):
+            errors.append("sequence.steps 必须是数组")
+            return {"valid": False, "errors": errors, "steps": 0}
+
+        if not steps:
             errors.append("sequence.steps 不能为空")
-        for idx, step in enumerate(steps if isinstance(steps, list) else []):
+            return {"valid": False, "errors": errors, "steps": 0}
+
+        # -- 层级 2 & 3: 逐步验证 -------------------------------------
+        for idx, step in enumerate(steps):
+            step_label = f"step {idx}"
+
             if not isinstance(step, dict):
-                errors.append(f"step {idx} 必须是对象")
+                errors.append(f"{step_label} 必须是对象")
                 continue
+
+            # timing 验证
+            timing = step.get("timing", {})
+            if timing and not isinstance(timing, dict):
+                errors.append(f"{step_label} timing 必须是对象")
+            elif isinstance(timing, dict):
+                for key in ("settle_s", "hold_s", "delay_s"):
+                    val = timing.get(key)
+                    if val is not None:
+                        try:
+                            fval = float(val)
+                            if fval < 0:
+                                errors.append(f"{step_label} timing.{key} 不能为负数，当前值: {val}")
+                        except (TypeError, ValueError):
+                            errors.append(f"{step_label} timing.{key} 必须是数值，当前值: {val!r}")
+                trigger = timing.get("trigger")
+                if trigger is not None and trigger not in ("immediate", "manual", "delay"):
+                    errors.append(f"{step_label} timing.trigger 无效: {trigger}")
+                if trigger == "delay" and "delay_s" not in timing:
+                    errors.append(f"{step_label} timing.trigger 为 delay 时必须指定 delay_s")
+
+            # magnetic_field 验证
             if "magnetic_field" in step:
-                self._resolve_field_step(step["magnetic_field"])
+                field = step["magnetic_field"]
+                if not isinstance(field, dict):
+                    errors.append(f"{step_label} magnetic_field 必须是对象")
+                else:
+                    has_cartesian = all(k in field for k in ("x_nT", "y_nT", "z_nT"))
+                    has_spherical = all(k in field for k in ("magnitude_nT", "theta_deg", "phi_deg"))
+                    has_alias = any(k in field for k in ("field_x_nT", "field_y_nT", "field_z_nT"))
+                    if not (has_cartesian or has_spherical or has_alias):
+                        errors.append(
+                            f"{step_label} magnetic_field 缺少坐标定义"
+                            "（需要 x_nT/y_nT/z_nT 或 magnitude_nT/theta_deg/phi_deg）"
+                        )
+                    for key in ("x_nT", "y_nT", "z_nT", "field_x_nT", "field_y_nT", "field_z_nT",
+                                "magnitude_nT", "theta_deg", "phi_deg"):
+                        val = field.get(key)
+                        if val is not None:
+                            try:
+                                float(val)
+                            except (TypeError, ValueError):
+                                errors.append(f"{step_label} magnetic_field.{key} 必须是数值，当前值: {val!r}")
+                    mag = field.get("magnitude_nT")
+                    if mag is not None:
+                        try:
+                            if float(mag) < 0:
+                                errors.append(f"{step_label} magnetic_field.magnitude_nT 不能为负数")
+                        except (TypeError, ValueError):
+                            pass
+
+            # microwave 验证
+            if "microwave" in step:
+                mw = step["microwave"]
+                if not isinstance(mw, dict):
+                    errors.append(f"{step_label} microwave 必须是对象")
+                else:
+                    freq = mw.get("frequency_hz")
+                    if freq is not None:
+                        try:
+                            fval = float(freq)
+                            if fval < 100_000 or fval > 12_750_000_000:
+                                errors.append(
+                                    f"{step_label} microwave.frequency_hz 超出范围 [100kHz, 12.75GHz]，"
+                                    f"当前值: {freq}"
+                                )
+                        except (TypeError, ValueError):
+                            errors.append(f"{step_label} microwave.frequency_hz 必须是数值")
+                    power = mw.get("power_dbm")
+                    if power is not None:
+                        try:
+                            float(power)
+                        except (TypeError, ValueError):
+                            errors.append(f"{step_label} microwave.power_dbm 必须是数值")
+                    sweep = mw.get("sweep")
+                    if sweep is not None:
+                        if not isinstance(sweep, dict):
+                            errors.append(f"{step_label} microwave.sweep 必须是对象")
+                        else:
+                            for k in ("start_hz", "stop_hz", "step_hz"):
+                                v = sweep.get(k)
+                                if v is not None:
+                                    try:
+                                        fv = float(v)
+                                        if k == "step_hz" and fv <= 0:
+                                            errors.append(f"{step_label} microwave.sweep.{k} 必须为正数")
+                                    except (TypeError, ValueError):
+                                        errors.append(f"{step_label} microwave.sweep.{k} 必须是数值")
+                            if sweep.get("shape") is not None:
+                                if sweep["shape"] not in ("SAWTOOTH", "TRIANGLE"):
+                                    errors.append(f"{step_label} microwave.sweep.shape 无效: {sweep['shape']}")
+
+            # lockin 验证
+            if "lockin" in step:
+                lockin = step["lockin"]
+                if not isinstance(lockin, dict):
+                    errors.append(f"{step_label} lockin 必须是对象")
+                else:
+                    ch = lockin.get("channel")
+                    if ch is not None and ch not in (1, 2):
+                        errors.append(f"{step_label} lockin.channel 必须是 1 或 2，当前值: {ch}")
+
+            # laser 验证
+            if "laser" in step:
+                laser = step["laser"]
+                if not isinstance(laser, dict):
+                    errors.append(f"{step_label} laser 必须是对象")
+                else:
+                    pwr = laser.get("power_mw")
+                    if pwr is not None:
+                        try:
+                            if float(pwr) < 0:
+                                errors.append(f"{step_label} laser.power_mw 不能为负数")
+                        except (TypeError, ValueError):
+                            errors.append(f"{step_label} laser.power_mw 必须是数值")
+
+            # acquisition 验证
             acq = step.get("acquisition", {})
             if isinstance(acq, dict):
                 start_trigger = acq.get("start_trigger", "step_start")
                 stop_trigger = acq.get("stop_trigger", "hold_elapsed")
-                valid_start = {"step_start", "setpoints_applied", "magnetic_settled", "microwave_output_on", "microwave_sweep_start", "disabled"}
-                valid_stop = {"hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end", "disabled"}
+                valid_start = {
+                    "step_start", "setpoints_applied", "magnetic_settled",
+                    "microwave_output_on", "microwave_sweep_start",
+                    "manual", "external_trigger", "condition_met",
+                    "inline", "disabled",
+                }
+                valid_stop = {
+                    "hold_elapsed", "timed", "microwave_sweep_complete",
+                    "manual", "step_end", "condition_met",
+                    "external_trigger", "disabled",
+                }
                 if start_trigger not in valid_start:
-                    errors.append(f"step {idx} acquisition.start_trigger 无效: {start_trigger}")
+                    errors.append(f"{step_label} acquisition.start_trigger 无效: {start_trigger}")
                 if stop_trigger not in valid_stop:
-                    errors.append(f"step {idx} acquisition.stop_trigger 无效: {stop_trigger}")
-        return {"valid": not errors, "errors": errors, "steps": len(steps) if isinstance(steps, list) else 0}
+                    errors.append(f"{step_label} acquisition.stop_trigger 无效: {stop_trigger}")
+
+            # 条件步骤验证
+            if step.get("type") == "conditional":
+                cond = step.get("condition")
+                if not isinstance(cond, dict):
+                    errors.append(f"{step_label} 条件步骤缺少 condition 字段")
+                elif "type" not in cond:
+                    errors.append(f"{step_label} condition 缺少 type 字段")
+
+            # 等待步骤验证
+            if step.get("type") == "wait":
+                has_duration = "duration_s" in step
+                has_condition = isinstance(step.get("condition"), dict)
+                if not has_duration and not has_condition:
+                    errors.append(f"{step_label} 等待步骤至少需要 duration_s 或 condition")
+
+            # 动态参数步骤验证
+            if "parameter_overrides" in step:
+                overrides = step["parameter_overrides"]
+                if not isinstance(overrides, dict):
+                    errors.append(f"{step_label} parameter_overrides 必须是对象")
+
+        # -- 层级 4: JSON Schema 补充验证 -----------------------------
+        # 仅在主验证通过时执行，用于发现主验证未覆盖的结构性问题
+        # 跳过 sequence 为列表的旧格式（schema 仅支持 dict 格式）
+        if not errors and isinstance(plan.get("sequence"), dict):
+            schema = self._load_experiment_plan_schema()
+            if schema is not None and jsonschema is not None:
+                try:
+                    jsonschema.validate(plan, schema)
+                except jsonschema.ValidationError as exc:
+                    path = ".".join(str(p) for p in exc.absolute_path) if exc.absolute_path else "(root)"
+                    errors.append(f"Schema 验证失败 [{path}]: {exc.message}")
+                except jsonschema.SchemaError as exc:
+                    errors.append(f"Schema 定义错误: {exc.message}")
+
+        return {
+            "valid": not errors,
+            "errors": errors,
+            "steps": len(steps),
+        }
 
     def _start_experiment(self, plan: Dict[str, Any]) -> dict:
         if self._experiment_thread is not None and self._experiment_thread.is_alive():
@@ -927,25 +1188,75 @@ class CommandService(QObject):
             sequence = plan.get("sequence", {})
             steps = sequence.get("steps", sequence if isinstance(sequence, list) else [])
             loop_count = int(sequence.get("loop_count", 1)) if isinstance(sequence, dict) else 1
+            defaults = plan.get("defaults", {})
+            default_settle = float(defaults.get("settle_s", 0.0))
+            default_hold = float(defaults.get("hold_s", 0.0))
             loop = 0
+            # 支持参数动态调整：每个步骤的 overrides 缓存
+            step_overrides: Dict[int, Dict[str, Any]] = {}
+            idx = 0
             while not self._experiment_stop.is_set() and (loop_count == 0 or loop < loop_count):
-                for idx, step in enumerate(steps):
+                idx = 0
+                while idx < len(steps):
                     if self._experiment_stop.is_set():
                         break
+                    step = steps[idx]
                     self._wait_experiment_unpaused()
                     self._experiment_state.update({"running": True, "paused": False, "step_index": idx, "loop_index": loop, "step_name": step.get("name", "")})
-                    timing = step.get("timing", {})
-                    settle = float(timing.get("settle_s", step.get("settle_s", 0.0)))
-                    hold = float(timing.get("hold_s", step.get("hold_s", 0.0)))
-                    trigger = timing.get("trigger", step.get("trigger", "immediate"))
-                    acq = step.get("acquisition", {}) if isinstance(step.get("acquisition", {}), dict) else {}
+
+                    # ---- 条件分支步骤 ----
+                    if step.get("type") == "conditional":
+                        cond = step.get("condition", {})
+                        met = self._evaluate_condition(cond)
+                        self._experiment_state["condition_result"] = met
+                        if met:
+                            target = step.get("then_step")
+                        else:
+                            target = step.get("else_step")
+                        if target is not None:
+                            target_idx = self._find_step_index(steps, target)
+                            if target_idx >= 0:
+                                idx = target_idx
+                                continue
+                        # 目标未找到或未指定，跳过此步骤
+                        idx += 1
+                        continue
+
+                    # ---- 等待步骤 ----
+                    if step.get("type") == "wait":
+                        self._experiment_state["phase"] = "waiting"
+                        duration = float(step.get("duration_s", 0.0))
+                        condition = step.get("condition")
+                        if condition:
+                            # 等待条件满足（带超时）
+                            timeout = duration if duration > 0 else 300.0  # 默认 5 分钟超时
+                            self._wait_for_condition(condition, timeout)
+                        elif duration > 0:
+                            self._interruptible_experiment_sleep(duration)
+                        idx += 1
+                        continue
+
+                    # ---- 应用动态参数覆盖 ----
+                    effective_step = self._apply_parameter_overrides(step, step_overrides.get(idx, {}))
+
+                    timing = effective_step.get("timing", {})
+                    settle = float(timing.get("settle_s", effective_step.get("settle_s", default_settle)))
+                    hold = float(timing.get("hold_s", effective_step.get("hold_s", default_hold)))
+                    trigger = timing.get("trigger", effective_step.get("trigger", "immediate"))
+                    acq = effective_step.get("acquisition", {}) if isinstance(effective_step.get("acquisition", {}), dict) else {}
                     start_trigger = acq.get("start_trigger", "step_start")
                     stop_trigger = acq.get("stop_trigger", "hold_elapsed")
+
+                    # ---- 条件触发：start_trigger == "condition_met" ----
+                    if start_trigger == "condition_met":
+                        cond = acq.get("start_condition", {})
+                        self._wait_for_condition(cond, float(acq.get("condition_timeout_s", 300.0)))
+
                     if start_trigger == "step_start":
-                        self._apply_acquisition_action(step, start=True)
-                    self._apply_experiment_step(step)
+                        self._apply_acquisition_action(effective_step, start=True)
+                    self._apply_experiment_step(effective_step)
                     if start_trigger in {"setpoints_applied", "microwave_output_on", "microwave_sweep_start"}:
-                        self._apply_acquisition_action(step, start=True)
+                        self._apply_acquisition_action(effective_step, start=True)
                     if trigger == "manual":
                         self._experiment_manual_advance.clear()
                         while not self._experiment_stop.is_set() and not self._experiment_manual_advance.wait(0.1):
@@ -954,14 +1265,29 @@ class CommandService(QObject):
                         self._interruptible_experiment_sleep(float(timing.get("delay_s", 0.0)))
                     self._interruptible_experiment_sleep(settle)
                     if start_trigger == "magnetic_settled":
-                        self._apply_acquisition_action(step, start=True)
+                        self._apply_acquisition_action(effective_step, start=True)
                     self._interruptible_experiment_sleep(hold)
+
+                    # ---- 条件触发：stop_trigger == "condition_met" ----
+                    if stop_trigger == "condition_met":
+                        cond = acq.get("stop_condition", {})
+                        self._wait_for_condition(cond, float(acq.get("condition_timeout_s", 300.0)))
+
                     if stop_trigger == "manual":
                         self._experiment_manual_advance.clear()
                         while not self._experiment_stop.is_set() and not self._experiment_manual_advance.wait(0.1):
                             self._wait_experiment_unpaused()
-                    if stop_trigger in {"hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end"}:
-                        self._apply_acquisition_action(step, start=False)
+                    if stop_trigger in {"hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end", "condition_met"}:
+                        self._apply_acquisition_action(effective_step, start=False)
+
+                    # ---- 记录 parameter_overrides 供后续步骤使用 ----
+                    if "parameter_overrides" in step:
+                        for target_name, override in step["parameter_overrides"].items():
+                            target_idx = self._find_step_index(steps, target_name)
+                            if target_idx >= 0:
+                                step_overrides.setdefault(target_idx, {}).update(override)
+
+                    idx += 1
                 loop += 1
         except Exception as exc:
             self._experiment_state["error"] = str(exc)
@@ -980,6 +1306,175 @@ class CommandService(QObject):
         while time.monotonic() < end and not self._experiment_stop.is_set():
             self._wait_experiment_unpaused()
             time.sleep(min(0.1, end - time.monotonic()))
+
+    # -- 条件评估与等待 --------------------------------------------------------
+
+    _COMPARISON_OPS = {
+        ">": lambda a, b: a > b,
+        ">=": lambda a, b: a >= b,
+        "<": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b,
+        "==": lambda a, b: a == b,
+        "!=": lambda a, b: a != b,
+    }
+
+    def _evaluate_condition(self, condition: Dict[str, Any]) -> bool:
+        """评估单个条件表达式，返回是否满足。
+
+        支持的条件类型:
+        - field_magnitude: 磁场幅值比较 {axis, operator, value}
+        - field_stable: 磁场稳定检测 {axis, tolerance_nT, window_s?}
+        - lockin_value: 锁相放大器值比较 {channel, param, operator, value}
+        - microwave_freq: 微波频率比较 {operator, value_hz}
+        - always: 始终为真 {}
+        - never: 始终为假 {}
+        - composite: 组合条件 {logic: "and"|"or", conditions: [...]}
+        """
+        if not isinstance(condition, dict):
+            return False
+        cond_type = condition.get("type", "")
+
+        if cond_type == "always":
+            return True
+        if cond_type == "never":
+            return False
+
+        if cond_type == "field_magnitude":
+            return self._evaluate_field_magnitude(condition)
+        if cond_type == "field_stable":
+            return self._evaluate_field_stable(condition)
+        if cond_type == "lockin_value":
+            return self._evaluate_lockin_value(condition)
+        if cond_type == "microwave_freq":
+            return self._evaluate_microwave_freq(condition)
+        if cond_type == "composite":
+            return self._evaluate_composite(condition)
+
+        return False
+
+    def _evaluate_field_magnitude(self, condition: Dict[str, Any]) -> bool:
+        """比较指定轴磁场幅值。"""
+        axis = str(condition.get("axis", "X")).upper()
+        op = condition.get("operator", ">")
+        value = float(condition.get("value", 0.0))
+        compare_fn = self._COMPARISON_OPS.get(op)
+        if compare_fn is None:
+            return False
+        try:
+            state = self._ctrl.mag.query_state(axis)
+            current = float(state.get("field_nT", 0.0))
+            return compare_fn(current, value)
+        except Exception:
+            return False
+
+    def _evaluate_field_stable(self, condition: Dict[str, Any]) -> bool:
+        """检测磁场是否在容差范围内稳定。"""
+        axis = str(condition.get("axis", "X")).upper()
+        tolerance = float(condition.get("tolerance_nT", 10.0))
+        window = float(condition.get("window_s", 1.0))
+        try:
+            state = self._ctrl.mag.query_state(axis)
+            current = float(state.get("field_nT", 0.0))
+            samples = [current]
+            sample_count = max(3, int(window / 0.2))
+            for _ in range(sample_count):
+                time.sleep(0.2)
+                if self._experiment_stop.is_set():
+                    return False
+                state = self._ctrl.mag.query_state(axis)
+                samples.append(float(state.get("field_nT", 0.0)))
+            avg = sum(samples) / len(samples)
+            return all(abs(s - avg) <= tolerance for s in samples)
+        except Exception:
+            return False
+
+    def _evaluate_lockin_value(self, condition: Dict[str, Any]) -> bool:
+        """比较锁相放大器参数值。"""
+        channel = int(condition.get("channel", 1))
+        param = condition.get("param", "X")
+        op = condition.get("operator", ">")
+        value = float(condition.get("value", 0.0))
+        compare_fn = self._COMPARISON_OPS.get(op)
+        if compare_fn is None:
+            return False
+        try:
+            data = self._ctrl.lockin.query_snapd(channel)
+            param_map = {"X": 0, "Y": 1, "R": 2, "theta": 3}
+            idx = param_map.get(param.upper(), 0)
+            current = float(data[idx]) if len(data) > idx else 0.0
+            return compare_fn(current, value)
+        except Exception:
+            return False
+
+    def _evaluate_microwave_freq(self, condition: Dict[str, Any]) -> bool:
+        """比较微波源当前频率。"""
+        op = condition.get("operator", ">")
+        value = float(condition.get("value_hz", 0.0))
+        compare_fn = self._COMPARISON_OPS.get(op)
+        if compare_fn is None:
+            return False
+        try:
+            current = self._ctrl.smb.cached_freq_hz
+            return compare_fn(current, value)
+        except Exception:
+            return False
+
+    def _evaluate_composite(self, condition: Dict[str, Any]) -> bool:
+        """组合条件评估（and/or 逻辑）。"""
+        logic = condition.get("logic", "and")
+        conditions = condition.get("conditions", [])
+        if not conditions:
+            return False
+        results = [self._evaluate_condition(c) for c in conditions]
+        if logic == "or":
+            return any(results)
+        return all(results)
+
+    def _wait_for_condition(self, condition: Dict[str, Any], timeout_s: float) -> bool:
+        """阻塞等待条件满足，支持中断和暂停。
+
+        Returns:
+            True 表示条件满足，False 表示超时或被中断。
+        """
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        poll_interval = 0.5
+        while not self._experiment_stop.is_set():
+            self._wait_experiment_unpaused()
+            if self._evaluate_condition(condition):
+                self._experiment_state["phase"] = "condition_met"
+                return True
+            if time.monotonic() >= deadline:
+                self._experiment_state["phase"] = "condition_timeout"
+                return False
+            remaining = deadline - time.monotonic()
+            time.sleep(min(poll_interval, max(0.05, remaining)))
+        return False
+
+    @staticmethod
+    def _find_step_index(steps: list, name: Any) -> int:
+        """按名称或索引查找步骤位置，未找到返回 -1。"""
+        if isinstance(name, int):
+            return name if 0 <= name < len(steps) else -1
+        for i, s in enumerate(steps):
+            if isinstance(s, dict) and s.get("name") == name:
+                return i
+        return -1
+
+    @staticmethod
+    def _apply_parameter_overrides(step: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """将参数覆盖合并到步骤中（深合并）。
+
+        overrides 格式: {"magnetic_field": {"x_nT": 500}, "microwave": {"power_dbm": -10}}
+        """
+        if not overrides:
+            return step
+        merged = copy.deepcopy(step)
+        for key, value in overrides.items():
+            if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+                merged[key].update(value)
+            else:
+                merged[key] = value
+        return merged
 
     def _apply_experiment_step(self, step: Dict[str, Any]) -> None:
         if "magnetic_field" in step:
@@ -1011,7 +1506,7 @@ class CommandService(QObject):
                 self._experiment_state["phase"] = "acquisition_start"
                 self._execute(Command(
                     CommandType.ACQ_START_RECORDING,
-                    {"output_dir": acq.get("output_dir")},
+                    {"output_dir": acq.get("output_dir"), "column_groups": acq.get("column_groups")},
                     source="experiment",
                 ))
             elif acq.get("start_stream", False) and not self._ctrl.is_acquiring:
@@ -1075,7 +1570,8 @@ class CommandService(QObject):
     def _create_recorder(self, params: Dict[str, Any]) -> ODMRRecorder:
         """创建并启动一次 CSV 记录会话。"""
         output_dir = params.get("output_dir") or params.get("save_dir")
-        recorder = ODMRRecorder(Path(output_dir) if output_dir else None)
+        column_groups = params.get("column_groups")
+        recorder = ODMRRecorder(Path(output_dir) if output_dir else None, column_groups=column_groups)
         recorder.start_recording()
         return recorder
 
