@@ -77,6 +77,7 @@ class FakeSerial:
         self.timeout = kwargs.get("timeout", 2.0)
         self._buffer = b""
         self._rall_counter = 0
+        self.writes = []
 
     def reset_input_buffer(self):
         pass
@@ -86,6 +87,7 @@ class FakeSerial:
 
     def write(self, data: bytes):
         cmd = data.decode("ascii", errors="replace").strip()
+        self.writes.append(cmd)
         if cmd == "*IDND?":
             self._buffer = b"SSI LIA-OE1022D,SN123456,Ver1.0\r\n"
         elif cmd == "SNAPD? 1,0,1,2,3":
@@ -178,12 +180,38 @@ class TestOE1022DDriver(unittest.TestCase):
         self.assertAlmostEqual(data["X"], 1.0, places=3)
 
     def test_rall_parse(self):
+        self.driver._transport = "usb2"
         self.driver.start_rall_stream()
         raw = self.driver.read_rall_batch()
         self.assertEqual(len(raw), RALL_TOTAL_BYTES)
         batch = self.driver.parse_rall(raw)
         self.assertIn("lockin_A_X_mv", batch)
         self.assertEqual(len(batch["lockin_A_X_mv"]), SAMPLES_PER_BATCH)
+
+    def test_rall_rejects_rs232_transport(self):
+        with self.assertRaises(RuntimeError):
+            self.driver.start_rall_stream()
+
+    def test_manual_aligned_oe1022d_commands(self):
+        self.driver.set_input_source(1, 2)
+        self.driver.set_ref_phase(1, -12.345)
+        self.driver.set_ref_frequency(1, 1000.0)
+        self.driver.set_harmonic(1, 3, slot=2)
+        self.driver.configure_channel_output(
+            output_ch=1,
+            source=2,
+            offset_pct=50.0,
+            expand=2,
+            speed=1,
+        )
+
+        self.assertIn("ISRCD 1,2", self.driver._serial.writes)
+        self.assertIn("PHASD 1,-12.35", self.driver._serial.writes)
+        self.assertIn("FREQD 1,1000", self.driver._serial.writes)
+        self.assertIn("HARMD 1,2,3", self.driver._serial.writes)
+        self.assertIn("FPOPD 1,2", self.driver._serial.writes)
+        self.assertIn("OEXPD 1,2,50.000,2", self.driver._serial.writes)
+        self.assertIn("SPEDD 1,1", self.driver._serial.writes)
 
 
 class TestCircularBuffer(unittest.TestCase):

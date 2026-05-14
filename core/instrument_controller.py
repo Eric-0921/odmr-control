@@ -140,8 +140,9 @@ class InstrumentController(QObject):
         parity: str = "N",
         stopbits: int = 1,
         timeout: float = 1.0,
+        transport: str = "rs232",
     ) -> str:
-        idn = self._lockin.connect(port, baudrate, bytesize, parity, stopbits, timeout)
+        idn = self._lockin.connect(port, baudrate, bytesize, parity, stopbits, timeout, transport)
         self._start_lockin_monitor()
         return idn
 
@@ -254,6 +255,8 @@ class InstrumentController(QObject):
 
     def start_lockin_acquire(self, recorder: Optional[ODMRRecorder] = None) -> None:
         """启动 RALL? 高速采集（仅在扫频期间调用）。"""
+        if not self._lockin.rall_supported:
+            raise RuntimeError("OE1022D RALL? requires the USB2.0 interface; RS232 supports SNAPD?/sample commands only.")
         if self._lockin_acquire_thread is not None:
             if recorder is not None and self._lockin_acquire_worker is not None:
                 self._recorder = recorder

@@ -27,7 +27,7 @@ class CommandType(Enum):
     SMB_SET_LF_SHAPE = auto()         # {shape}
     SMB_SET_MODULATION = auto()       # {mod_type, enabled, depth/freq/...}
     SMB_SET_FM_DEVIATION = auto()     # {hz}
-    SMB_SET_SWEEP = auto()            # {start_hz, stop_hz, step_hz, dwell_ms, power_dbm}
+    SMB_SET_SWEEP = auto()            # {start_hz, stop_hz, step_hz, dwell_ms, power_dbm, spacing, shape, retrace, trigger, lf_connector, ovolt_*}
     SMB_START_SWEEP = auto()
     SMB_STOP_SWEEP = auto()
     SMB_QUERY_STATE = auto()          # {} -> 返回完整状态字典
@@ -36,10 +36,10 @@ class CommandType(Enum):
     # ===== OE1022D 连接与基础控制 =====
     LOCKIN_CONNECT = auto()           # {port, baudrate, bytesize, parity, stopbits, timeout}
     LOCKIN_DISCONNECT = auto()
-    LOCKIN_SET_INPUT = auto()         # {channel, source, gain, ground, coupling, notch}
+    LOCKIN_SET_INPUT = auto()         # {channel, source, ground, coupling, notch}
     LOCKIN_SET_REF_PHASE = auto()     # {channel, phase_deg, source, slope, freq_hz, harmonic}
     LOCKIN_SET_GAIN_TC = auto()       # {channel, sensitivity, reserve, time_const, filter_db, sync}
-    LOCKIN_SET_OUTPUT = auto()        # {channel, source, offset, expand, voltage}
+    LOCKIN_SET_OUTPUT = auto()        # {output_ch, source, offset, expand, speed, aux_voltage_v}
     LOCKIN_SET_SAMPLE = auto()        # {step_time_ms, length, trigger_mode, sample_mode}
     LOCKIN_AUTO_GAIN = auto()         # {channel}
     LOCKIN_AUTO_RESERVE = auto()      # {channel}
@@ -105,6 +105,7 @@ class CommandType(Enum):
     SMB_APPLY_CONFIG = auto()
     EXPERIMENT_LOAD_JSON = auto()
     EXPERIMENT_VALIDATE = auto()
+    EXPERIMENT_PREFLIGHT = auto()
     EXPERIMENT_START = auto()
     EXPERIMENT_PAUSE = auto()
     EXPERIMENT_RESUME = auto()

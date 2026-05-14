@@ -335,6 +335,19 @@ class SMB100ADriver:
     def get_sweep_running(self) -> bool:
         return self._query("SWE:RUNN?").strip() in ("1", "ON")
 
+    def set_sweep_lf_connector(self, on: bool) -> None:
+        self._write(f"SWE:LFC {'ON' if on else 'OFF'}")
+
+    def set_sweep_output_voltage_start(self, volts: float) -> None:
+        if not -3.0 <= volts <= 3.0:
+            raise ValueError("RF sweep LF connector start voltage must be -3..3 V")
+        self._write(f"SWE:OVOL:STAR {volts:.6f}V")
+
+    def set_sweep_output_voltage_stop(self, volts: float) -> None:
+        if not -3.0 <= volts <= 3.0:
+            raise ValueError("RF sweep LF connector stop voltage must be -3..3 V")
+        self._write(f"SWE:OVOL:STOP {volts:.6f}V")
+
     # -- LF output -----------------------------------------------------------
 
     def set_lf_output(self, on: bool) -> None:
@@ -379,6 +392,9 @@ class SMB100ADriver:
 
     def set_fm_source(self, source: str = "INT") -> None:
         self._write(f"SOUR:FM:SOUR {source}")
+
+    def set_fm_mode(self, mode: str = "NORM") -> None:
+        self._write(f"SOUR:FM:MODE {mode}")
 
     def set_am_state(self, on: bool) -> None:
         self._write(f"SOUR:AM:STAT {'ON' if on else 'OFF'}")
@@ -435,7 +451,12 @@ class SMB100ADriver:
     # -- convenience ---------------------------------------------------------
 
     def configure_sweep(self, start_hz: float, stop_hz: float, step_hz: float,
-                        dwell_ms: float, power_dbm: float) -> None:
+                        dwell_ms: float, power_dbm: float, *,
+                        spacing: str = "LIN", shape: str = "SAWTOOTH",
+                        retrace: bool = False, trigger: str = "IMM",
+                        lf_connector: bool = False,
+                        ovolt_start_v: float = 0.0,
+                        ovolt_stop_v: float = 3.0) -> None:
         """一次性配置扫频参数（含安全校验）。"""
         self.validate_sweep_params(start_hz, stop_hz, step_hz)
         self.validate_power(power_dbm)
@@ -444,7 +465,14 @@ class SMB100ADriver:
         self.set_sweep_stop(stop_hz)
         self.set_sweep_step(step_hz)
         self.set_sweep_dwell(dwell_ms)
-        self.set_sweep_spacing("LIN")
+        self.set_sweep_spacing(spacing)
+        self.set_sweep_shape(shape)
+        self.set_sweep_retrace(retrace)
+        self.set_sweep_trigger_source(trigger)
+        self.set_sweep_lf_connector(lf_connector)
+        if lf_connector:
+            self.set_sweep_output_voltage_start(ovolt_start_v)
+            self.set_sweep_output_voltage_stop(ovolt_stop_v)
         self.set_sweep_mode("AUTO")
 
     def start_sweep(self) -> None:

@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import copy
+import datetime
+import hashlib
 import json
 import queue
 import threading
@@ -27,6 +29,9 @@ from core.commands import Command, CommandType
 from core.instrument_controller import InstrumentController
 from core.mag_field_controller import FieldController
 from core.mag_sequence_engine import FieldSequence, FieldStep, SequenceEngine
+from core.preflight import ExperimentPreflight
+from core.resource_manager import ResourceManager
+from core.run_manifest import RunManifest
 from core.vector_field import SphericalField, spherical_to_cartesian
 from core.timestamp_sync import TimestampSyncHub, TimestampedSample
 from data.recorder import ODMRRecorder
@@ -79,6 +84,9 @@ class CommandService(QObject):
         self._experiment_stop = threading.Event()
         self._experiment_pause = threading.Event()
         self._experiment_manual_advance = threading.Event()
+        self._resource_manager = ResourceManager()
+        self._experiment_run_id: str = ""
+        self._experiment_run_dir: Optional[Path] = None
 
         # 时间戳同步中心
         self._ts_hub = TimestampSyncHub()
@@ -198,10 +206,72 @@ class CommandService(QObject):
 
     # -- command routing -----------------------------------------------------
 
+    _LEASED_COMMAND_RESOURCES = {
+        CommandType.SMB_SET_FREQUENCY: "microwave",
+        CommandType.SMB_SET_POWER: "microwave",
+        CommandType.SMB_SET_OUTPUT: "microwave",
+        CommandType.SMB_SET_LF_OUTPUT: "microwave",
+        CommandType.SMB_SET_LF_FREQ: "microwave",
+        CommandType.SMB_SET_LF_VOLTAGE: "microwave",
+        CommandType.SMB_SET_LF_SHAPE: "microwave",
+        CommandType.SMB_SET_MODULATION: "microwave",
+        CommandType.SMB_SET_FM_DEVIATION: "microwave",
+        CommandType.SMB_SET_SWEEP: "microwave",
+        CommandType.SMB_START_SWEEP: "microwave",
+        CommandType.LOCKIN_SET_INPUT: "lockin",
+        CommandType.LOCKIN_SET_REF_PHASE: "lockin",
+        CommandType.LOCKIN_SET_GAIN_TC: "lockin",
+        CommandType.LOCKIN_SET_OUTPUT: "lockin",
+        CommandType.LOCKIN_SET_SAMPLE: "lockin",
+        CommandType.LOCKIN_AUTO_GAIN: "lockin",
+        CommandType.LOCKIN_AUTO_RESERVE: "lockin",
+        CommandType.LOCKIN_AUTO_PHASE: "lockin",
+        CommandType.LOCKIN_START_ACQUIRE: "lockin",
+        CommandType.LOCKIN_STOP_ACQUIRE: "lockin",
+        CommandType.LOCKIN_SET_TIME_CONSTANT: "lockin",
+        CommandType.LOCKIN_SET_FILTER_SLOPE: "lockin",
+        CommandType.LOCKIN_SET_SYNC_FILTER: "lockin",
+        CommandType.LOCKIN_SET_LINE_NOTCH: "lockin",
+        CommandType.ACQ_START_RECORDING: "lockin",
+        CommandType.ACQ_STOP_RECORDING: "lockin",
+        CommandType.LASER_SET_POWER: "laser",
+        CommandType.LASER_SET_OUTPUT: "laser",
+        CommandType.MAG_SET_FIELD: "magnetic_field",
+        CommandType.MAG_SET_FIELD_3D: "magnetic_field",
+        CommandType.MAG_SET_CURRENT: "magnetic_field",
+        CommandType.MAG_SET_ZERO_OFFSET: "magnetic_field",
+        CommandType.MAG_PREPARE_ZERO_LOCK: "magnetic_field",
+        CommandType.MAG_SET_OUTPUT: "magnetic_field",
+        CommandType.MAG_LOCK_ZERO: "magnetic_field",
+        CommandType.MAG_LOAD_SEQUENCE: "magnetic_field",
+        CommandType.MAG_START_SEQUENCE: "magnetic_field",
+    }
+
+    def _enforce_resource_lease(self, cmd: Command) -> None:
+        if cmd.source == "experiment":
+            return
+        if cmd.cmd_type in {
+            CommandType.SYS_EMERGENCY_STOP,
+            CommandType.SMB_EMERGENCY_STOP,
+            CommandType.LASER_EMERGENCY_STOP,
+            CommandType.MAG_EMERGENCY_STOP,
+            CommandType.EXPERIMENT_STOP,
+            CommandType.EXPERIMENT_PAUSE,
+            CommandType.EXPERIMENT_RESUME,
+            CommandType.EXPERIMENT_QUERY_STATE,
+        }:
+            return
+        resource = self._LEASED_COMMAND_RESOURCES.get(cmd.cmd_type)
+        if not resource or not self._resource_manager.is_leased(resource):
+            return
+        owner = self._resource_manager.owner(resource)
+        raise SafetyError(f"{resource} is leased by active run {owner}; manual command {cmd.cmd_type.name} is blocked")
+
     def _execute(self, cmd: Command) -> dict:
         """命令路由：根据 cmd_type 调用 InstrumentController 或 Driver 方法。"""
         ct = cmd.cmd_type
         p = cmd.params
+        self._enforce_resource_lease(cmd)
 
         # ===== SMB100A =====
         if ct == CommandType.SMB_CONNECT:
@@ -253,6 +323,10 @@ class CommandService(QObject):
         if ct == CommandType.SMB_SET_MODULATION:
             # 简化版：仅开关 FM 调制
             enabled = bool(p.get("enabled", False))
+            if "fm_source" in p:
+                self._ctrl.smb.set_fm_source(str(p["fm_source"]))
+            if "fm_mode" in p:
+                self._ctrl.smb.set_fm_mode(str(p["fm_mode"]))
             self._ctrl.smb.set_fm_state(enabled)
             if "am_state" in p:
                 self._ctrl.smb.set_am_state(bool(p["am_state"]))
@@ -269,6 +343,13 @@ class CommandService(QObject):
                 float(p["step_hz"]),
                 float(p["dwell_ms"]),
                 sweep_power,
+                spacing=str(p.get("spacing", "LIN")),
+                shape=str(p.get("shape", "SAWTOOTH")),
+                retrace=bool(p.get("retrace", False)),
+                trigger=str(p.get("trigger", "IMM")),
+                lf_connector=bool(p.get("lf_connector", False)),
+                ovolt_start_v=float(p.get("ovolt_start_v", 0.0)),
+                ovolt_stop_v=float(p.get("ovolt_stop_v", 3.0)),
             )
             return {}
 
@@ -302,6 +383,7 @@ class CommandService(QObject):
                 p.get("parity", "N"),
                 p.get("stopbits", 1),
                 p.get("timeout", 1.0),
+                p.get("transport", "rs232"),
             )
             return {"idn": idn}
 
@@ -366,7 +448,6 @@ class CommandService(QObject):
         if ct == CommandType.LOCKIN_SET_INPUT:
             ch = p.get("channel", 1)
             self._ctrl.lockin.set_input_source(ch, p.get("source", 0))
-            self._ctrl.lockin.set_current_gain(ch, p.get("gain", 0))
             self._ctrl.lockin.set_grounding(ch, p.get("ground", 0))
             self._ctrl.lockin.set_coupling(ch, p.get("coupling", 0))
             self._ctrl.lockin.set_line_notch(ch, p.get("notch", 1))
@@ -391,17 +472,24 @@ class CommandService(QObject):
             return {}
 
         if ct == CommandType.LOCKIN_SET_OUTPUT:
-            ch = p.get("channel", 1)
-            self._ctrl.lockin.set_output_source(ch, p.get("output_ch", 1), p.get("source", 0))
-            self._ctrl.lockin.set_output_offset(ch, p.get("output_ch", 1), p.get("offset", 0))
-            self._ctrl.lockin.set_output_expand(ch, p.get("output_ch", 1), p.get("expand", 0))
+            self._ctrl.lockin.configure_channel_output(
+                output_ch=int(p.get("output_ch", 1)),
+                source=int(p.get("source", 0)),
+                offset_pct=float(p.get("offset", 0.0)),
+                expand=int(p.get("expand", 1)),
+                speed=int(p.get("speed", 0)),
+                aux_voltage_v=float(p.get("aux_voltage_v", 0.0)),
+            )
             return {}
 
         if ct == CommandType.LOCKIN_SET_SAMPLE:
-            # OE1022D 采样参数配置（当前为占位，驱动层命令待完善）
-            self.log_requested.emit(
-                f"[Lockin] Sample config: step_time={p.get('step_time_ms')}ms, "
-                f"length={p.get('length')}, trigger={'Internal' if p.get('trigger_mode') == 0 else 'External'}"
+            self._ctrl.lockin.set_sample_config(
+                channel=int(p.get("channel", 1)),
+                step_time_ms=float(p.get("step_time_ms", 100.0)),
+                length=int(p.get("length", 1024)),
+                buffers=tuple(p.get("buffers", (0, 1, 2, 3))),
+                trigger_mode=int(p.get("trigger_mode", 0)),
+                sample_mode=int(p.get("sample_mode", 0)),
             )
             return {"status": "configured"}
 
@@ -672,6 +760,15 @@ class CommandService(QObject):
                 raise ValueError("未加载实验 JSON")
             return self._validate_experiment_plan(plan)
 
+        if ct == CommandType.EXPERIMENT_PREFLIGHT:
+            plan = self._load_experiment_plan(p) if p else self._experiment_plan
+            if plan is None:
+                raise ValueError("未加载实验 JSON")
+            validation = self._validate_experiment_plan(plan)
+            if not validation["valid"]:
+                return {"ok": False, "validation": validation, "checks": []}
+            return ExperimentPreflight(self._ctrl, self._config).run(plan).to_dict()
+
         if ct == CommandType.EXPERIMENT_START:
             plan = self._load_experiment_plan(p) if ("path" in p or "plan" in p) else self._experiment_plan
             if plan is None:
@@ -783,6 +880,10 @@ class CommandService(QObject):
             mod = cfg["modulation"]
             if "fm_deviation_hz" in mod:
                 self._ctrl.smb.set_fm_deviation(float(mod["fm_deviation_hz"]))
+            if "fm_source" in mod:
+                self._ctrl.smb.set_fm_source(str(mod["fm_source"]))
+            if "fm_mode" in mod:
+                self._ctrl.smb.set_fm_mode(str(mod["fm_mode"]))
             if "fm_state" in mod:
                 self._ctrl.smb.set_fm_state(bool(mod["fm_state"]))
             if "am_depth_pct" in mod:
@@ -800,13 +901,14 @@ class CommandService(QObject):
                     float(sweep["step_hz"]),
                     float(sweep["dwell_ms"]),
                     sweep_power,
+                    spacing=str(sweep.get("spacing", "LIN")),
+                    shape=str(sweep.get("shape", "SAWTOOTH")),
+                    retrace=bool(sweep.get("retrace", False)),
+                    trigger=str(sweep.get("trigger", "IMM")),
+                    lf_connector=bool(sweep.get("lf_connector", False)),
+                    ovolt_start_v=float(sweep.get("ovolt_start_v", 0.0)),
+                    ovolt_stop_v=float(sweep.get("ovolt_stop_v", 3.0)),
                 )
-            if "shape" in sweep:
-                self._ctrl.smb.set_sweep_shape(str(sweep["shape"]))
-            if "retrace" in sweep:
-                self._ctrl.smb.set_sweep_retrace(bool(sweep["retrace"]))
-            if "trigger" in sweep:
-                self._ctrl.smb.set_sweep_trigger_source(str(sweep["trigger"]))
             if sweep.get("execute"):
                 self._ctrl.smb.set_output(True)
                 self._ctrl.smb.start_sweep()
@@ -1163,31 +1265,148 @@ class CommandService(QObject):
             "steps": len(steps),
         }
 
+    @staticmethod
+    def _stable_hash(data: Dict[str, Any]) -> str:
+        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _required_resources(plan: Dict[str, Any]) -> list[str]:
+        sequence = plan.get("sequence", {})
+        steps = sequence.get("steps", []) if isinstance(sequence, dict) else sequence
+        resources: set[str] = set()
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                if "microwave" in step:
+                    resources.add("microwave")
+                if "lockin" in step or "acquisition" in step:
+                    resources.add("lockin")
+                if "laser" in step:
+                    resources.add("laser")
+                if "magnetic_field" in step:
+                    resources.add("magnetic_field")
+        return sorted(resources)
+
+    def _output_root_for_plan(self, plan: Dict[str, Any]) -> Path:
+        metadata = plan.get("metadata", {}) if isinstance(plan.get("metadata"), dict) else {}
+        recording_defaults = metadata.get("recording_defaults", {}) if isinstance(metadata.get("recording_defaults"), dict) else {}
+        output_root = recording_defaults.get("output_dir") or self._config.get("acquisition", {}).get("save_dir", "./experiments")
+        return Path(str(output_root))
+
+    def _create_run_artifacts(
+        self,
+        plan: Dict[str, Any],
+        validation: Dict[str, Any],
+        preflight_report: Dict[str, Any],
+    ) -> tuple[str, Path]:
+        metadata = plan.get("metadata", {}) if isinstance(plan.get("metadata"), dict) else {}
+        plan_hash = self._stable_hash(plan)
+        manifest = RunManifest.create(
+            plan_hash,
+            name=str(metadata.get("name") or "run"),
+        )
+        manifest.operator = str(metadata.get("operator", ""))
+        manifest.safety_profile = str(metadata.get("safety_profile", "default"))
+        manifest.status = "running"
+
+        run_dir = self._output_root_for_plan(plan) / manifest.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "compiled_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        (run_dir / "draft_snapshot.json").write_text(
+            json.dumps(metadata.get("draft_snapshot", {}), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "compile_report.json").write_text(
+            json.dumps({"valid": validation.get("valid"), "errors": validation.get("errors", []), "plan_hash": plan_hash}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (run_dir / "preflight_report.json").write_text(json.dumps(preflight_report, ensure_ascii=False, indent=2), encoding="utf-8")
+        (run_dir / "events.jsonl").write_text("", encoding="utf-8")
+        manifest.write(run_dir)
+        self._write_run_event("run_started", {"run_id": manifest.run_id, "plan_hash": plan_hash}, run_dir=run_dir)
+        return manifest.run_id, run_dir
+
+    def _write_run_event(self, event_type: str, payload: Dict[str, Any], *, run_dir: Optional[Path] = None) -> None:
+        target_dir = run_dir or self._experiment_run_dir
+        if target_dir is None:
+            return
+        event = {
+            "time": datetime.datetime.now(datetime.UTC).isoformat(),
+            "type": event_type,
+            **payload,
+        }
+        try:
+            with (target_dir / "events.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _update_run_manifest_status(self, status: str) -> None:
+        if self._experiment_run_dir is None:
+            return
+        path = self._experiment_run_dir / "run_manifest.json"
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            manifest["status"] = status
+            manifest["end_time"] = datetime.datetime.now(datetime.UTC).isoformat()
+            path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     def _start_experiment(self, plan: Dict[str, Any]) -> dict:
         if self._experiment_thread is not None and self._experiment_thread.is_alive():
             raise RuntimeError("实验正在运行")
         validation = self._validate_experiment_plan(plan)
         if not validation["valid"]:
             raise ValueError("; ".join(validation["errors"]))
+        preflight = ExperimentPreflight(self._ctrl, self._config).run(plan)
+        if not preflight.ok:
+            raise ValueError("Preflight failed")
+        run_id, run_dir = self._create_run_artifacts(plan, validation, preflight.to_dict())
+        resources = self._required_resources(plan)
+        self._experiment_run_id = run_id
+        self._experiment_run_dir = run_dir
+        try:
+            self._resource_manager.acquire_for_run(run_id, resources)
+        except Exception as exc:
+            self._write_run_event("run_failed", {"run_id": run_id, "error": str(exc)}, run_dir=run_dir)
+            self._update_run_manifest_status("failed")
+            self._resource_manager.release(run_id)
+            self._experiment_run_id = ""
+            self._experiment_run_dir = None
+            raise
         self._experiment_plan = plan
         self._experiment_stop.clear()
         self._experiment_pause.clear()
         self._experiment_manual_advance.clear()
-        self._experiment_state = {"running": True, "paused": False, "step_index": -1, "error": ""}
+        self._experiment_state = {
+            "running": True,
+            "paused": False,
+            "step_index": -1,
+            "error": "",
+            "run_id": run_id,
+            "run_dir": str(run_dir),
+            "leased_resources": resources,
+        }
         self._experiment_thread = threading.Thread(
             target=self._run_experiment_plan,
-            args=(plan,),
+            args=(plan, run_id),
             name="ODMRExperimentEngine",
             daemon=True,
         )
         self._experiment_thread.start()
         return self._experiment_state.copy()
 
-    def _run_experiment_plan(self, plan: Dict[str, Any]) -> None:
+    def _run_experiment_plan(self, plan: Dict[str, Any], run_id: str = "") -> None:
+        final_status = "completed"
         try:
             sequence = plan.get("sequence", {})
             steps = sequence.get("steps", sequence if isinstance(sequence, list) else [])
             loop_count = int(sequence.get("loop_count", 1)) if isinstance(sequence, dict) else 1
+            loop_delay = float(sequence.get("loop_delay", 0.0)) if isinstance(sequence, dict) else 0.0
+            return_to_zero = bool(sequence.get("return_to_zero", False)) if isinstance(sequence, dict) else False
             defaults = plan.get("defaults", {})
             default_settle = float(defaults.get("settle_s", 0.0))
             default_hold = float(defaults.get("hold_s", 0.0))
@@ -1203,6 +1422,12 @@ class CommandService(QObject):
                     step = steps[idx]
                     self._wait_experiment_unpaused()
                     self._experiment_state.update({"running": True, "paused": False, "step_index": idx, "loop_index": loop, "step_name": step.get("name", "")})
+                    self._write_run_event("step_started", {
+                        "run_id": run_id,
+                        "loop_index": loop,
+                        "step_index": idx,
+                        "step_name": step.get("name", ""),
+                    })
 
                     # ---- 条件分支步骤 ----
                     if step.get("type") == "conditional":
@@ -1279,6 +1504,12 @@ class CommandService(QObject):
                             self._wait_experiment_unpaused()
                     if stop_trigger in {"hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end", "condition_met"}:
                         self._apply_acquisition_action(effective_step, start=False)
+                    self._write_run_event("step_finished", {
+                        "run_id": run_id,
+                        "loop_index": loop,
+                        "step_index": idx,
+                        "step_name": step.get("name", ""),
+                    })
 
                     # ---- 记录 parameter_overrides 供后续步骤使用 ----
                     if "parameter_overrides" in step:
@@ -1289,10 +1520,27 @@ class CommandService(QObject):
 
                     idx += 1
                 loop += 1
+                has_next_loop = loop_count == 0 or loop < loop_count
+                if has_next_loop and loop_delay > 0 and not self._experiment_stop.is_set():
+                    self._interruptible_experiment_sleep(loop_delay)
+            if return_to_zero and not self._experiment_stop.is_set():
+                self._execute(Command(
+                    CommandType.MAG_SET_FIELD_3D,
+                    {"x_nT": 0.0, "y_nT": 0.0, "z_nT": 0.0},
+                    source="experiment",
+                ))
         except Exception as exc:
+            final_status = "failed"
             self._experiment_state["error"] = str(exc)
+            self._write_run_event("run_failed", {"run_id": run_id, "error": str(exc)})
             self._apply_experiment_safety()
         finally:
+            if self._experiment_stop.is_set() and final_status == "completed":
+                final_status = "aborted"
+            self._write_run_event("run_finished", {"run_id": run_id, "status": final_status})
+            self._update_run_manifest_status(final_status)
+            if run_id:
+                self._resource_manager.release(run_id)
             self._experiment_state["running"] = False
 
     def _wait_experiment_unpaused(self) -> None:

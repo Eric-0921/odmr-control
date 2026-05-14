@@ -104,6 +104,7 @@ class OE1022DDriver:
         self._lock = threading.RLock()
         self._cached_data: Dict[str, float] = {}
         self._raw_log_cb: Optional[Callable[[str, bytes], None]] = None
+        self._transport = "rs232"
 
     # -- properties ----------------------------------------------------------
 
@@ -115,6 +116,14 @@ class OE1022DDriver:
     def cached_data(self) -> Dict[str, float]:
         with self._lock:
             return self._cached_data.copy()
+
+    @property
+    def transport(self) -> str:
+        return self._transport
+
+    @property
+    def rall_supported(self) -> bool:
+        return self._transport == "usb2"
 
     def set_raw_log_callback(self, cb: Optional[Callable[[str, bytes], None]]) -> None:
         self._raw_log_cb = cb
@@ -129,6 +138,7 @@ class OE1022DDriver:
         parity: str = DEFAULT_PARITY,
         stopbits: int = DEFAULT_STOPBITS,
         timeout: float = DEFAULT_TIMEOUT,
+        transport: str = "rs232",
     ) -> str:
         if serial is None:
             raise RuntimeError("pyserial is not installed")
@@ -140,6 +150,7 @@ class OE1022DDriver:
             stopbits=stopbits,
             timeout=timeout,
         )
+        self._transport = transport.lower()
         try:
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
@@ -309,6 +320,8 @@ class OE1022DDriver:
 
     def start_rall_stream(self) -> None:
         """发送第一个 RALL? 启动数据流。"""
+        if not self.rall_supported:
+            raise RuntimeError("RALL? is only available on the OE1022D USB2.0 interface, not RS232.")
         self._send(b"RALL?\r")
 
     def read_rall_batch(self, timeout: float = 2.0) -> bytes:
@@ -426,11 +439,15 @@ class OE1022DDriver:
 
     def set_input_source(self, channel: int = 1, source: int = 0) -> None:
         """输入源: 0=A, 1=AB, 2=I(10^6), 3=I(10^8)"""
-        self._exchange_ascii(f"FMODD {channel},{source}")
+        self._exchange_ascii(f"ISRCD {channel},{source}")
 
     def set_current_gain(self, channel: int = 1, gain: int = 0) -> None:
-        """电流增益: 0=1, 1=10, 2=100"""
-        self._exchange_ascii(f"ICNPD {channel},{gain}")
+        """Compatibility no-op.
+
+        OE1022D folds current gain into ISRCD source modes:
+        2 = 1 MOhm / 10E6 V/A, 3 = 100 MOhm / 10E8 V/A.
+        """
+        return None
 
     def set_grounding(self, channel: int = 1, ground: int = 0) -> None:
         """接地: 0=Float, 1=Ground"""
@@ -444,8 +461,7 @@ class OE1022DDriver:
 
     def set_ref_phase(self, channel: int = 1, phase_deg: float = 0.0) -> None:
         """参考相位，单位度。"""
-        index = int(phase_deg * 100)
-        self._exchange_ascii(f"PHASD {channel},{index}")
+        self._exchange_ascii(f"PHASD {channel},{phase_deg:.2f}")
 
     def set_ref_source(self, channel: int = 1, source: int = 0) -> None:
         """参考源: 0=External, 1=Internal, 2=Internal Sweep"""
@@ -457,12 +473,11 @@ class OE1022DDriver:
 
     def set_ref_frequency(self, channel: int = 1, freq_hz: float = 1000.0) -> None:
         """参考频率，单位 Hz（仅内部源有效）。"""
-        index = int(freq_hz * 1000)
-        self._exchange_ascii(f"FREQD {channel},{index}")
+        self._exchange_ascii(f"FREQD {channel},{freq_hz:.6g}")
 
-    def set_harmonic(self, channel: int = 1, harmonic: int = 1) -> None:
-        """谐波次数: 1~32767"""
-        self._exchange_ascii(f"HMODD {channel},{harmonic}")
+    def set_harmonic(self, channel: int = 1, harmonic: int = 1, slot: int = 1) -> None:
+        """谐波次数: slot=1/2, harmonic=1~32767."""
+        self._exchange_ascii(f"HARMD {channel},{slot},{harmonic}")
 
     # -- GAIN / TC -----------------------------------------------------------
 
@@ -477,36 +492,70 @@ class OE1022DDriver:
     # -- CHANNEL OUTPUT ------------------------------------------------------
 
     def set_output_source(self, channel: int = 1, output_ch: int = 1, source: int = 0) -> None:
-        """输出源: CH1/CH2 的源选择。"""
-        self._exchange_ascii(f"OCHSD {channel},{output_ch},{source}")
+        """后面板 CH1/CH2 输出源选择，source 为手册 FPOPD 参数 k。"""
+        self._exchange_ascii(f"FPOPD {output_ch},{source}")
 
-    def set_output_offset(self, channel: int = 1, output_ch: int = 1, offset: int = 0) -> None:
-        """输出偏移: -10000~10000 (对应 -100%~100%)。"""
-        self._exchange_ascii(f"OFFSD {channel},{output_ch},{offset}")
+    def set_output_offset(self, channel: int = 1, output_ch: int = 1, offset: float = 0.0, source: int = 0, expand: int = 1) -> None:
+        """输出偏移百分比，必须和源/放大倍数一起通过 OEXPD 下发。"""
+        self._exchange_ascii(f"OEXPD {output_ch},{source},{offset:.3f},{expand}")
 
-    def set_output_expand(self, channel: int = 1, output_ch: int = 1, expand: int = 0) -> None:
-        """输出扩展: 0=1, 1=10, 2=100。"""
-        self._exchange_ascii(f"OEXPD {channel},{output_ch},{expand}")
+    def set_output_expand(self, channel: int = 1, output_ch: int = 1, expand: int = 1, source: int = 0, offset: float = 0.0) -> None:
+        """输出放大倍数 1..256，必须和源/偏移一起通过 OEXPD 下发。"""
+        self._exchange_ascii(f"OEXPD {output_ch},{source},{offset:.3f},{expand}")
 
     def set_output_speed(self, channel: int = 1, output_ch: int = 1, speed: int = 0) -> None:
-        """输出速率: 0=Fast, 1=Slow."""
-        self._exchange_ascii(f"OSPD {channel},{output_ch},{speed}")
+        """输出速率: 0=Slow, 1=Fast."""
+        self._exchange_ascii(f"SPEDD {output_ch},{speed}")
 
     def set_aux_output_voltage(self, channel: int = 1, output_ch: int = 1, voltage_v: float = 0.0) -> None:
-        self._exchange_ascii(f"OAUXD {channel},{output_ch},{int(voltage_v * 1000)}")
+        self._exchange_ascii(f"CAUXD {output_ch},{voltage_v:.3f}")
+
+    def configure_channel_output(
+        self,
+        output_ch: int = 1,
+        source: int = 0,
+        offset_pct: float = 0.0,
+        expand: int = 1,
+        speed: int = 0,
+        aux_voltage_v: float = 0.0,
+    ) -> None:
+        """Configure CHOUT using the OE1022D manual command set."""
+        self.set_output_source(output_ch=output_ch, source=source)
+        if source == 34:
+            self.set_aux_output_voltage(output_ch=output_ch, voltage_v=aux_voltage_v)
+        else:
+            self.set_output_offset(output_ch=output_ch, source=source, offset=offset_pct, expand=expand)
+        self.set_output_speed(output_ch=output_ch, speed=speed)
+
+    def set_sample_config(
+        self,
+        channel: int = 1,
+        step_time_ms: float = 100.0,
+        length: int = 1024,
+        buffers: Tuple[int, int, int, int] = (0, 1, 2, 3),
+        trigger_mode: int = 0,
+        sample_mode: int = 0,
+    ) -> None:
+        """Configure OE1022D sample buffers per manual SRATD/SLEND/SSLED/STRGD/SPRMD."""
+        if not 1 <= length <= 16384:
+            raise ValueError("OE1022D sample length must be 1..16384")
+        self._exchange_ascii(f"SRATD {channel},{step_time_ms:.3f}")
+        self._exchange_ascii(f"SLEND {channel},{length}")
+        for idx, param in enumerate(buffers, start=1):
+            self._exchange_ascii(f"SSLED {channel},{idx},{param}")
+        self._exchange_ascii(f"STRGD {channel},{trigger_mode}")
+        self._exchange_ascii(f"SPRMD {channel},{sample_mode}")
 
     def query_config(self, channel: int = 1) -> Dict[str, object]:
         """Best-effort query of the main front-panel configuration."""
         config: Dict[str, object] = {"channel": channel}
         query_map = {
-            "input_source": ("FMODD", 0),
-            "current_gain": ("ICNPD", 0),
+            "input_source": ("ISRCD", 0),
             "ground": ("IGNDD", 0),
             "coupling": ("ICPLD", 0),
             "line_notch": ("ILIND", 1),
-            "ref_source": ("RSLPD", 0),
-            "ref_slope": ("RMODD", 0),
-            "harmonic": ("HMODD", 1),
+            "ref_source": ("FMODD", 0),
+            "ref_slope": ("RSLPD", 0),
             "sensitivity_index": ("SENSD", 10),
             "reserve_index": ("RMODD", 1),
             "time_constant_index": ("OFLTD", 6),

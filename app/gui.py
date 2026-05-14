@@ -12,6 +12,7 @@ import datetime
 import json
 import logging
 import queue
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +23,7 @@ from PyQt5.QtGui import QDoubleValidator, QFont, QIntValidator
 from PyQt5.QtWidgets import (
     QAbstractItemView, QAction, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QFrame,
+    QHeaderView,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMenu, QMenuBar, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QStatusBar, QTabWidget,
@@ -30,6 +32,21 @@ from PyQt5.QtWidgets import (
 )
 
 from app.config_io import load_config, save_config
+from app.experiment_draft import (
+    AcquisitionDefaults,
+    BThetaPhiDraft,
+    BxyzGridDraft,
+    CustomStepsDraft,
+    DeviceRequirements,
+    DraftMetadata,
+    ExperimentPlanDraft,
+    ODMRSweepDraft,
+    RecordingDefaults,
+    SafetySelection,
+    SequenceOptions,
+    TimingDefaults,
+)
+from app.plan_compiler import CompiledPlan, PlanCompiler
 from app.unit_selector import UnitSelector, FrequencyUnitSelector, MagneticFieldUnitSelector, PowerUnitSelector, TimeUnitSelector
 from core.command_service import CommandService
 from core.commands import Command, CommandType
@@ -267,6 +284,7 @@ class ODMRControlGUI(QMainWindow):
 
         # async command tracking (for CommandService migration)
         self._pending_cmds: Dict[str, tuple] = {}
+        self._exp_run_workflow: Dict[str, Any] = {}
         if self._cmd_service is not None:
             self._cmd_service.command_completed.connect(self._on_command_completed)
             self._cmd_service.command_error.connect(self._on_command_error)
@@ -394,14 +412,14 @@ class ODMRControlGUI(QMainWindow):
         self._nav.setMinimumWidth(200)
         self._nav.setMaximumWidth(260)
         nav_items = [
-            ("设备连接 / Connection", 0),
-            ("参数配置 / Parameters", 1),
-            ("扫频实验 / Sweep", 2),
-            ("实时波形 / Waveform", 3),
-            ("磁场控制 / Magnetic Field", 4),
-            ("实验自动化 / Automation", 5),
-            ("状态监控 / Monitor", 6),
-            ("日志 / Log", 7),
+            ("Station / Connection", 0),
+            ("Workbench / Parameters", 1),
+            ("Legacy Sweep / Manual", 2),
+            ("Live Data / Waveform", 3),
+            ("Field Workbench", 4),
+            ("Run Designer", 5),
+            ("Review / Monitor", 6),
+            ("Review / Log", 7),
         ]
         for label, idx in nav_items:
             item = QTreeWidgetItem([label])
@@ -619,6 +637,12 @@ class ODMRControlGUI(QMainWindow):
         self._lockin_baud_combo.setCurrentText(str(self._cfg["lockin"]["baudrate"]))
         lockin_layout.addWidget(self._lockin_baud_combo, 0, 3)
 
+        lockin_layout.addWidget(QLabel("采集接口 / Acquire:"), 1, 0)
+        self._lockin_transport_combo = QComboBox()
+        self._lockin_transport_combo.addItem("RS232/SNAPD", "rs232")
+        self._lockin_transport_combo.addItem("USB2.0/RALL", "usb2")
+        lockin_layout.addWidget(self._lockin_transport_combo, 1, 1)
+
         lockin_scan_btn = QPushButton("扫描 / Scan")
         lockin_scan_btn.setToolTip("扫描串口并自动识别 OE1022D (IDN验证)")
         lockin_scan_btn.clicked.connect(self._scan_lockin_ports)
@@ -634,10 +658,10 @@ class ODMRControlGUI(QMainWindow):
         self._lockin_led.setProperty("on", "false")
         lockin_layout.addWidget(self._lockin_led, 0, 6, alignment=Qt.AlignCenter)
 
-        # Row 1: status label (embedded in device area)
+        # Row 2: status label (embedded in device area)
         self._lockin_status_label = QLabel("未连接 / Disconnected")
         self._lockin_status_label.setStyleSheet("color: #999; font-weight: 600;")
-        lockin_layout.addWidget(self._lockin_status_label, 1, 0, 1, 6)
+        lockin_layout.addWidget(self._lockin_status_label, 2, 0, 1, 6)
 
         layout.addWidget(lockin_group)
 
@@ -1346,43 +1370,58 @@ class ODMRControlGUI(QMainWindow):
     def _build_experiment_automation_page(self) -> QWidget:
         page = QScrollArea()
         page.setWidgetResizable(True)
+        page.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         inner = QWidget()
         layout = QVBoxLayout(inner)
 
-        title = QLabel("实验自动化 / Integrated Experiment Automation")
+        title = QLabel("Run Designer / Canonical Experiment Plan")
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
 
         profile = QGroupBox("实验方案 / Profile")
         profile_grid = QGridLayout(profile)
+        profile_grid.setColumnStretch(1, 3)
+        profile_grid.setColumnStretch(3, 1)
         profile_grid.addWidget(QLabel("名称:"), 0, 0)
         self._exp_name_edit = QLineEdit("nv_experiment")
         profile_grid.addWidget(self._exp_name_edit, 0, 1)
         profile_grid.addWidget(QLabel("模式:"), 0, 2)
         self._exp_mode_combo = QComboBox()
         self._exp_mode_combo.addItems([
-            "ODMR 微波扫频",
-            "全光 NV 磁场/电流标定",
-            "三轴磁场排列组合",
+            "ODMR Sweep Draft",
+            "Bxyz Grid Draft",
+            "B-theta-phi Vector Draft",
+            "Custom Step Table Draft",
         ])
         self._exp_mode_combo.currentIndexChanged.connect(self._exp_apply_mode_defaults)
         profile_grid.addWidget(self._exp_mode_combo, 0, 3)
         profile_grid.addWidget(QLabel("记录目录:"), 1, 0)
         self._exp_output_dir = QLineEdit(self._cfg.get("acquisition", {}).get("save_dir", "./experiments"))
-        profile_grid.addWidget(self._exp_output_dir, 1, 1, 1, 3)
+        self._exp_output_dir.setMinimumWidth(280)
+        profile_grid.addWidget(self._exp_output_dir, 1, 1, 1, 5)
         browse = QPushButton("浏览 / Browse")
         browse.clicked.connect(self._exp_browse_output_dir)
-        profile_grid.addWidget(browse, 1, 4)
+        profile_grid.addWidget(browse, 1, 6)
         profile_grid.addWidget(QLabel("Loop:"), 0, 4)
         self._exp_loop_edit = QLineEdit("1")
         self._exp_loop_edit.setFixedWidth(70)
         profile_grid.addWidget(self._exp_loop_edit, 0, 5)
+        profile_grid.addWidget(QLabel("Loop delay (s):"), 0, 6)
+        self._exp_loop_delay_edit = QLineEdit("0")
+        self._exp_loop_delay_edit.setFixedWidth(70)
+        profile_grid.addWidget(self._exp_loop_delay_edit, 0, 7)
+        self._exp_return_zero_check = QCheckBox("Return B=0")
+        profile_grid.addWidget(self._exp_return_zero_check, 2, 1)
+        self._exp_infinite_loop_confirm = QCheckBox("Confirm loop=0")
+        profile_grid.addWidget(self._exp_infinite_loop_confirm, 2, 2)
         layout.addWidget(profile)
 
         smb = QGroupBox("SMB100A 微波 / Microwave")
         smb_grid = QGridLayout(smb)
+        smb_grid.setColumnStretch(1, 1)
+        smb_grid.setColumnStretch(3, 1)
         self._exp_mw_enable = QCheckBox("启用微波")
-        smb_grid.addWidget(self._exp_mw_enable, 0, 0)
+        smb_grid.addWidget(self._exp_mw_enable, 0, 0, 1, 2)
         # 频率参数使用 FrequencyUnitSelector (base unit: Hz)
         self._exp_mw_start_selector = FrequencyUnitSelector(2.82e9)
         self._exp_mw_stop_selector = FrequencyUnitSelector(2.92e9)
@@ -1395,18 +1434,18 @@ class ODMRControlGUI(QMainWindow):
         smb_grid.addWidget(self._exp_mw_start_selector, 1, 1)
         smb_grid.addWidget(QLabel("Stop freq:"), 1, 2)
         smb_grid.addWidget(self._exp_mw_stop_selector, 1, 3)
-        smb_grid.addWidget(QLabel("Step freq:"), 1, 4)
-        smb_grid.addWidget(self._exp_mw_step_selector, 1, 5)
-        smb_grid.addWidget(QLabel("Dwell:"), 2, 0)
-        smb_grid.addWidget(self._exp_mw_dwell_selector, 2, 1)
-        smb_grid.addWidget(QLabel("Power:"), 2, 2)
-        smb_grid.addWidget(self._exp_mw_power_selector, 2, 3)
+        smb_grid.addWidget(QLabel("Step freq:"), 2, 0)
+        smb_grid.addWidget(self._exp_mw_step_selector, 2, 1)
+        smb_grid.addWidget(QLabel("Dwell:"), 2, 2)
+        smb_grid.addWidget(self._exp_mw_dwell_selector, 2, 3)
+        smb_grid.addWidget(QLabel("Power:"), 3, 0)
+        smb_grid.addWidget(self._exp_mw_power_selector, 3, 1)
         self._exp_mw_execute = QCheckBox("内部扫频执行 / Execute sweep")
         self._exp_mw_execute.setChecked(True)
-        smb_grid.addWidget(self._exp_mw_execute, 3, 0, 1, 2)
+        smb_grid.addWidget(self._exp_mw_execute, 4, 0, 1, 2)
         self._exp_mw_rf_output = QCheckBox("RF 输出")
         self._exp_mw_rf_output.setChecked(True)
-        smb_grid.addWidget(self._exp_mw_rf_output, 3, 2)
+        smb_grid.addWidget(self._exp_mw_rf_output, 4, 2)
         layout.addWidget(smb)
 
         mag = QGroupBox("磁场扫描 / Magnetic Field")
@@ -1415,55 +1454,88 @@ class ODMRControlGUI(QMainWindow):
         self._exp_field_mode.addItems(["Bxyz 网格", "B-theta-phi 向量"])
         mag_grid.addWidget(QLabel("扫描坐标:"), 0, 0)
         mag_grid.addWidget(self._exp_field_mode, 0, 1)
+        mag_grid.setColumnStretch(2, 1)
+
+        self._exp_field_stack = QStackedWidget()
+
+        bxyz_panel = QWidget()
+        bxyz_grid = QGridLayout(bxyz_panel)
+        bxyz_grid.setContentsMargins(0, 0, 0, 0)
+        bxyz_grid.setColumnStretch(1, 1)
+        bxyz_grid.setColumnStretch(3, 1)
+        bxyz_grid.setColumnStretch(5, 1)
         self._exp_field_selectors = {}
-        for row, axis in enumerate(("X", "Y", "Z"), start=1):
-            mag_grid.addWidget(QLabel(f"{axis} start/stop/step:"), row, 0)
+        for row, axis in enumerate(("X", "Y", "Z")):
+            bxyz_grid.addWidget(QLabel(f"{axis} start:"), row, 0)
             self._exp_field_selectors[axis] = {}
-            for col, suffix in enumerate(("start", "stop", "step"), start=1):
+            for col, (suffix, label) in enumerate((("start", "start"), ("stop", "stop"), ("step", "step"))):
                 selector = MagneticFieldUnitSelector(0.0 if suffix != "step" else 1000.0)
                 self._exp_field_selectors[axis][suffix] = selector
-                mag_grid.addWidget(selector, row, col)
+                if col > 0:
+                    bxyz_grid.addWidget(QLabel(f"{label}:"), row, col * 2)
+                bxyz_grid.addWidget(selector, row, col * 2 + 1)
+        self._exp_field_stack.addWidget(bxyz_panel)
+
+        vector_panel = QWidget()
+        vector_grid = QGridLayout(vector_panel)
+        vector_grid.setContentsMargins(0, 0, 0, 0)
+        vector_grid.setColumnStretch(1, 1)
+        vector_grid.setColumnStretch(3, 1)
+        vector_grid.setColumnStretch(5, 1)
         # B-theta-phi 向量参数
         self._exp_b_selectors = {}
         for col, suffix in enumerate(("start", "stop", "step")):
             default_val = float(("0", "10000", "1000")[col])
             selector = MagneticFieldUnitSelector(default_val)
             self._exp_b_selectors[suffix] = selector
-        mag_grid.addWidget(QLabel("B start/stop/step:"), 1, 5)
-        mag_grid.addWidget(self._exp_b_selectors["start"], 1, 6)
-        mag_grid.addWidget(self._exp_b_selectors["stop"], 1, 7)
-        mag_grid.addWidget(self._exp_b_selectors["step"], 1, 8)
+        vector_grid.addWidget(QLabel("B start:"), 0, 0)
+        vector_grid.addWidget(self._exp_b_selectors["start"], 0, 1)
+        vector_grid.addWidget(QLabel("B stop:"), 0, 2)
+        vector_grid.addWidget(self._exp_b_selectors["stop"], 0, 3)
+        vector_grid.addWidget(QLabel("B step:"), 0, 4)
+        vector_grid.addWidget(self._exp_b_selectors["step"], 0, 5)
         # theta/phi 保持 deg（角度标准单位）
         for row, (label, attr, default) in enumerate((
             ("theta deg", "theta", ("90", "90", "0")),
             ("phi deg", "phi", ("0", "0", "0")),
-        ), start=2):
-            mag_grid.addWidget(QLabel(label + ":"), row, 5)
-            for col, suffix in enumerate(("start", "stop", "step"), start=6):
-                edit = QLineEdit(default[col - 6])
+        ), start=1):
+            vector_grid.addWidget(QLabel(label + " start:"), row, 0)
+            for col, (suffix, suffix_label) in enumerate((("start", "start"), ("stop", "stop"), ("step", "step"))):
+                edit = QLineEdit(default[col])
+                edit.setMinimumWidth(100)
                 setattr(self, f"_exp_{attr}_{suffix}", edit)
-                mag_grid.addWidget(edit, row, col)
+                if col > 0:
+                    vector_grid.addWidget(QLabel(suffix_label + ":"), row, col * 2)
+                vector_grid.addWidget(edit, row, col * 2 + 1)
+        self._exp_field_stack.addWidget(vector_panel)
+        mag_grid.addWidget(self._exp_field_stack, 1, 0, 1, 3)
+
         # Settle/Hold 使用 TimeUnitSelector (base unit: s)
         self._exp_settle_selector = TimeUnitSelector(0.5)
         self._exp_hold_selector = TimeUnitSelector(1.0)
-        mag_grid.addWidget(QLabel("Settle:"), 4, 0)
-        mag_grid.addWidget(self._exp_settle_selector, 4, 1)
-        mag_grid.addWidget(QLabel("Hold:"), 4, 2)
-        mag_grid.addWidget(self._exp_hold_selector, 4, 3)
+        mag_grid.addWidget(QLabel("Settle:"), 2, 0)
+        mag_grid.addWidget(self._exp_settle_selector, 2, 1)
+        mag_grid.addWidget(QLabel("Hold:"), 3, 0)
+        mag_grid.addWidget(self._exp_hold_selector, 3, 1)
+        self._exp_field_mode.currentIndexChanged.connect(self._exp_update_field_mode_panel)
         layout.addWidget(mag)
 
         acq = QGroupBox("OE1022D 采集触发 / Lock-in Acquisition Trigger")
         acq_grid = QGridLayout(acq)
+        acq_grid.setColumnStretch(2, 1)
+        acq_grid.setColumnStretch(4, 1)
         self._exp_record_check = QCheckBox("记录 CSV")
         self._exp_record_check.setChecked(True)
         acq_grid.addWidget(self._exp_record_check, 0, 0)
         acq_grid.addWidget(QLabel("开始采集:"), 0, 1)
         self._exp_acq_start_combo = QComboBox()
         self._exp_acq_start_combo.addItems(["step_start", "setpoints_applied", "magnetic_settled", "microwave_output_on", "microwave_sweep_start"])
+        self._exp_acq_start_combo.setMinimumWidth(220)
         acq_grid.addWidget(self._exp_acq_start_combo, 0, 2)
         acq_grid.addWidget(QLabel("结束采集:"), 0, 3)
         self._exp_acq_stop_combo = QComboBox()
         self._exp_acq_stop_combo.addItems(["hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end"])
+        self._exp_acq_stop_combo.setMinimumWidth(220)
         acq_grid.addWidget(self._exp_acq_stop_combo, 0, 4)
         acq_grid.addWidget(QLabel("锁相通道:"), 1, 0)
         self._exp_lockin_channel = QComboBox()
@@ -1473,16 +1545,16 @@ class ODMRControlGUI(QMainWindow):
 
         # --- Quick Generation ---
         quick_group = QGroupBox("快速生成 / Quick Generate")
-        quick_layout = QHBoxLayout(quick_group)
-        for text, cb in (
+        quick_layout = QGridLayout(quick_group)
+        for idx, (text, cb) in enumerate((
             ("Bxyz 网格扫描", self._exp_quick_generate_bxyz),
             ("B-theta-phi 向量扫描", self._exp_quick_generate_vector),
             ("ODMR 扫频", self._exp_quick_generate_odmr),
-        ):
+        )):
             btn = QPushButton(text)
             btn.clicked.connect(cb)
-            quick_layout.addWidget(btn)
-        quick_layout.addStretch()
+            quick_layout.addWidget(btn, idx // 3, idx % 3)
+        quick_layout.setColumnStretch(3, 1)
         layout.addWidget(quick_group)
 
         # --- Step List ---
@@ -1496,6 +1568,11 @@ class ODMRControlGUI(QMainWindow):
         self._exp_step_table.setMinimumHeight(180)
         self._exp_step_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._exp_step_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._exp_step_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self._exp_step_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._exp_step_table.setColumnWidth(0, 44)
+        for col in range(2, 8):
+            self._exp_step_table.setColumnWidth(col, 90)
         self._exp_step_table.doubleClicked.connect(lambda: self._exp_edit_selected_step())
         step_layout.addWidget(self._exp_step_table)
 
@@ -1515,8 +1592,8 @@ class ODMRControlGUI(QMainWindow):
         layout.addWidget(step_group)
 
         # --- Import/Export and Control ---
-        buttons = QHBoxLayout()
-        for text, cb, primary in (
+        buttons = QGridLayout()
+        for idx, (text, cb, primary) in enumerate((
             ("导入步骤 / Import Steps", self._exp_import_steps, False),
             ("导出步骤 / Export Steps", self._exp_export_steps, False),
             ("加载方案 / Load Plan", self._exp_load_json, False),
@@ -1526,13 +1603,13 @@ class ODMRControlGUI(QMainWindow):
             ("暂停 / Pause", lambda: self._submit_experiment_command(CommandType.EXPERIMENT_PAUSE, {}, "experiment_pause"), False),
             ("继续 / Resume", lambda: self._submit_experiment_command(CommandType.EXPERIMENT_RESUME, {}, "experiment_resume"), False),
             ("停止 / Stop", lambda: self._submit_experiment_command(CommandType.EXPERIMENT_STOP, {}, "experiment_stop"), False),
-        ):
+        )):
             btn = QPushButton(text)
             if primary:
                 btn.setObjectName("primaryBtn")
             btn.clicked.connect(cb)
-            buttons.addWidget(btn)
-        buttons.addStretch()
+            buttons.addWidget(btn, idx // 5, idx % 5)
+        buttons.setColumnStretch(5, 1)
         layout.addLayout(buttons)
 
         self._exp_status_label = QLabel("Idle")
@@ -1542,9 +1619,109 @@ class ODMRControlGUI(QMainWindow):
         self._exp_json_preview.setMinimumHeight(260)
         layout.addWidget(self._exp_json_preview)
 
+        layout.addWidget(self._build_run_console_panel())
+
         self._exp_apply_mode_defaults()
+        self._exp_update_field_mode_panel()
         page.setWidget(inner)
         return page
+
+    def _build_run_console_panel(self) -> QWidget:
+        console = QGroupBox("Run Console / Operator Panel")
+        layout = QGridLayout(console)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+
+        loaded = QGroupBox("Loaded Plan")
+        loaded_grid = QGridLayout(loaded)
+        self._exp_plan_summary_labels: Dict[str, QLabel] = {}
+        for row, (key, label) in enumerate((
+            ("name", "Name"),
+            ("hash", "Plan hash"),
+            ("steps", "Steps"),
+            ("loop", "Loop"),
+            ("output", "Output root"),
+            ("duration", "Est. duration"),
+        )):
+            loaded_grid.addWidget(QLabel(label + ":"), row, 0)
+            value = QLabel("--")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self._exp_plan_summary_labels[key] = value
+            loaded_grid.addWidget(value, row, 1)
+        layout.addWidget(loaded, 0, 0)
+
+        validation = QGroupBox("Validation")
+        validation_layout = QVBoxLayout(validation)
+        self._exp_validation_status = QLabel("Not validated")
+        self._exp_validation_status.setObjectName("smallData")
+        validation_layout.addWidget(self._exp_validation_status)
+        self._exp_validation_report = QTextEdit()
+        self._exp_validation_report.setReadOnly(True)
+        self._exp_validation_report.setMinimumHeight(90)
+        validation_layout.addWidget(self._exp_validation_report)
+        layout.addWidget(validation, 0, 1)
+
+        preflight = QGroupBox("Preflight")
+        preflight_layout = QVBoxLayout(preflight)
+        self._exp_preflight_status = QLabel("Not run")
+        self._exp_preflight_status.setObjectName("smallData")
+        preflight_layout.addWidget(self._exp_preflight_status)
+        self._exp_preflight_report = QTextEdit()
+        self._exp_preflight_report.setReadOnly(True)
+        self._exp_preflight_report.setMinimumHeight(110)
+        preflight_layout.addWidget(self._exp_preflight_report)
+        layout.addWidget(preflight, 1, 0)
+
+        state = QGroupBox("Run State")
+        state_grid = QGridLayout(state)
+        self._exp_run_state_labels: Dict[str, QLabel] = {}
+        for row, (key, label) in enumerate((
+            ("run_id", "Run ID"),
+            ("run_dir", "Run dir"),
+            ("status", "Status"),
+            ("step", "Current step"),
+            ("loop", "Loop index"),
+            ("leases", "Leased resources"),
+            ("error", "Error"),
+        )):
+            state_grid.addWidget(QLabel(label + ":"), row, 0)
+            value = QLabel("--")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            value.setWordWrap(True)
+            self._exp_run_state_labels[key] = value
+            state_grid.addWidget(value, row, 1)
+        self._exp_open_run_folder_btn = QPushButton("Open Run Folder")
+        self._exp_open_run_folder_btn.setEnabled(False)
+        self._exp_open_run_folder_btn.clicked.connect(self._exp_open_run_folder)
+        state_grid.addWidget(self._exp_open_run_folder_btn, 7, 1)
+        layout.addWidget(state, 1, 1)
+
+        self._exp_compile_report = QTextEdit()
+        self._exp_compile_report.setReadOnly(True)
+        self._exp_compile_report.setMinimumHeight(90)
+        layout.addWidget(QLabel("Raw command/result JSON:"), 2, 0, 1, 2)
+        layout.addWidget(self._exp_compile_report, 3, 0, 1, 2)
+
+        buttons = QGridLayout()
+        for idx, (text, cb, primary) in enumerate((
+            ("Compile Draft", self._exp_compile_draft_preview, False),
+            ("Validate", self._exp_validate_plan, False),
+            ("Preflight", self._exp_preflight_plan, False),
+            ("Start Run", self._exp_start_plan, True),
+            ("Query State", lambda: self._submit_experiment_command(CommandType.EXPERIMENT_QUERY_STATE, {}, "experiment_query_state"), False),
+        )):
+            btn = QPushButton(text)
+            if primary:
+                btn.setObjectName("primaryBtn")
+            btn.clicked.connect(cb)
+            buttons.addWidget(btn, 0, idx)
+        buttons.setColumnStretch(5, 1)
+        layout.addLayout(buttons, 4, 0, 1, 2)
+        return console
+
+    def _exp_update_field_mode_panel(self) -> None:
+        if hasattr(self, "_exp_field_stack") and hasattr(self, "_exp_field_mode"):
+            self._exp_field_stack.setCurrentIndex(self._exp_field_mode.currentIndex())
 
     def _exp_apply_mode_defaults(self) -> None:
         mode = self._exp_mode_combo.currentText() if hasattr(self, "_exp_mode_combo") else ""
@@ -1555,13 +1732,12 @@ class ODMRControlGUI(QMainWindow):
             self._exp_acq_stop_combo.setCurrentText("microwave_sweep_complete")
             self._exp_field_mode.setCurrentText("Bxyz 网格")
             self._exp_hold_selector.set_value_in_base_unit(float(self._estimate_mw_sweep_seconds()))
-        elif "全光" in mode:
+        elif "B-theta" in mode:
             self._exp_mw_enable.setChecked(False)
             self._exp_field_mode.setCurrentText("B-theta-phi 向量")
             self._exp_acq_start_combo.setCurrentText("magnetic_settled")
             self._exp_acq_stop_combo.setCurrentText("hold_elapsed")
             self._exp_hold_selector.set_value_in_base_unit(1.0)
-            self._exp_name_edit.setText("all_optical_nv_current_calibration")
         else:
             self._exp_mw_enable.setChecked(False)
             self._exp_field_mode.setCurrentText("Bxyz 网格")
@@ -1599,54 +1775,279 @@ class ODMRControlGUI(QMainWindow):
             return "1.0"
 
     def _exp_generate_plan(self) -> Dict[str, Any]:
-        """Build experiment plan from self._exp_steps with defaults applied."""
-        output_dir = self._exp_output_dir.text().strip() or "./experiments"
-        settle_s = self._exp_settle_selector.value_in_base_unit()
-        hold_s = self._exp_hold_selector.value_in_base_unit()
-        start_trigger = self._exp_acq_start_combo.currentText()
-        stop_trigger = self._exp_acq_stop_combo.currentText()
+        """Compile the current Run Designer draft into a schema-compatible plan."""
+        compiled = self._exp_compile_draft()
+        self._exp_show_compile_report(compiled)
+        return compiled.plan
+
+    def _exp_current_draft(self) -> ExperimentPlanDraft:
+        mode = self._exp_mode_combo.currentText()
         lockin_ch = int(self._exp_lockin_channel.currentText())
-        record = self._exp_record_check.isChecked()
+        smb_cfg = self._cfg.get("smb", {})
+        laser_cfg = self._cfg.get("laser", {})
+        draft = ExperimentPlanDraft(
+            metadata=DraftMetadata(
+                name=self._exp_name_edit.text().strip() or "nv_experiment",
+                mode=mode,
+                domain="diamond_nv_odmr",
+            ),
+            sequence=SequenceOptions(
+                loop_count=int(float(self._exp_loop_edit.text())),
+                loop_delay_s=float(self._exp_loop_delay_edit.text() or 0),
+                return_to_zero=self._exp_return_zero_check.isChecked(),
+                infinite_loop_confirmed=self._exp_infinite_loop_confirm.isChecked(),
+            ),
+            recording=RecordingDefaults(
+                output_dir=self._exp_output_dir.text().strip() or "./experiments",
+                enabled=self._exp_record_check.isChecked(),
+                format="csv",
+            ),
+            safety=SafetySelection(
+                amplifier_installed=smb_cfg.get("amplifier_installed", True),
+                laser_max_power_mw=float(laser_cfg.get("max_power_mw", 150)),
+            ),
+            devices=DeviceRequirements(
+                microwave=self._exp_mw_enable.isChecked(),
+                lockin=True,
+                laser=False,
+                magnetic_field=True,
+                lockin_channel=lockin_ch,
+            ),
+            timing=TimingDefaults(
+                settle_s=self._exp_settle_selector.value_in_base_unit(),
+                hold_s=self._exp_hold_selector.value_in_base_unit(),
+                dwell_ms=self._exp_mw_dwell_selector.value_in_base_unit() * 1000.0,
+            ),
+            acquisition=AcquisitionDefaults(
+                start_trigger=self._exp_acq_start_combo.currentText(),
+                stop_trigger=self._exp_acq_stop_combo.currentText(),
+                start_recording=self._exp_record_check.isChecked(),
+                stop_recording=self._exp_record_check.isChecked(),
+                stop_acquire=False,
+            ),
+        )
 
-        steps = []
-        for idx, step in enumerate(self._exp_steps):
-            s = dict(step)  # shallow copy
-            s.setdefault("name", f"step_{idx + 1:04d}")
-            # Timing defaults
-            timing = s.setdefault("timing", {})
-            timing.setdefault("settle_s", settle_s)
-            timing.setdefault("hold_s", hold_s)
-            timing.setdefault("trigger", "immediate")
-            # Acquisition defaults
-            acq = s.setdefault("acquisition", {})
-            acq.setdefault("start_recording", record)
-            acq.setdefault("stop_recording", record)
-            acq.setdefault("start_trigger", start_trigger)
-            acq.setdefault("stop_trigger", stop_trigger)
-            acq.setdefault("output_dir", str(Path(output_dir) / s.get("name", f"step_{idx + 1:04d}")))
-            acq.setdefault("stop_acquire", False)
-            # Lockin defaults
-            lockin = s.setdefault("lockin", {})
-            lockin.setdefault("channel", lockin_ch)
-            steps.append(s)
+        field_draft: BxyzGridDraft | BThetaPhiDraft
+        if self._exp_field_mode.currentText().startswith("B-theta"):
+            field_draft = BThetaPhiDraft(
+                b_start_nT=self._exp_b_selectors["start"].value_in_base_unit(),
+                b_stop_nT=self._exp_b_selectors["stop"].value_in_base_unit(),
+                b_step_nT=self._exp_b_selectors["step"].value_in_base_unit(),
+                theta_start_deg=float(self._exp_theta_start.text() or 0),
+                theta_stop_deg=float(self._exp_theta_stop.text() or 0),
+                theta_step_deg=float(self._exp_theta_step.text() or 0),
+                phi_start_deg=float(self._exp_phi_start.text() or 0),
+                phi_stop_deg=float(self._exp_phi_stop.text() or 0),
+                phi_step_deg=float(self._exp_phi_step.text() or 0),
+            )
+        else:
+            field_draft = BxyzGridDraft(
+                x_start_nT=self._exp_field_selectors["X"]["start"].value_in_base_unit(),
+                x_stop_nT=self._exp_field_selectors["X"]["stop"].value_in_base_unit(),
+                x_step_nT=self._exp_field_selectors["X"]["step"].value_in_base_unit(),
+                y_start_nT=self._exp_field_selectors["Y"]["start"].value_in_base_unit(),
+                y_stop_nT=self._exp_field_selectors["Y"]["stop"].value_in_base_unit(),
+                y_step_nT=self._exp_field_selectors["Y"]["step"].value_in_base_unit(),
+                z_start_nT=self._exp_field_selectors["Z"]["start"].value_in_base_unit(),
+                z_stop_nT=self._exp_field_selectors["Z"]["stop"].value_in_base_unit(),
+                z_step_nT=self._exp_field_selectors["Z"]["step"].value_in_base_unit(),
+            )
 
-        return {
-            "metadata": {
-                "name": self._exp_name_edit.text().strip() or "nv_experiment",
-                "domain": "diamond_nv_odmr_all_optical",
-                "mode": self._exp_mode_combo.currentText(),
-                "generated_by": "odmr-control-gui",
-            },
-            "devices": {
-                "smb100a": {"enabled": any("microwave" in s for s in steps)},
-                "lockin": {"model": "OE1022D", "channel": lockin_ch},
-                "magnetic_field": {"axes": ["X", "Y", "Z"]},
-            },
-            "defaults": {"settle_s": settle_s, "hold_s": hold_s},
-            "sequence": {"loop_count": int(float(self._exp_loop_edit.text())), "steps": steps},
-            "recording": {"output_dir": output_dir, "format": "csv"},
-            "safety": {"on_error": "rf_off_mag_off_stop_recording"},
+        if "ODMR" in mode:
+            draft.procedure = ODMRSweepDraft(
+                start_hz=self._exp_mw_start_selector.value_in_base_unit(),
+                stop_hz=self._exp_mw_stop_selector.value_in_base_unit(),
+                step_hz=self._exp_mw_step_selector.value_in_base_unit(),
+                power_dbm=self._exp_mw_power_selector.value_in_base_unit(),
+                dwell_ms=self._exp_mw_dwell_selector.value_in_base_unit() * 1000.0,
+                rf_output=self._exp_mw_rf_output.isChecked(),
+                execute=self._exp_mw_execute.isChecked(),
+                sweep_mode="device",
+                field_points=field_draft,
+            )
+            draft.devices.microwave = True
+        elif "B-theta" in mode:
+            draft.procedure = field_draft if isinstance(field_draft, BThetaPhiDraft) else BThetaPhiDraft()
+            draft.devices.microwave = False
+        elif "Custom" in mode:
+            draft.procedure = CustomStepsDraft(steps=[dict(step) for step in self._exp_steps])
+            draft.devices.microwave = any("microwave" in step for step in self._exp_steps)
+            draft.devices.magnetic_field = any("magnetic_field" in step for step in self._exp_steps)
+        else:
+            draft.procedure = field_draft if isinstance(field_draft, BxyzGridDraft) else BxyzGridDraft()
+            draft.devices.microwave = False
+        return draft
+
+    def _exp_compile_draft(self) -> CompiledPlan:
+        return PlanCompiler().compile(self._exp_current_draft())
+
+    def _exp_compile_draft_preview(self) -> None:
+        compiled = self._exp_compile_draft()
+        self._exp_json_preview.setPlainText(json.dumps(compiled.plan, ensure_ascii=False, indent=2))
+        self._exp_show_compile_report(compiled)
+
+    def _exp_show_compile_report(self, compiled: CompiledPlan) -> None:
+        if not hasattr(self, "_exp_compile_report"):
+            return
+        report = compiled.report()
+        self._exp_compile_report.setPlainText(json.dumps(report, ensure_ascii=False, indent=2))
+        self._exp_update_loaded_plan_summary(compiled)
+        self._exp_update_validation_report(compiled)
+        if hasattr(self, "_exp_status_label"):
+            self._exp_status_label.setText(
+                f"Compiled: valid={compiled.valid} warnings={len(compiled.warnings)} errors={len(compiled.errors)} hash={compiled.plan_hash[:10]}"
+            )
+
+    def _exp_update_loaded_plan_summary(self, compiled: CompiledPlan) -> None:
+        if not hasattr(self, "_exp_plan_summary_labels"):
+            return
+        plan = compiled.plan
+        metadata = plan.get("metadata", {}) if isinstance(plan.get("metadata"), dict) else {}
+        sequence = plan.get("sequence", {}) if isinstance(plan.get("sequence"), dict) else {}
+        steps = sequence.get("steps", []) if isinstance(sequence.get("steps", []), list) else []
+        recording = metadata.get("recording_defaults", {}) if isinstance(metadata.get("recording_defaults"), dict) else {}
+        values = {
+            "name": str(metadata.get("name", "--")),
+            "hash": compiled.plan_hash[:16],
+            "steps": str(len(steps)),
+            "loop": str(sequence.get("loop_count", 1)),
+            "output": str(recording.get("output_dir", "--")),
+            "duration": self._exp_estimate_plan_duration(plan),
         }
+        for key, value in values.items():
+            self._exp_plan_summary_labels[key].setText(value)
+
+    def _exp_estimate_plan_duration(self, plan: Dict[str, Any]) -> str:
+        sequence = plan.get("sequence", {}) if isinstance(plan.get("sequence"), dict) else {}
+        steps = sequence.get("steps", []) if isinstance(sequence.get("steps", []), list) else []
+        loop_count = int(sequence.get("loop_count", 1) or 1)
+        if loop_count == 0:
+            return "infinite"
+        total_s = 0.0
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            timing = step.get("timing", {}) if isinstance(step.get("timing", {}), dict) else {}
+            total_s += float(timing.get("settle_s", 0.0) or 0.0)
+            total_s += float(timing.get("hold_s", 0.0) or 0.0)
+            microwave = step.get("microwave", {}) if isinstance(step.get("microwave", {}), dict) else {}
+            sweep = microwave.get("sweep", {}) if isinstance(microwave.get("sweep", {}), dict) else {}
+            try:
+                start = float(sweep.get("start_hz", 0.0) or 0.0)
+                stop = float(sweep.get("stop_hz", start) or start)
+                step_hz = float(sweep.get("step_hz", 0.0) or 0.0)
+                dwell_ms = float(sweep.get("dwell_ms", 0.0) or 0.0)
+                if step_hz > 0 and stop >= start:
+                    points = int((stop - start) / step_hz) + 1
+                    total_s += max(points, 1) * dwell_ms / 1000.0
+            except (TypeError, ValueError):
+                pass
+        total_s *= max(loop_count, 1)
+        if total_s >= 3600:
+            return f"{total_s / 3600:.2f} h"
+        if total_s >= 60:
+            return f"{total_s / 60:.1f} min"
+        return f"{total_s:.1f} s"
+
+    def _exp_set_status_label(self, label: QLabel, text: str, status: str) -> None:
+        colors = {
+            "ok": "#007a3d",
+            "valid": "#007a3d",
+            "warning": "#b36b00",
+            "error": "#c03030",
+            "running": "#005c8a",
+            "idle": "#666",
+        }
+        label.setText(text)
+        label.setStyleSheet(
+            "font-family: Consolas, 'Courier New', monospace; font-size: 16px; font-weight: 700; "
+            f"color: {colors.get(status, '#005c8a')}; padding: 8px; border: 1px solid #c0c0c0; "
+            "border-radius: 3px; background-color: #f8f8f8;"
+        )
+
+    def _exp_update_validation_report(self, result_or_compiled: Any) -> None:
+        if not hasattr(self, "_exp_validation_status"):
+            return
+        if isinstance(result_or_compiled, CompiledPlan):
+            valid = result_or_compiled.valid
+            errors = [message.message for message in result_or_compiled.errors]
+            warnings = [message.message for message in result_or_compiled.warnings]
+            steps = len(result_or_compiled.plan.get("sequence", {}).get("steps", []))
+        else:
+            result = result_or_compiled if isinstance(result_or_compiled, dict) else {}
+            valid = bool(result.get("valid", False))
+            errors = [str(item) for item in result.get("errors", [])]
+            warnings = [str(item) for item in result.get("warnings", [])]
+            steps = int(result.get("steps", 0) or 0)
+        status = "valid" if valid and not warnings else ("warning" if valid else "error")
+        self._exp_set_status_label(
+            self._exp_validation_status,
+            f"{'VALID' if valid else 'INVALID'} | steps={steps} | errors={len(errors)} | warnings={len(warnings)}",
+            status,
+        )
+        lines: List[str] = []
+        lines.extend(f"ERROR: {item}" for item in errors)
+        lines.extend(f"WARNING: {item}" for item in warnings)
+        if not lines:
+            lines.append("No validation issues.")
+        self._exp_validation_report.setPlainText("\n".join(lines))
+
+    def _exp_update_preflight_report(self, result: Dict[str, Any]) -> None:
+        if not hasattr(self, "_exp_preflight_status"):
+            return
+        checks = result.get("checks", []) if isinstance(result, dict) else []
+        counts = {"ok": 0, "warning": 0, "error": 0, "skipped": 0}
+        lines: List[str] = []
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            status = str(check.get("status", "unknown"))
+            counts[status] = counts.get(status, 0) + 1
+            name = check.get("name", "check")
+            message = check.get("message", "")
+            lines.append(f"{status.upper():7} {name}: {message}")
+        ok = bool(result.get("ok", False)) if isinstance(result, dict) else False
+        status_key = "error" if counts.get("error", 0) else ("warning" if counts.get("warning", 0) else "ok")
+        self._exp_set_status_label(
+            self._exp_preflight_status,
+            f"{'PASS' if ok else 'BLOCKED'} | ok={counts.get('ok', 0)} warning={counts.get('warning', 0)} error={counts.get('error', 0)} skipped={counts.get('skipped', 0)}",
+            status_key,
+        )
+        self._exp_preflight_report.setPlainText("\n".join(lines) if lines else "No preflight result.")
+
+    def _exp_update_run_state(self, result: Dict[str, Any]) -> None:
+        if not hasattr(self, "_exp_run_state_labels") or not isinstance(result, dict):
+            return
+        running = bool(result.get("running", False))
+        paused = bool(result.get("paused", False))
+        error = str(result.get("error", "") or "")
+        status = "failed" if error else ("paused" if paused else ("running" if running else "idle"))
+        step_index = result.get("step_index", "--")
+        step_name = result.get("step_name", "")
+        leases = result.get("leased_resources", [])
+        run_dir = str(result.get("run_dir", "") or "")
+        values = {
+            "run_id": str(result.get("run_id", "--") or "--"),
+            "run_dir": run_dir or "--",
+            "status": status,
+            "step": f"{step_index} {step_name}".strip(),
+            "loop": str(result.get("loop_index", "--")),
+            "leases": ", ".join(str(item) for item in leases) if isinstance(leases, list) else str(leases or "--"),
+            "error": error or "--",
+        }
+        for key, value in values.items():
+            self._exp_run_state_labels[key].setText(value)
+        self._exp_open_run_folder_btn.setEnabled(bool(run_dir and Path(run_dir).exists()))
+
+    def _exp_open_run_folder(self) -> None:
+        run_dir = self._exp_run_state_labels.get("run_dir").text() if hasattr(self, "_exp_run_state_labels") else ""
+        if not run_dir or run_dir == "--" or not Path(run_dir).exists():
+            QMessageBox.information(self, "Run Folder", "No run folder is available yet.")
+            return
+        try:
+            subprocess.Popen(["open", run_dir])
+        except Exception as exc:
+            QMessageBox.warning(self, "Run Folder", str(exc))
 
     def _exp_rebuild_table(self) -> None:
         """Rebuild step table from self._exp_steps."""
@@ -1706,22 +2107,36 @@ class ODMRControlGUI(QMainWindow):
 
     def _exp_validate_plan(self) -> None:
         try:
+            self._exp_compile_draft_preview()
             plan = self._exp_current_plan()
             self._submit_experiment_command(CommandType.EXPERIMENT_VALIDATE, {"plan": plan}, "experiment_validate")
         except Exception as exc:
             QMessageBox.warning(self, "Validate Error", str(exc))
 
+    def _exp_preflight_plan(self) -> None:
+        try:
+            self._exp_compile_draft_preview()
+            plan = self._exp_current_plan()
+            self._submit_experiment_command(CommandType.EXPERIMENT_PREFLIGHT, {"plan": plan}, "experiment_preflight")
+        except Exception as exc:
+            QMessageBox.warning(self, "Preflight Error", str(exc))
+
     def _exp_start_plan(self) -> None:
         try:
+            self._exp_compile_draft_preview()
             plan = self._exp_current_plan()
-            self._submit_experiment_command(CommandType.EXPERIMENT_START, {"plan": plan}, "experiment_start")
+            self._exp_run_workflow = {"plan": plan, "stage": "load"}
+            self._exp_status_label.setText("Run workflow: loading plan")
+            self._submit_experiment_command(CommandType.EXPERIMENT_LOAD_JSON, {"plan": plan}, "experiment_run_load")
         except Exception as exc:
             QMessageBox.warning(self, "Start Error", str(exc))
 
     def _exp_save_json(self) -> None:
         """Save the full experiment plan as JSON."""
         try:
-            plan = self._exp_generate_plan()
+            compiled = self._exp_compile_draft()
+            self._exp_show_compile_report(compiled)
+            plan = compiled.plan
             self._exp_json_preview.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
             path, _ = QFileDialog.getSaveFileName(self, "保存实验方案 / Save Experiment JSON", "", "JSON Files (*.json);;All Files (*)")
             if path:
@@ -1916,10 +2331,14 @@ class ODMRControlGUI(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle(f"编辑步骤 / Edit Step: {step.get('name', '')}")
         dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        dlg.setMinimumWidth(600)
+        dlg.setMinimumWidth(720)
         form = QVBoxLayout(dlg)
 
+        content = QWidget()
         grid = QGridLayout()
+        content.setLayout(grid)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
         row = 0
 
         # Name
@@ -2062,12 +2481,23 @@ class ODMRControlGUI(QMainWindow):
         grid.addWidget(lockin_ch_combo, row, 1)
         row += 1
 
-        form.addLayout(grid)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+        form.addWidget(scroll, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         form.addWidget(buttons)
+
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            dlg.resize(min(840, max(720, available.width() - 120)), min(720, max(520, available.height() - 160)))
+            dlg.setMaximumHeight(max(520, available.height() - 80))
 
         if dlg.exec_() == QDialog.Accepted:
             # Update step name
@@ -2075,10 +2505,13 @@ class ODMRControlGUI(QMainWindow):
 
             # Update magnetic field
             new_mf: Dict[str, float] = {}
+            cartesian_mf = {
+                axis: field_selectors[axis].value_in_base_unit()
+                for axis in ("x_nT", "y_nT", "z_nT")
+            }
             for axis in ("x_nT", "y_nT", "z_nT"):
-                val = field_selectors[axis].value_in_base_unit()
-                if val != 0.0:
-                    new_mf[axis] = val
+                if cartesian_mf[axis] != 0.0:
+                    new_mf[axis] = cartesian_mf[axis]
             magnitude = field_selectors["magnitude_nT"].value_in_base_unit()
             if magnitude != 0.0:
                 new_mf["magnitude_nT"] = magnitude
@@ -2088,6 +2521,8 @@ class ODMRControlGUI(QMainWindow):
                     val = widget.text().strip()
                     if val:
                         new_mf[key] = float(val)
+            if "magnitude_nT" not in new_mf and not any(cartesian_mf.values()):
+                new_mf = cartesian_mf
             step["magnetic_field"] = new_mf
 
             # Update microwave
@@ -2184,8 +2619,81 @@ class ODMRControlGUI(QMainWindow):
             service = CommandService(self._ctrl, self._cfg)
             result = service._execute(Command(cmd_type, params, source="gui"))
             self._exp_status_label.setText(f"{op}: {result}")
+            if op.endswith("validate"):
+                self._exp_update_validation_report(result)
+            elif op.endswith("preflight"):
+                self._exp_update_preflight_report(result)
+            elif op.endswith("query_state") or op.endswith("start"):
+                self._exp_update_run_state(result)
         except Exception as exc:
             QMessageBox.warning(self, "Experiment Error", str(exc))
+
+    def _exp_submit_workflow_step(self, cmd_type: CommandType, op: str, stage: str) -> None:
+        plan = self._exp_run_workflow.get("plan")
+        if not isinstance(plan, dict):
+            self._exp_status_label.setText("Run workflow failed: missing compiled plan")
+            self._exp_run_workflow = {}
+            return
+        self._exp_run_workflow["stage"] = stage
+        self._submit_experiment_command(cmd_type, {"plan": plan}, op)
+
+    def _exp_handle_run_workflow_result(self, op: str, success: bool, message: str, result: dict) -> bool:
+        if not op.startswith("experiment_run_"):
+            return False
+        if not success:
+            self._exp_run_workflow = {}
+            if hasattr(self, "_exp_status_label"):
+                self._exp_status_label.setText(f"{op} failed: {message}")
+            if hasattr(self, "_exp_compile_report"):
+                self._exp_compile_report.setPlainText(str(message))
+            QMessageBox.warning(self, "Experiment Error", message)
+            self._on_log(f"[Experiment] {op} failed: {message}", "smb")
+            return True
+
+        if hasattr(self, "_exp_compile_report"):
+            self._exp_compile_report.setPlainText(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        self._on_log(f"[Experiment] {op} OK: {result}", "smb")
+
+        if op == "experiment_run_load":
+            self._exp_update_validation_report(result)
+            if hasattr(self, "_exp_status_label"):
+                self._exp_status_label.setText("Run workflow: validating plan")
+            self._exp_submit_workflow_step(CommandType.EXPERIMENT_VALIDATE, "experiment_run_validate", "validate")
+            return True
+
+        if op == "experiment_run_validate":
+            self._exp_update_validation_report(result)
+            if not result.get("valid", False):
+                self._exp_run_workflow = {}
+                if hasattr(self, "_exp_status_label"):
+                    self._exp_status_label.setText("Run workflow stopped: validation failed")
+                return True
+            if hasattr(self, "_exp_status_label"):
+                self._exp_status_label.setText("Run workflow: running preflight")
+            self._exp_submit_workflow_step(CommandType.EXPERIMENT_PREFLIGHT, "experiment_run_preflight", "preflight")
+            return True
+
+        if op == "experiment_run_preflight":
+            self._exp_update_preflight_report(result)
+            if not result.get("ok", False):
+                self._exp_run_workflow = {}
+                if hasattr(self, "_exp_status_label"):
+                    self._exp_status_label.setText("Run workflow stopped: preflight failed")
+                return True
+            if hasattr(self, "_exp_status_label"):
+                self._exp_status_label.setText("Run workflow: starting run")
+            self._exp_submit_workflow_step(CommandType.EXPERIMENT_START, "experiment_run_start", "start")
+            return True
+
+        if op == "experiment_run_start":
+            self._exp_run_workflow = {}
+            self._exp_update_run_state(result)
+            if hasattr(self, "_exp_status_label"):
+                run_id = result.get("run_id", "")
+                self._exp_status_label.setText(f"Run started: {run_id}" if run_id else "Run started")
+            return True
+
+        return True
 
     # -----------------------------------------------------------------------
     # Page 1: Parameter Config (Source + Lock-in tabs)
@@ -2280,19 +2788,28 @@ class ODMRControlGUI(QMainWindow):
         # -- Modulation --------------------------------------------------------
         mod_group = QGroupBox("调制 / Modulation")
         mod_layout = QGridLayout(mod_group)
-        mod_layout.addWidget(QLabel("FM 偏差 (Hz):"), 0, 0)
+        mod_layout.addWidget(QLabel("FM Source:"), 0, 0)
+        self._fm_source_combo = QComboBox()
+        self._fm_source_combo.addItems(["INT", "EXT", "INT,EXT"])
+        mod_layout.addWidget(self._fm_source_combo, 0, 1)
+        mod_layout.addWidget(QLabel("FM Mode:"), 0, 2)
+        self._fm_mode_combo = QComboBox()
+        self._fm_mode_combo.addItems(["NORM", "LNO", "HDEV"])
+        self._fm_mode_combo.setCurrentText("HDEV")
+        mod_layout.addWidget(self._fm_mode_combo, 0, 3)
+        mod_layout.addWidget(QLabel("FM 偏差 (Hz):"), 1, 0)
         self._fm_dev_edit = QLineEdit(str(cfg_sweep["fm_dev_hz"]))
-        mod_layout.addWidget(self._fm_dev_edit, 0, 1)
+        mod_layout.addWidget(self._fm_dev_edit, 1, 1)
         btn = QPushButton("设 / Set")
         btn.setObjectName("primaryBtn")
         btn.clicked.connect(lambda: self._set_fm_dev(self._fm_dev_edit.text()))
-        mod_layout.addWidget(btn, 0, 2)
+        mod_layout.addWidget(btn, 1, 2)
         self._am_toggle = QCheckBox("AM 调制 / AM Modulation")
-        mod_layout.addWidget(self._am_toggle, 1, 0)
-        mod_layout.addWidget(QLabel("AM 深度 (%):"), 1, 1)
+        mod_layout.addWidget(self._am_toggle, 2, 0)
+        mod_layout.addWidget(QLabel("AM 深度 (%):"), 2, 1)
         self._am_depth_edit = QLineEdit("0")
-        mod_layout.addWidget(self._am_depth_edit, 1, 2)
-        mod_layout.setColumnStretch(3, 1)
+        mod_layout.addWidget(self._am_depth_edit, 2, 2)
+        mod_layout.setColumnStretch(4, 1)
         layout.addWidget(mod_group)
 
         # -- LF Generator ------------------------------------------------------
@@ -2329,8 +2846,14 @@ class ODMRControlGUI(QMainWindow):
         layout.addWidget(lf_group)
 
         # -- RF Sweep ---------------------------------------------------------
-        rf_sweep_group = QGroupBox("RF 扫频 / RF Sweep")
+        rf_sweep_group = QGroupBox("Manual SMB Diagnostic Sweep / RF Sweep")
         rf_sweep = QGridLayout(rf_sweep_group)
+        sweep_note = QLabel(
+            "Device diagnostic only. This does not change the Run Designer draft or define a formal ODMR experiment."
+        )
+        sweep_note.setWordWrap(True)
+        sweep_note.setStyleSheet("color: #666;")
+        rf_sweep.addWidget(sweep_note, 0, 0, 1, 4)
         sweep_defaults = {
             "start_hz": cfg_sweep.get("start_hz", 2.82e9),
             "stop_hz": cfg_sweep.get("stop_hz", 2.92e9),
@@ -2346,28 +2869,40 @@ class ODMRControlGUI(QMainWindow):
             ("Stop (Hz):", self._rf_sweep_stop_edit),
             ("Step (Hz):", self._rf_sweep_step_edit),
             ("Dwell (ms):", self._rf_sweep_dwell_edit),
-        )):
+        ), start=1):
             rf_sweep.addWidget(QLabel(label), row, 0)
             rf_sweep.addWidget(widget, row, 1)
         self._rf_sweep_shape_combo = QComboBox()
         self._rf_sweep_shape_combo.addItems(["SAWTOOTH", "TRIANGLE"])
-        rf_sweep.addWidget(QLabel("Shape:"), 0, 2)
-        rf_sweep.addWidget(self._rf_sweep_shape_combo, 0, 3)
+        rf_sweep.addWidget(QLabel("Shape:"), 1, 2)
+        rf_sweep.addWidget(self._rf_sweep_shape_combo, 1, 3)
+        self._rf_sweep_spacing_combo = QComboBox()
+        self._rf_sweep_spacing_combo.addItems(["LIN", "LOG"])
+        rf_sweep.addWidget(QLabel("Spacing:"), 1, 4)
+        rf_sweep.addWidget(self._rf_sweep_spacing_combo, 1, 5)
         self._rf_sweep_retrace_combo = QComboBox()
         self._rf_sweep_retrace_combo.addItems(["ON", "OFF"])
-        rf_sweep.addWidget(QLabel("Retrace:"), 1, 2)
-        rf_sweep.addWidget(self._rf_sweep_retrace_combo, 1, 3)
+        rf_sweep.addWidget(QLabel("Retrace:"), 2, 2)
+        rf_sweep.addWidget(self._rf_sweep_retrace_combo, 2, 3)
         self._rf_sweep_trigger_combo = QComboBox()
         self._rf_sweep_trigger_combo.addItems(["IMM", "EXT", "BUS"])
-        rf_sweep.addWidget(QLabel("Trigger:"), 2, 2)
-        rf_sweep.addWidget(self._rf_sweep_trigger_combo, 2, 3)
+        rf_sweep.addWidget(QLabel("Trigger:"), 3, 2)
+        rf_sweep.addWidget(self._rf_sweep_trigger_combo, 3, 3)
+        self._rf_sweep_lfc_check = QCheckBox("LF ramp")
+        rf_sweep.addWidget(self._rf_sweep_lfc_check, 2, 4)
+        self._rf_sweep_ovolt_start_edit = QLineEdit("0")
+        self._rf_sweep_ovolt_stop_edit = QLineEdit("3")
+        rf_sweep.addWidget(QLabel("V start:"), 3, 4)
+        rf_sweep.addWidget(self._rf_sweep_ovolt_start_edit, 3, 5)
+        rf_sweep.addWidget(QLabel("V stop:"), 4, 4)
+        rf_sweep.addWidget(self._rf_sweep_ovolt_stop_edit, 4, 5)
         set_sweep_btn = QPushButton("配置扫频 / Configure")
         set_sweep_btn.setObjectName("primaryBtn")
         set_sweep_btn.clicked.connect(self._apply_rf_sweep_config)
-        rf_sweep.addWidget(set_sweep_btn, 3, 2)
+        rf_sweep.addWidget(set_sweep_btn, 4, 2)
         start_sweep_btn = QPushButton("执行 / Execute")
         start_sweep_btn.clicked.connect(lambda: self._cmd_service and self._cmd_service.submit(Command(CommandType.SMB_START_SWEEP, source="gui")))
-        rf_sweep.addWidget(start_sweep_btn, 3, 3)
+        rf_sweep.addWidget(start_sweep_btn, 4, 3)
         layout.addWidget(rf_sweep_group)
 
         # -- Apply All ---------------------------------------------------------
@@ -2378,6 +2913,9 @@ class ODMRControlGUI(QMainWindow):
         query_btn = QPushButton("读取 SMB 配置 / Query Config")
         query_btn.clicked.connect(lambda: self._cmd_service and self._cmd_service.submit(Command(CommandType.SMB_QUERY_CONFIG, source="gui")))
         layout.addWidget(query_btn)
+        copy_draft_btn = QPushButton("复制当前微波设置到 Run Designer / Copy Current Microwave to Draft")
+        copy_draft_btn.clicked.connect(self._copy_smb_config_to_experiment_draft)
+        layout.addWidget(copy_draft_btn)
 
         layout.addStretch()
         page.setWidget(inner)
@@ -2443,7 +2981,6 @@ class ODMRControlGUI(QMainWindow):
             layout, "输入与滤波器 / INPUT / FILTERS",
             [
                 ("输入模式：A=单端, AB=差分, I=电流\nSource (0=A,1=AB,2=I6,3=I8)", "source", 0, "combo", ["A", "AB", "I(10^6)", "I(10^8)"]),
-                ("电流增益（放大倍数）\nCurrent Gain (0=1,1=10,2=100)", "gain", 0, "combo", ["1", "10", "100"]),
                 ("接地方式：浮地 / 接地\nGrounding (0=Float,1=Ground)", "ground", 0, "combo", ["Float", "Ground"]),
                 ("耦合方式：AC=交流(0.16Hz高通), DC=直流\nCoupling (0=AC,1=DC)", "coupling", 0, "combo", ["AC", "DC"]),
                 ("工频陷波器：关 / 50Hz / 50+100Hz / 100Hz\nLine Notch (0=Off,1=50Hz,2=50+100,3=100Hz)", "notch", 1, "combo", ["Off", "50Hz", "50+100Hz", "100Hz"]),
@@ -2481,17 +3018,24 @@ class ODMRControlGUI(QMainWindow):
             btn.clicked.connect(lambda _k=key, _w=w: self._set_lockin_gain(_k, _w))
 
         # 通道输出 / CHANNEL OUTPUT
+        output_sources = [
+            "0: A-R", "1: A-X", "2: A-Y", "3: A-theta", "4: A-Rh1", "5: A-Xh1", "6: A-Yh1",
+            "7: A-theta h1", "8: A-Rh2", "9: A-Xh2", "10: A-Yh2", "11: A-theta h2",
+            "12: A-Noise", "13: A-E1", "14: A-E2", "15: A-E3", "16: A-E4",
+            "17: B-R", "18: B-X", "19: B-Y", "20: B-theta", "21: B-Rh1", "22: B-Xh1",
+            "23: B-Yh1", "24: B-theta h1", "25: B-Rh2", "26: B-Xh2", "27: B-Yh2",
+            "28: B-theta h2", "29: B-Noise", "30: B-E1", "31: B-E2", "32: B-E3",
+            "33: B-E4", "34: AUXOUT",
+        ]
         self._lockin_output_widgets = add_param_group(
             layout, "通道输出 / CHANNEL OUTPUT",
             [
                 ("输出通道号\nOutput CH (1 or 2)", "out_ch", "1", "line"),
-                ("输出源（X/Y/R/θ/各谐波/Noise/AUXOUT）\nSource", "out_source", 0, "combo", [
-                    "0: X", "1: Y", "2: R", "3: theta", "4: Xh1", "5: Yh1", "6: Rh1",
-                    "7: theta_h1", "8: Xh2", "9: Yh2", "10: Rh2", "11: theta_h2",
-                    "12: noise", "13: AUX1", "14: AUX2",
-                ]),
-                ("偏置（-100%~+100%）\nOffset (-10000~10000)", "out_offset", "0", "line"),
-                ("扩展倍数\nExpand (0=1,1=10,2=100)", "out_expand", 0, "combo", ["1", "10", "100"]),
+                ("输出源（手册 FPOPD k）\nSource", "out_source", 0, "combo", output_sources),
+                ("偏置百分比（-100~+100）\nOffset (%)", "out_offset", "0", "line"),
+                ("放大倍数\nExpand (1..256)", "out_expand", "1", "line"),
+                ("速度\nSpeed (0=Slow,1=Fast)", "out_speed", 0, "combo", ["Slow", "Fast"]),
+                ("AUXOUT 直流幅值 (Vdc)\nAux voltage", "out_aux_voltage", "0", "line"),
             ]
         )
         for key, (w, btn) in self._lockin_output_widgets.items():
@@ -2592,9 +3136,13 @@ class ODMRControlGUI(QMainWindow):
         w_src = self._lockin_output_widgets["out_source"][0]
         params["source"] = w_src.currentIndex() if isinstance(w_src, QComboBox) else int(w_src.text())
         w_off = self._lockin_output_widgets["out_offset"][0]
-        params["offset"] = int(w_off.text()) if isinstance(w_off, QLineEdit) else 0
+        params["offset"] = float(w_off.text()) if isinstance(w_off, QLineEdit) else 0.0
         w_exp = self._lockin_output_widgets["out_expand"][0]
-        params["expand"] = w_exp.currentIndex() if isinstance(w_exp, QComboBox) else 0
+        params["expand"] = int(w_exp.text()) if isinstance(w_exp, QLineEdit) else 1
+        w_speed = self._lockin_output_widgets["out_speed"][0]
+        params["speed"] = w_speed.currentIndex() if isinstance(w_speed, QComboBox) else 0
+        w_aux = self._lockin_output_widgets["out_aux_voltage"][0]
+        params["aux_voltage_v"] = float(w_aux.text()) if isinstance(w_aux, QLineEdit) else 0.0
         self._send_lockin_cmd(CommandType.LOCKIN_SET_OUTPUT, params)
 
     def _apply_lockin_config_page(self) -> None:
@@ -2602,16 +3150,16 @@ class ODMRControlGUI(QMainWindow):
         ch = self._get_lockin_ctrl_channel()
         input_cfg = {
             "source": self._lockin_input_widgets["source"][0].currentIndex(),
-            "gain": self._lockin_input_widgets["gain"][0].currentIndex(),
             "ground": self._lockin_input_widgets["ground"][0].currentIndex(),
             "coupling": self._lockin_input_widgets["coupling"][0].currentIndex(),
             "notch": self._lockin_input_widgets["notch"][0].currentIndex(),
         }
+        freq_widget = self._lockin_ref_widgets["freq"][0]
         ref_cfg = {
             "phase_deg": float(self._lockin_ref_widgets["phase"][0].text()),
             "source": self._lockin_ref_widgets["ref_source"][0].currentIndex(),
             "slope": self._lockin_ref_widgets["slope"][0].currentIndex(),
-            "freq_hz": float(self._lockin_ref_widgets["freq"][0].text()),
+            "freq_hz": freq_widget.value_in_base_unit() if isinstance(freq_widget, FrequencyUnitSelector) else float(freq_widget.text()),
             "harmonic": int(self._lockin_ref_widgets["harmonic"][0].text()),
         }
         gain_cfg = {
@@ -2624,8 +3172,10 @@ class ODMRControlGUI(QMainWindow):
         output_cfg = {
             "output_ch": int(self._lockin_output_widgets["out_ch"][0].text()),
             "source": self._lockin_output_widgets["out_source"][0].currentIndex(),
-            "offset": int(self._lockin_output_widgets["out_offset"][0].text()),
-            "expand": self._lockin_output_widgets["out_expand"][0].currentIndex(),
+            "offset": float(self._lockin_output_widgets["out_offset"][0].text()),
+            "expand": int(self._lockin_output_widgets["out_expand"][0].text()),
+            "speed": self._lockin_output_widgets["out_speed"][0].currentIndex(),
+            "aux_voltage_v": float(self._lockin_output_widgets["out_aux_voltage"][0].text()),
         }
         config = {"channel": ch, "input": input_cfg, "ref": ref_cfg, "gain_tc": gain_cfg, "output": output_cfg}
         self._send_lockin_cmd(CommandType.LOCKIN_APPLY_CONFIG, config)
@@ -2846,6 +3396,10 @@ class ODMRControlGUI(QMainWindow):
         """启动 RALL? 波形采集（页面切换到波形时调用）。"""
         self._waveform_page_active = True
         if not self._waveform_rall_running and self._ctrl.is_lockin_connected:
+            if not self._ctrl.lockin.rall_supported:
+                self._wave_status_label.setText("RALL? 需要 USB2.0；RS232 下使用 SNAPD 监控")
+                self._on_log("[Waveform] RALL? skipped: selected interface is RS232/SNAPD", "lockin")
+                return
             try:
                 self._ctrl.start_lockin_acquire(None)
                 self._waveform_rall_running = True
@@ -2878,9 +3432,15 @@ class ODMRControlGUI(QMainWindow):
         inner = QWidget()
         layout = QVBoxLayout(inner)
 
-        title = QLabel("扫频实验 / Sweep Experiment")
+        title = QLabel("Legacy Sweep / Manual Diagnostic")
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
+        legacy_note = QLabel(
+            "Manual diagnostic only. Formal ODMR experiments are designed in Run Designer and executed through CommandService.EXPERIMENT_*."
+        )
+        legacy_note.setWordWrap(True)
+        legacy_note.setStyleSheet("color: #666;")
+        layout.addWidget(legacy_note)
 
         cfg_sweep = self._cfg["sweep"]
 
@@ -2922,11 +3482,11 @@ class ODMRControlGUI(QMainWindow):
 
         # -- Control buttons --------------------------------------------------
         btn_layout = QHBoxLayout()
-        self._start_sweep_btn = QPushButton("开始扫频 / Start Sweep")
+        self._start_sweep_btn = QPushButton("开始手动扫频 / Start Manual Sweep")
         self._start_sweep_btn.setObjectName("primaryBtn")
         self._start_sweep_btn.clicked.connect(self._start_sweep)
         btn_layout.addWidget(self._start_sweep_btn)
-        self._stop_sweep_btn = QPushButton("停止扫频 / Stop Sweep")
+        self._stop_sweep_btn = QPushButton("停止手动扫频 / Stop Manual Sweep")
         self._stop_sweep_btn.setObjectName("dangerBtn")
         self._stop_sweep_btn.clicked.connect(self._stop_sweep)
         self._stop_sweep_btn.setEnabled(False)
@@ -3162,17 +3722,18 @@ class ODMRControlGUI(QMainWindow):
         else:
             port = self._lockin_port_combo.currentData() or self._lockin_port_combo.currentText()
             baud = int(self._lockin_baud_combo.currentText())
+            transport = self._lockin_transport_combo.currentData() or "rs232"
             if self._cmd_service is not None:
                 cmd = Command(
                     CommandType.LOCKIN_CONNECT,
-                    {"port": port, "baudrate": baud},
+                    {"port": port, "baudrate": baud, "transport": transport},
                     source="gui",
                 )
                 req = self._cmd_service.submit(cmd)
                 self._pending_cmds[req] = ("lockin_connect", port)
             else:
                 try:
-                    idn = self._ctrl.connect_lockin(port, baud)
+                    idn = self._ctrl.connect_lockin(port, baud, transport=transport)
                     self._lockin_conn_btn.setText("断开 / Disconnect")
                     self._lockin_led.setProperty("on", "true")
                     self._lockin_led.style().unpolish(self._lockin_led)
@@ -3489,6 +4050,10 @@ class ODMRControlGUI(QMainWindow):
                 (CommandType.SMB_SET_LF_FREQ, {"freq_hz": lf_freq_hz}),
                 (CommandType.SMB_SET_LF_SHAPE, {"shape": self._lf_shape_combo.currentText()}),
                 (CommandType.SMB_SET_FM_DEVIATION, {"hz": float(self._fm_dev_edit.text())}),
+                (CommandType.SMB_APPLY_CONFIG, {"modulation": {
+                    "fm_source": self._fm_source_combo.currentText(),
+                    "fm_mode": self._fm_mode_combo.currentText(),
+                }, "lf": {"impedance": self._lf_impedance_combo.currentText()}}),
             ]
             if self._cmd_service is not None:
                 for ct, pr in params:
@@ -3498,6 +4063,9 @@ class ODMRControlGUI(QMainWindow):
                 self._ctrl.smb.set_lf_voltage(float(self._lf_amp_edit.text()))
                 self._ctrl.smb.set_lf_freq(lf_freq_hz)
                 self._ctrl.smb.set_lf_shape(self._lf_shape_combo.currentText())
+                self._ctrl.smb.set_lf_impedance(self._lf_impedance_combo.currentText())
+                self._ctrl.smb.set_fm_source(self._fm_source_combo.currentText())
+                self._ctrl.smb.set_fm_mode(self._fm_mode_combo.currentText())
                 self._ctrl.smb.set_fm_deviation(float(self._fm_dev_edit.text()))
             self._on_log("All parameters applied", "smb")
         except Exception as exc:
@@ -3519,6 +4087,8 @@ class ODMRControlGUI(QMainWindow):
             },
             "modulation": {
                 "fm_deviation_hz": float(self._fm_dev_edit.text()),
+                "fm_source": self._fm_source_combo.currentText(),
+                "fm_mode": self._fm_mode_combo.currentText(),
                 "fm_state": self._fm_toggle.isChecked(),
                 "am_depth_pct": float(self._am_depth_edit.text()),
                 "am_state": self._am_toggle.isChecked(),
@@ -3528,9 +4098,13 @@ class ODMRControlGUI(QMainWindow):
                 "stop_hz": float(self._rf_sweep_stop_edit.text()),
                 "step_hz": float(self._rf_sweep_step_edit.text()),
                 "dwell_ms": float(self._rf_sweep_dwell_edit.text()),
+                "spacing": self._rf_sweep_spacing_combo.currentText(),
                 "shape": self._rf_sweep_shape_combo.currentText(),
                 "retrace": self._rf_sweep_retrace_combo.currentText() == "ON",
                 "trigger": self._rf_sweep_trigger_combo.currentText(),
+                "lf_connector": self._rf_sweep_lfc_check.isChecked(),
+                "ovolt_start_v": float(self._rf_sweep_ovolt_start_edit.text()),
+                "ovolt_stop_v": float(self._rf_sweep_ovolt_stop_edit.text()),
             },
         }
 
@@ -3562,6 +4136,13 @@ class ODMRControlGUI(QMainWindow):
                 "step_hz": sweep["step_hz"],
                 "dwell_ms": sweep["dwell_ms"],
                 "power_dbm": cfg["power_dbm"],
+                "spacing": sweep["spacing"],
+                "shape": sweep["shape"],
+                "retrace": sweep["retrace"],
+                "trigger": sweep["trigger"],
+                "lf_connector": sweep["lf_connector"],
+                "ovolt_start_v": sweep["ovolt_start_v"],
+                "ovolt_stop_v": sweep["ovolt_stop_v"],
             }
             if self._cmd_service is not None:
                 self._cmd_service.submit(Command(CommandType.SMB_SET_SWEEP, params, source="gui"))
@@ -3571,6 +4152,27 @@ class ODMRControlGUI(QMainWindow):
             self._on_log("RF sweep configured", "smb")
         except Exception as exc:
             self._on_error("Configure RF sweep failed: " + str(exc))
+
+    def _copy_smb_config_to_experiment_draft(self) -> None:
+        if not hasattr(self, "_exp_mode_combo"):
+            QMessageBox.warning(self, "Run Designer", "Run Designer is not initialized yet.")
+            return
+        try:
+            cfg = self._collect_smb_config_page()
+            sweep = cfg["sweep"]
+            self._exp_mode_combo.setCurrentText("ODMR Sweep Draft")
+            self._exp_mw_enable.setChecked(True)
+            self._exp_mw_start_selector.set_value_in_base_unit(sweep["start_hz"])
+            self._exp_mw_stop_selector.set_value_in_base_unit(sweep["stop_hz"])
+            self._exp_mw_step_selector.set_value_in_base_unit(sweep["step_hz"])
+            self._exp_mw_dwell_selector.set_value_in_base_unit(sweep["dwell_ms"] / 1000.0)
+            self._exp_mw_power_selector.set_value_in_base_unit(cfg["power_dbm"])
+            self._exp_mw_execute.setChecked(True)
+            self._exp_mw_rf_output.setChecked(bool(cfg["rf_output"]))
+            self._exp_compile_draft_preview()
+            self._on_log("Copied manual SMB settings to Run Designer draft", "smb")
+        except Exception as exc:
+            self._on_error("Copy SMB config to Run Designer failed: " + str(exc))
 
     def _toggle_rf_output(self, state):
         if not self._ctrl.is_smb_connected:
@@ -3644,6 +4246,7 @@ class ODMRControlGUI(QMainWindow):
             self._on_error("激光输出切换失败: " + str(exc))
 
     def _start_sweep(self):
+        """Legacy manual diagnostic sweep; formal runs use Run Designer/CommandService.EXPERIMENT_*."""
         if not self._ctrl.is_smb_connected:
             QMessageBox.warning(self, "Warning", "Please connect SMB100A first")
             return
@@ -4050,6 +4653,8 @@ class ODMRControlGUI(QMainWindow):
         if request_id not in self._pending_cmds:
             return
         op, ctx = self._pending_cmds.pop(request_id)
+        if self._exp_handle_run_workflow_result(op, success, message, result):
+            return
 
         if op == "smb_connect":
             if success:
@@ -4205,10 +4810,20 @@ class ODMRControlGUI(QMainWindow):
             if success:
                 if hasattr(self, "_exp_status_label"):
                     self._exp_status_label.setText(f"{op}: {result}")
+                if hasattr(self, "_exp_compile_report"):
+                    self._exp_compile_report.setPlainText(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                if op.endswith("validate"):
+                    self._exp_update_validation_report(result)
+                elif op.endswith("preflight"):
+                    self._exp_update_preflight_report(result)
+                elif op.endswith("query_state") or op.endswith("start"):
+                    self._exp_update_run_state(result)
                 self._on_log(f"[Experiment] {op} OK: {result}", "smb")
             else:
                 if hasattr(self, "_exp_status_label"):
                     self._exp_status_label.setText(f"{op} failed: {message}")
+                if hasattr(self, "_exp_compile_report"):
+                    self._exp_compile_report.setPlainText(str(message))
                 QMessageBox.warning(self, "Experiment Error", message)
                 self._on_log(f"[Experiment] {op} failed: {message}", "smb")
 

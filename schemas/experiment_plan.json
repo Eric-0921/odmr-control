@@ -11,6 +11,30 @@
     },
     "sequence": {
       "$ref": "#/definitions/sequence"
+    },
+    "devices": {
+      "type": "object",
+      "description": "实验相关设备配置摘要",
+      "additionalProperties": true
+    },
+    "defaults": {
+      "type": "object",
+      "description": "步骤默认参数",
+      "properties": {
+        "settle_s": {"type": "number", "minimum": 0},
+        "hold_s": {"type": "number", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "recording": {
+      "type": "object",
+      "description": "全局记录配置",
+      "additionalProperties": true
+    },
+    "safety": {
+      "type": "object",
+      "description": "安全策略配置",
+      "additionalProperties": true
     }
   },
   "additionalProperties": false,
@@ -107,6 +131,30 @@
         },
         "acquisition": {
           "$ref": "#/definitions/acquisition"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["normal", "wait", "conditional"],
+          "description": "步骤类型"
+        },
+        "condition": {
+          "$ref": "#/definitions/condition"
+        },
+        "then_step": {
+          "description": "条件为真时跳转的步骤名称或索引"
+        },
+        "else_step": {
+          "description": "条件为假时跳转的步骤名称或索引"
+        },
+        "duration_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "等待步骤持续时间"
+        },
+        "parameter_overrides": {
+          "type": "object",
+          "description": "对后续步骤的参数覆盖",
+          "additionalProperties": true
         }
       },
       "additionalProperties": true
@@ -320,12 +368,12 @@
       "properties": {
         "start_trigger": {
           "type": "string",
-          "enum": ["step_start", "setpoints_applied", "magnetic_settled", "microwave_output_on", "microwave_sweep_start", "inline", "disabled"],
+          "enum": ["step_start", "setpoints_applied", "magnetic_settled", "microwave_output_on", "microwave_sweep_start", "manual", "external_trigger", "condition_met", "inline", "disabled"],
           "description": "采集启动触发条件"
         },
         "stop_trigger": {
           "type": "string",
-          "enum": ["hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end", "disabled"],
+          "enum": ["hold_elapsed", "timed", "microwave_sweep_complete", "manual", "step_end", "condition_met", "external_trigger", "disabled"],
           "description": "采集停止触发条件"
         },
         "start_recording": {
@@ -355,9 +403,45 @@
             "enum": ["CH-A", "CH-B", "ADC", "SMB", "Laser", "MagneticField", "System"]
           },
           "description": "要录制的数据列组，默认全部。可选择性录制以减小文件体积"
+        },
+        "start_condition": {
+          "$ref": "#/definitions/condition"
+        },
+        "stop_condition": {
+          "$ref": "#/definitions/condition"
+        },
+        "condition_timeout_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "条件触发等待超时"
         }
       },
       "additionalProperties": false
+    },
+    "condition": {
+      "type": "object",
+      "description": "实验条件表达式",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["always", "never", "field_magnitude", "field_stable", "lockin_value", "microwave_freq", "composite"]
+        },
+        "axis": {"type": "string"},
+        "operator": {"type": "string", "enum": [">", ">=", "<", "<=", "==", "!="]},
+        "value": {"type": "number"},
+        "value_hz": {"type": "number"},
+        "tolerance_nT": {"type": "number", "minimum": 0},
+        "window_s": {"type": "number", "minimum": 0},
+        "channel": {"type": "integer", "enum": [1, 2]},
+        "param": {"type": "string"},
+        "logic": {"type": "string", "enum": ["and", "or"]},
+        "conditions": {
+          "type": "array",
+          "items": {"$ref": "#/definitions/condition"}
+        }
+      },
+      "required": ["type"],
+      "additionalProperties": true
     }
   }
 }

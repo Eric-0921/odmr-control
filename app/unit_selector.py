@@ -23,7 +23,7 @@ from typing import Dict, Optional
 
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtGui import QDoubleValidator
-from PyQt5.QtWidgets import QHBoxLayout, QLineEdit, QComboBox, QWidget
+from PyQt5.QtWidgets import QHBoxLayout, QLineEdit, QComboBox, QSizePolicy, QWidget
 
 
 # ---------------------------------------------------------------------------
@@ -117,16 +117,19 @@ class UnitSelector(QWidget):
         layout.setSpacing(4)
 
         self._edit = QLineEdit()
+        self._edit.setMinimumWidth(100)
+        self._edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         if validator is not None:
             self._edit.setValidator(validator)
         else:
             self._edit.setValidator(QDoubleValidator())
-        layout.addWidget(self._edit)
+        layout.addWidget(self._edit, 1)
 
         self._combo = QComboBox()
         self._combo.addItems(list(self._units.keys()))
         self._combo.setCurrentText(default_unit)
-        self._combo.setFixedWidth(80)
+        self._combo.setMinimumWidth(72)
+        self._combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         layout.addWidget(self._combo)
 
         # 初始化显示值

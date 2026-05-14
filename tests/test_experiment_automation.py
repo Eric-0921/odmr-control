@@ -258,6 +258,49 @@ class TestExperimentPlanValidation(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertEqual(result["steps"], 1)
 
+    def test_validate_accepts_gui_generated_top_level_sections(self):
+        """GUI 生成的完整计划包含 devices/defaults/recording/safety，应通过 schema 校验。"""
+        plan = {
+            "metadata": {"name": "gui_plan", "generated_by": "odmr-control-gui"},
+            "devices": {"smb100a": {"enabled": False}},
+            "defaults": {"settle_s": 0.0, "hold_s": 0.0},
+            "sequence": {
+                "loop_count": 1,
+                "steps": [
+                    {"name": "zero", "magnetic_field": {"x_nT": 0, "y_nT": 0, "z_nT": 0}},
+                ],
+            },
+            "recording": {"output_dir": "./experiments", "format": "csv"},
+            "safety": {"on_error": "rf_off_mag_off_stop_recording"},
+        }
+
+        result = self.service._execute(Command(CommandType.EXPERIMENT_VALIDATE, {"plan": plan}))
+
+        self.assertTrue(result["valid"], result["errors"])
+
+    def test_validate_accepts_condition_trigger_schema_fields(self):
+        """运行时支持的 condition_met 触发器及条件字段也应通过 schema 校验。"""
+        plan = {
+            "sequence": {
+                "steps": [
+                    {
+                        "name": "condition_acq",
+                        "acquisition": {
+                            "start_trigger": "condition_met",
+                            "start_condition": {"type": "always"},
+                            "stop_trigger": "condition_met",
+                            "stop_condition": {"type": "always"},
+                            "condition_timeout_s": 0.1,
+                        },
+                    },
+                ],
+            },
+        }
+
+        result = self.service._execute(Command(CommandType.EXPERIMENT_VALIDATE, {"plan": plan}))
+
+        self.assertTrue(result["valid"], result["errors"])
+
 
 # ---------------------------------------------------------------------------
 # 实验计划加载测试
@@ -627,6 +670,66 @@ class TestExperimentLifecycle(unittest.TestCase):
         state = self.service._execute(Command(CommandType.EXPERIMENT_QUERY_STATE))
         self.assertFalse(state["running"])
         self.assertEqual(step_counter["count"], 3)
+
+    def test_experiment_applies_loop_delay_between_loops(self):
+        """sequence.loop_delay 应在循环之间生效。"""
+        slept = []
+        original_sleep = self.service._interruptible_experiment_sleep
+
+        def fake_sleep(seconds):
+            slept.append(seconds)
+
+        self.service._interruptible_experiment_sleep = fake_sleep
+
+        plan = {
+            "sequence": {
+                "loop_count": 2,
+                "loop_delay": 1.25,
+                "steps": [
+                    {"name": "looped_step", "timing": {"settle_s": 0.0, "hold_s": 0.0}},
+                ],
+            },
+        }
+
+        self.service._execute(Command(CommandType.EXPERIMENT_LOAD_JSON, {"plan": plan}))
+        self.service._execute(Command(CommandType.EXPERIMENT_START))
+        time.sleep(0.3)
+
+        self.service._interruptible_experiment_sleep = original_sleep
+        self.assertIn(1.25, slept)
+
+    def test_experiment_return_to_zero_sets_zero_field_after_success(self):
+        """sequence.return_to_zero=True 时，实验正常结束后应发送三轴归零命令。"""
+        commands = []
+        original_execute = self.service._execute
+
+        def recording_execute(command):
+            commands.append(command)
+            return original_execute(command)
+
+        self.service._execute = recording_execute
+
+        plan = {
+            "sequence": {
+                "loop_count": 1,
+                "return_to_zero": True,
+                "steps": [
+                    {"name": "step", "timing": {"settle_s": 0.0, "hold_s": 0.0}},
+                ],
+            },
+        }
+
+        self.service._execute(Command(CommandType.EXPERIMENT_LOAD_JSON, {"plan": plan}))
+        self.service._execute(Command(CommandType.EXPERIMENT_START))
+        time.sleep(0.3)
+
+        self.service._execute = original_execute
+        zero_commands = [
+            command for command in commands
+            if command.cmd_type == CommandType.MAG_SET_FIELD_3D
+            and command.params == {"x_nT": 0.0, "y_nT": 0.0, "z_nT": 0.0}
+        ]
+        self.assertTrue(zero_commands)
 
     def test_experiment_safety_stop_on_error(self):
         """实验执行中出错时应触发安全停止。"""
