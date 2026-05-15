@@ -52,6 +52,11 @@ UNIT_CONVERSIONS: Dict[str, Dict[str, float]] = {
         "min": 60.0,
         "h": 3600.0,
     },
+    "voltage": {
+        "uV": 1e-6,
+        "mV": 1e-3,
+        "V": 1.0,
+    },
 }
 
 
@@ -206,11 +211,11 @@ class UnitSelector(QWidget):
 class FrequencyUnitSelector(UnitSelector):
     """频率单位选择器: Hz / kHz / MHz / GHz"""
 
-    def __init__(self, value: float = 0.0, validator=None, parent=None):
+    def __init__(self, value: float = 0.0, default_unit: str = "GHz", validator=None, parent=None):
         super().__init__(
             value=value,
             units=UNIT_CONVERSIONS["frequency"],
-            default_unit="GHz",
+            default_unit=default_unit,
             validator=validator,
             parent=parent,
         )
@@ -232,11 +237,24 @@ class MagneticFieldUnitSelector(UnitSelector):
 class TimeUnitSelector(UnitSelector):
     """时间单位选择器: us / ms / s / min / h"""
 
-    def __init__(self, value: float = 0.0, validator=None, parent=None):
+    def __init__(self, value: float = 0.0, default_unit: str = "s", validator=None, parent=None):
         super().__init__(
             value=value,
             units=UNIT_CONVERSIONS["time"],
-            default_unit="s",
+            default_unit=default_unit,
+            validator=validator,
+            parent=parent,
+        )
+
+
+class VoltageUnitSelector(UnitSelector):
+    """电压单位选择器: uV / mV / V，基础单位为 V。"""
+
+    def __init__(self, value: float = 0.0, default_unit: str = "V", validator=None, parent=None):
+        super().__init__(
+            value=value,
+            units=UNIT_CONVERSIONS["voltage"],
+            default_unit=default_unit,
             validator=validator,
             parent=parent,
         )

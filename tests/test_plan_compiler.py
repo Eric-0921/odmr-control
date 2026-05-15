@@ -9,6 +9,7 @@ from app.experiment_draft import (
     DeviceRequirements,
     DraftMetadata,
     ExperimentPlanDraft,
+    LaserDefaults,
     ODMRSweepDraft,
     RecordingDefaults,
     SafetySelection,
@@ -128,6 +129,28 @@ class TestPlanCompiler(unittest.TestCase):
             field = step["magnetic_field"]
             self.assertEqual(set(field.keys()), {"magnitude_nT", "theta_deg", "phi_deg"})
             self.assertNotIn("microwave", step)
+
+    def test_laser_defaults_are_applied_to_compiled_steps(self):
+        draft = ExperimentPlanDraft(
+            metadata=DraftMetadata(name="laser_field", mode="bxyz_grid"),
+            procedure=BxyzGridDraft(
+                x_start_nT=0.0,
+                x_stop_nT=0.0,
+                y_start_nT=0.0,
+                y_stop_nT=0.0,
+                z_start_nT=0.0,
+                z_stop_nT=0.0,
+            ),
+            devices=DeviceRequirements(laser=True, magnetic_field=True, lockin=True, lockin_channel=2),
+            laser=LaserDefaults(power_mw=12.0, output=True),
+        )
+
+        compiled = self.compiler.compile(draft)
+
+        self.assertTrue(compiled.valid, compiled.report())
+        step = compiled.plan["sequence"]["steps"][0]
+        self.assertEqual(step["laser"], {"power_mw": 12.0, "output": True})
+        self.assertEqual(step["lockin"]["channel"], 2)
 
     def test_semantic_errors_for_invalid_odmr_sweep(self):
         draft = self._odmr_draft()

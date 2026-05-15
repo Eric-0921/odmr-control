@@ -40,6 +40,7 @@ from app.experiment_draft import (
     DeviceRequirements,
     DraftMetadata,
     ExperimentPlanDraft,
+    LaserDefaults,
     ODMRSweepDraft,
     RecordingDefaults,
     SafetySelection,
@@ -47,13 +48,20 @@ from app.experiment_draft import (
     TimingDefaults,
 )
 from app.plan_compiler import CompiledPlan, PlanCompiler
-from app.unit_selector import UnitSelector, FrequencyUnitSelector, MagneticFieldUnitSelector, PowerUnitSelector, TimeUnitSelector
+from app.unit_selector import (
+    UnitSelector,
+    FrequencyUnitSelector,
+    MagneticFieldUnitSelector,
+    PowerUnitSelector,
+    TimeUnitSelector,
+    VoltageUnitSelector,
+)
 from core.command_service import CommandService
 from core.commands import Command, CommandType
 from core.instrument_controller import InstrumentController
 from core.presets import FieldPreset, PresetManager
 from core.sweep_engine import SweepEngine, SweepSequence, SweepStep
-from core.vector_field import SphericalField, spherical_to_cartesian
+from core.vector_field import CartesianField, SphericalField, cartesian_to_spherical, spherical_to_cartesian
 from data.circular_buffer import CircularBuffer
 from data.recorder import ODMRRecorder
 from instruments.oe1022d import (
@@ -713,7 +721,7 @@ class ODMRControlGUI(QMainWindow):
             validator=QIntValidator(0, 999),
         )
         laser_ctrl_layout.addWidget(self._laser_power_selector, 0, 1)
-        laser_power_btn = QPushButton("设 / Set")
+        laser_power_btn = QPushButton("设置")
         laser_power_btn.setObjectName("primaryBtn")
         laser_power_btn.clicked.connect(self._set_laser_power)
         laser_ctrl_layout.addWidget(laser_power_btn, 0, 2)
@@ -808,7 +816,7 @@ class ODMRControlGUI(QMainWindow):
                 channels=["X", "Y", "R", "theta", "smb_freq_hz"],
                 capacity=2000,
             )
-            lockin_tabs.addTab(ch_page, f"Channel {'A' if ch_num == 1 else 'B'}")
+            lockin_tabs.addTab(ch_page, f"CH-{'A' if ch_num == 1 else 'B'}")
         layout.addWidget(lockin_tabs)
 
         layout.addStretch()
@@ -990,7 +998,7 @@ class ODMRControlGUI(QMainWindow):
             grid.addWidget(lock, row, 8, alignment=Qt.AlignCenter)
             self._mag_controls[axis]["lock"] = lock
             action_box = QHBoxLayout()
-            set_btn = QPushButton("设置 / Set")
+            set_btn = QPushButton("设置")
             set_btn.clicked.connect(lambda _checked=False, a=axis: self._set_mag_axis_values(a))
             action_box.addWidget(set_btn)
             capture_btn = QPushButton("回读零偏")
@@ -1032,13 +1040,66 @@ class ODMRControlGUI(QMainWindow):
                 widget.setValidator(QDoubleValidator(-1e12, 1e12, 3))
             grid.addWidget(QLabel(label), 0, col * 2)
             grid.addWidget(widget, 0, col * 2 + 1)
-        calc = QPushButton("转换并填入 / Convert to Bxyz")
+        self._mag_vec_cart_selectors: Dict[str, MagneticFieldUnitSelector] = {}
+        for col, axis in enumerate(("Bx", "By", "Bz")):
+            selector = MagneticFieldUnitSelector(0.0, "nT")
+            self._mag_vec_cart_selectors[axis] = selector
+            grid.addWidget(QLabel(axis), 1, col * 2)
+            grid.addWidget(selector, 1, col * 2 + 1)
+        calc = QPushButton("球坐标转 Bxyz")
         calc.clicked.connect(self._mag_vector_to_manual)
         grid.addWidget(calc, 0, 6)
+        rev = QPushButton("Bxyz 转球坐标")
+        rev.clicked.connect(self._mag_cartesian_to_vector)
+        grid.addWidget(rev, 1, 6)
+        fill = QPushButton("填入三轴目标")
+        fill.setObjectName("primaryBtn")
+        fill.clicked.connect(self._mag_fill_manual_from_vector)
+        grid.addWidget(fill, 2, 6)
         self._mag_vec_result = QLabel("Bx=0, By=0, Bz=0 nT")
         self._mag_vec_result.setObjectName("smallData")
-        grid.addWidget(self._mag_vec_result, 1, 0, 1, 7)
+        grid.addWidget(self._mag_vec_result, 2, 0, 1, 6)
         layout.addWidget(group)
+
+        self._mag_vec_table = QTableWidget(1, 6)
+        self._mag_vec_table.setHorizontalHeaderLabels(["B nT", "theta deg", "phi deg", "Bx nT", "By nT", "Bz nT"])
+        self._mag_vec_table.verticalHeader().setVisible(False)
+        self._mag_vec_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._mag_vec_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self._mag_vec_table)
+
+        if _HAS_PYG:
+            self._mag_vec_projection_plot = pg.PlotWidget()
+            self._mag_vec_projection_plot.setLabel("left", "Y/Z", units="nT")
+            self._mag_vec_projection_plot.setLabel("bottom", "X/Y", units="nT")
+            self._mag_vec_projection_plot.addLegend()
+            self._mag_vec_projection_plot.showGrid(x=True, y=True, alpha=0.3)
+            self._mag_vec_projection_curves = {
+                "XY": self._mag_vec_projection_plot.plot(pen=pg.mkPen("#0080c8", width=2), symbol="o", name="XY"),
+                "XZ": self._mag_vec_projection_plot.plot(pen=pg.mkPen("#00a651", width=2), symbol="o", name="XZ"),
+                "YZ": self._mag_vec_projection_plot.plot(pen=pg.mkPen("#e04040", width=2), symbol="o", name="YZ"),
+            }
+            layout.addWidget(self._mag_vec_projection_plot, 1)
+            self._mag_vec_gl_view = None
+            try:
+                import pyqtgraph.opengl as gl
+                self._mag_vec_gl_view = gl.GLViewWidget()
+                self._mag_vec_gl_view.setMinimumHeight(260)
+                self._mag_vec_gl_view.opts["distance"] = 10
+                self._mag_vec_gl_grid = gl.GLGridItem()
+                self._mag_vec_gl_view.addItem(self._mag_vec_gl_grid)
+                self._mag_vec_gl_line = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0, 0, 0]], dtype=float), color=(0.0, 0.5, 0.8, 1.0), width=3)
+                self._mag_vec_gl_view.addItem(self._mag_vec_gl_line)
+                layout.addWidget(self._mag_vec_gl_view, 1)
+            except Exception:
+                self._mag_vec_gl_view = None
+        else:
+            self._mag_vec_projection_plot = None
+            self._mag_vec_projection_curves = {}
+            self._mag_vec_gl_view = None
+
+        self._mag_current_vector_cartesian = CartesianField()
+        self._mag_update_vector_views(SphericalField(), CartesianField())
         layout.addStretch()
         return page
 
@@ -1150,15 +1211,60 @@ class ODMRControlGUI(QMainWindow):
 
     def _mag_vector_to_manual(self) -> None:
         field = spherical_to_cartesian(SphericalField(
-            float(self._mag_vec_mag.text()),
+            self._mag_vec_mag.value_in_base_unit(),
             float(self._mag_vec_theta.text()),
             float(self._mag_vec_phi.text()),
         ))
+        for axis, value in (("Bx", field.x_nT), ("By", field.y_nT), ("Bz", field.z_nT)):
+            self._mag_vec_cart_selectors[axis].set_value_in_base_unit(value)
+        self._mag_update_vector_views(cartesian_to_spherical(field), field)
+
+    def _mag_cartesian_to_vector(self) -> None:
+        field = CartesianField(
+            self._mag_vec_cart_selectors["Bx"].value_in_base_unit(),
+            self._mag_vec_cart_selectors["By"].value_in_base_unit(),
+            self._mag_vec_cart_selectors["Bz"].value_in_base_unit(),
+        )
+        spherical = cartesian_to_spherical(field)
+        self._mag_vec_mag.set_value_in_base_unit(spherical.magnitude_nT)
+        self._mag_vec_theta.setText(f"{spherical.theta_deg:.6g}")
+        self._mag_vec_phi.setText(f"{spherical.phi_deg:.6g}")
+        self._mag_update_vector_views(spherical, field)
+
+    def _mag_fill_manual_from_vector(self) -> None:
+        field = getattr(self, "_mag_current_vector_cartesian", CartesianField())
         values = {"X": field.x_nT, "Y": field.y_nT, "Z": field.z_nT}
         for axis, value in values.items():
             if axis in self._mag_field_selectors:
                 self._mag_field_selectors[axis].set_value_in_base_unit(value)
+
+    def _mag_update_vector_views(self, spherical: SphericalField, field: CartesianField) -> None:
+        self._mag_current_vector_cartesian = field
         self._mag_vec_result.setText(f"Bx={field.x_nT:.3f}, By={field.y_nT:.3f}, Bz={field.z_nT:.3f} nT")
+        if hasattr(self, "_mag_vec_table"):
+            values = [
+                spherical.magnitude_nT,
+                spherical.theta_deg,
+                spherical.phi_deg,
+                field.x_nT,
+                field.y_nT,
+                field.z_nT,
+            ]
+            for col, value in enumerate(values):
+                self._mag_vec_table.setItem(0, col, QTableWidgetItem(f"{value:.6g}"))
+        curves = getattr(self, "_mag_vec_projection_curves", {})
+        if curves:
+            curves["XY"].setData([0.0, field.x_nT], [0.0, field.y_nT])
+            curves["XZ"].setData([0.0, field.x_nT], [0.0, field.z_nT])
+            curves["YZ"].setData([0.0, field.y_nT], [0.0, field.z_nT])
+            limit = max(abs(field.x_nT), abs(field.y_nT), abs(field.z_nT), 1.0)
+            self._mag_vec_projection_plot.setXRange(-limit, limit)
+            self._mag_vec_projection_plot.setYRange(-limit, limit)
+        if getattr(self, "_mag_vec_gl_view", None) is not None:
+            limit = max(abs(field.x_nT), abs(field.y_nT), abs(field.z_nT), 1.0)
+            scale = 4.0 / limit
+            pos = np.array([[0.0, 0.0, 0.0], [field.x_nT * scale, field.y_nT * scale, field.z_nT * scale]], dtype=float)
+            self._mag_vec_gl_line.setData(pos=pos)
 
     def _refresh_mag_presets(self) -> None:
         if not hasattr(self, "_mag_preset_combo"):
@@ -1425,20 +1531,20 @@ class ODMRControlGUI(QMainWindow):
         # 频率参数使用 FrequencyUnitSelector (base unit: Hz)
         self._exp_mw_start_selector = FrequencyUnitSelector(2.82e9)
         self._exp_mw_stop_selector = FrequencyUnitSelector(2.92e9)
-        self._exp_mw_step_selector = FrequencyUnitSelector(1e6)
+        self._exp_mw_step_selector = FrequencyUnitSelector(1e6, default_unit="MHz")
         # 功率使用 PowerUnitSelector (base unit: dBm)
         self._exp_mw_power_selector = PowerUnitSelector(-30.0)
         # 驻留时间使用 TimeUnitSelector (base unit: s)
         self._exp_mw_dwell_selector = TimeUnitSelector(50.0e-3)  # 50 ms
-        smb_grid.addWidget(QLabel("Start freq:"), 1, 0)
+        smb_grid.addWidget(QLabel("起始频率:"), 1, 0)
         smb_grid.addWidget(self._exp_mw_start_selector, 1, 1)
-        smb_grid.addWidget(QLabel("Stop freq:"), 1, 2)
+        smb_grid.addWidget(QLabel("终止频率:"), 1, 2)
         smb_grid.addWidget(self._exp_mw_stop_selector, 1, 3)
-        smb_grid.addWidget(QLabel("Step freq:"), 2, 0)
+        smb_grid.addWidget(QLabel("步进频率:"), 2, 0)
         smb_grid.addWidget(self._exp_mw_step_selector, 2, 1)
-        smb_grid.addWidget(QLabel("Dwell:"), 2, 2)
+        smb_grid.addWidget(QLabel("驻留时间:"), 2, 2)
         smb_grid.addWidget(self._exp_mw_dwell_selector, 2, 3)
-        smb_grid.addWidget(QLabel("Power:"), 3, 0)
+        smb_grid.addWidget(QLabel("功率:"), 3, 0)
         smb_grid.addWidget(self._exp_mw_power_selector, 3, 1)
         self._exp_mw_execute = QCheckBox("内部扫频执行 / Execute sweep")
         self._exp_mw_execute.setChecked(True)
@@ -1447,6 +1553,24 @@ class ODMRControlGUI(QMainWindow):
         self._exp_mw_rf_output.setChecked(True)
         smb_grid.addWidget(self._exp_mw_rf_output, 4, 2)
         layout.addWidget(smb)
+
+        laser = QGroupBox("激光器 / Laser")
+        laser_grid = QGridLayout(laser)
+        self._exp_laser_enable = QCheckBox("启用激光步骤")
+        laser_grid.addWidget(self._exp_laser_enable, 0, 0)
+        laser_grid.addWidget(QLabel("功率:"), 0, 1)
+        self._exp_laser_power_selector = UnitSelector(
+            0.0,
+            LASER_POWER_UNITS,
+            "mW",
+            validator=QIntValidator(0, int(self._cfg.get("laser", {}).get("max_power_mw", 150))),
+        )
+        laser_grid.addWidget(self._exp_laser_power_selector, 0, 2)
+        self._exp_laser_output = QCheckBox("输出")
+        self._exp_laser_output.setChecked(True)
+        laser_grid.addWidget(self._exp_laser_output, 0, 3)
+        laser_grid.setColumnStretch(4, 1)
+        layout.addWidget(laser)
 
         mag = QGroupBox("磁场扫描 / Magnetic Field")
         mag_grid = QGridLayout(mag)
@@ -1539,7 +1663,8 @@ class ODMRControlGUI(QMainWindow):
         acq_grid.addWidget(self._exp_acq_stop_combo, 0, 4)
         acq_grid.addWidget(QLabel("锁相通道:"), 1, 0)
         self._exp_lockin_channel = QComboBox()
-        self._exp_lockin_channel.addItems(["1", "2"])
+        self._exp_lockin_channel.addItem("CH-A", 1)
+        self._exp_lockin_channel.addItem("CH-B", 2)
         acq_grid.addWidget(self._exp_lockin_channel, 1, 1)
         layout.addWidget(acq)
 
@@ -1563,15 +1688,17 @@ class ODMRControlGUI(QMainWindow):
         step_group = QGroupBox("步骤列表 / Step List")
         step_layout = QVBoxLayout(step_group)
 
-        self._exp_step_table = QTableWidget(0, 8)
-        self._exp_step_table.setHorizontalHeaderLabels(["#", "Name", "Bx", "By", "Bz", "MW", "Start", "Stop"])
-        self._exp_step_table.setMinimumHeight(180)
+        self._exp_step_table = QTableWidget(0, 10)
+        self._exp_step_table.setHorizontalHeaderLabels(["选", "#", "Name", "Bx", "By", "Bz", "MW", "Laser", "Lock-in", "Acq"])
+        self._exp_step_table.setMinimumHeight(320)
         self._exp_step_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._exp_step_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._exp_step_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._exp_step_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self._exp_step_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._exp_step_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self._exp_step_table.setColumnWidth(0, 44)
-        for col in range(2, 8):
+        self._exp_step_table.setColumnWidth(1, 52)
+        for col in range(3, 10):
             self._exp_step_table.setColumnWidth(col, 90)
         self._exp_step_table.doubleClicked.connect(lambda: self._exp_edit_selected_step())
         step_layout.addWidget(self._exp_step_table)
@@ -1580,9 +1707,14 @@ class ODMRControlGUI(QMainWindow):
         for text, cb in (
             ("添加 / Add", self._exp_add_step),
             ("删除 / Delete", self._exp_delete_selected_step),
+            ("删除勾选", self._exp_delete_checked_steps),
+            ("清空全部", self._exp_delete_all_steps),
             ("编辑 / Edit", self._exp_edit_selected_step),
             ("上移 / Up", self._exp_move_step_up),
             ("下移 / Down", self._exp_move_step_down),
+            ("全选", self._exp_select_all_steps),
+            ("取消选择", self._exp_clear_step_selection),
+            ("套用默认设备", self._exp_apply_defaults_to_checked_steps),
         ):
             btn = QPushButton(text)
             btn.clicked.connect(cb)
@@ -1782,7 +1914,7 @@ class ODMRControlGUI(QMainWindow):
 
     def _exp_current_draft(self) -> ExperimentPlanDraft:
         mode = self._exp_mode_combo.currentText()
-        lockin_ch = int(self._exp_lockin_channel.currentText())
+        lockin_ch = int(self._exp_lockin_channel.currentData() or 1)
         smb_cfg = self._cfg.get("smb", {})
         laser_cfg = self._cfg.get("laser", {})
         draft = ExperimentPlanDraft(
@@ -1809,7 +1941,7 @@ class ODMRControlGUI(QMainWindow):
             devices=DeviceRequirements(
                 microwave=self._exp_mw_enable.isChecked(),
                 lockin=True,
-                laser=False,
+                laser=self._exp_laser_enable.isChecked(),
                 magnetic_field=True,
                 lockin_channel=lockin_ch,
             ),
@@ -1824,6 +1956,10 @@ class ODMRControlGUI(QMainWindow):
                 start_recording=self._exp_record_check.isChecked(),
                 stop_recording=self._exp_record_check.isChecked(),
                 stop_acquire=False,
+            ),
+            laser=LaserDefaults(
+                power_mw=self._exp_laser_power_selector.value_in_base_unit(),
+                output=self._exp_laser_output.isChecked(),
             ),
         )
 
@@ -1872,6 +2008,7 @@ class ODMRControlGUI(QMainWindow):
         elif "Custom" in mode:
             draft.procedure = CustomStepsDraft(steps=[dict(step) for step in self._exp_steps])
             draft.devices.microwave = any("microwave" in step for step in self._exp_steps)
+            draft.devices.laser = any("laser" in step for step in self._exp_steps)
             draft.devices.magnetic_field = any("magnetic_field" in step for step in self._exp_steps)
         else:
             draft.procedure = field_draft if isinstance(field_draft, BxyzGridDraft) else BxyzGridDraft()
@@ -2052,10 +2189,17 @@ class ODMRControlGUI(QMainWindow):
     def _exp_rebuild_table(self) -> None:
         """Rebuild step table from self._exp_steps."""
         self._exp_step_table.setRowCount(0)
-        for idx, step in enumerate(self._exp_steps[:200]):
+        for idx, step in enumerate(self._exp_steps):
             self._exp_step_table.insertRow(idx)
             field = self._resolve_preview_field(step.get("magnetic_field", {}))
             has_mw = "microwave" in step
+            laser = step.get("laser", {}) if isinstance(step.get("laser", {}), dict) else {}
+            lockin = step.get("lockin", {}) if isinstance(step.get("lockin", {}), dict) else {}
+            acq = step.get("acquisition", {}) if isinstance(step.get("acquisition", {}), dict) else {}
+            select_item = QTableWidgetItem()
+            select_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            select_item.setCheckState(Qt.Unchecked)
+            self._exp_step_table.setItem(idx, 0, select_item)
             values = [
                 idx + 1,
                 step.get("name", ""),
@@ -2063,13 +2207,97 @@ class ODMRControlGUI(QMainWindow):
                 f"{field.get('y_nT', 0):.3g}",
                 f"{field.get('z_nT', 0):.3g}",
                 "sweep" if has_mw else "off",
-                step.get("acquisition", {}).get("start_trigger", ""),
-                step.get("acquisition", {}).get("stop_trigger", ""),
+                f"{laser.get('power_mw', '')} mW" if laser else "off",
+                self._lockin_channel_label(int(lockin.get("channel", 1))) if lockin else "off",
+                f"{acq.get('start_trigger', '')}->{acq.get('stop_trigger', '')}" if acq else "",
             ]
             for col, value in enumerate(values):
-                self._exp_step_table.setItem(idx, col, QTableWidgetItem(str(value)))
+                self._exp_step_table.setItem(idx, col + 1, QTableWidgetItem(str(value)))
         count = len(self._exp_steps)
         self._exp_status_label.setText(f"步骤列表: {count} 步 / {count} steps")
+
+    @staticmethod
+    def _lockin_channel_label(channel: int) -> str:
+        return "CH-A" if int(channel) == 1 else "CH-B"
+
+    def _exp_checked_step_indices(self) -> List[int]:
+        indices: List[int] = []
+        for row in range(self._exp_step_table.rowCount()):
+            item = self._exp_step_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.Checked:
+                indices.append(row)
+        if indices:
+            return indices
+        return sorted({idx.row() for idx in self._exp_step_table.selectionModel().selectedRows()})
+
+    def _exp_select_all_steps(self) -> None:
+        for row in range(self._exp_step_table.rowCount()):
+            item = self._exp_step_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.Checked)
+
+    def _exp_clear_step_selection(self) -> None:
+        self._exp_step_table.clearSelection()
+        for row in range(self._exp_step_table.rowCount()):
+            item = self._exp_step_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.Unchecked)
+
+    def _exp_delete_checked_steps(self) -> None:
+        indices = self._exp_checked_step_indices()
+        if not indices:
+            return
+        for row in sorted(indices, reverse=True):
+            if 0 <= row < len(self._exp_steps):
+                self._exp_steps.pop(row)
+        self._exp_rebuild_table()
+        self._exp_sync_plan_preview()
+
+    def _exp_delete_all_steps(self) -> None:
+        if not self._exp_steps:
+            return
+        if QMessageBox.question(self, "清空步骤", "确认删除全部步骤？") != QMessageBox.Yes:
+            return
+        self._exp_steps = []
+        self._exp_rebuild_table()
+        self._exp_sync_plan_preview()
+
+    def _exp_default_step_overlays(self) -> Dict[str, Any]:
+        overlays: Dict[str, Any] = {
+            "lockin": {"channel": int(self._exp_lockin_channel.currentData() or 1)},
+            "timing": {
+                "settle_s": self._exp_settle_selector.value_in_base_unit(),
+                "hold_s": self._exp_hold_selector.value_in_base_unit(),
+                "trigger": "immediate",
+            },
+            "acquisition": {
+                "start_trigger": self._exp_acq_start_combo.currentText(),
+                "stop_trigger": self._exp_acq_stop_combo.currentText(),
+                "start_recording": self._exp_record_check.isChecked(),
+                "stop_recording": self._exp_record_check.isChecked(),
+            },
+        }
+        if self._exp_laser_enable.isChecked():
+            overlays["laser"] = {
+                "power_mw": self._exp_laser_power_selector.value_in_base_unit(),
+                "output": self._exp_laser_output.isChecked(),
+            }
+        return overlays
+
+    def _exp_apply_step_defaults(self, step: Dict[str, Any]) -> Dict[str, Any]:
+        for key, value in self._exp_default_step_overlays().items():
+            step[key] = dict(value) if isinstance(value, dict) else value
+        return step
+
+    def _exp_apply_defaults_to_checked_steps(self) -> None:
+        indices = self._exp_checked_step_indices()
+        if not indices:
+            indices = list(range(len(self._exp_steps)))
+        for row in indices:
+            if 0 <= row < len(self._exp_steps):
+                self._exp_apply_step_defaults(self._exp_steps[row])
+        self._exp_rebuild_table()
+        self._exp_sync_plan_preview()
 
     @staticmethod
     def _resolve_preview_field(field: Dict[str, Any]) -> Dict[str, float]:
@@ -2196,10 +2424,10 @@ class ODMRControlGUI(QMainWindow):
             for y in ys:
                 for z in zs:
                     idx += 1
-                    self._exp_steps.append({
+                    self._exp_steps.append(self._exp_apply_step_defaults({
                         "name": f"bxyz_{idx:04d}",
                         "magnetic_field": {"x_nT": x, "y_nT": y, "z_nT": z},
-                    })
+                    }))
         self._exp_rebuild_table()
         self._exp_sync_plan_preview()
 
@@ -2219,10 +2447,10 @@ class ODMRControlGUI(QMainWindow):
             for theta in thetas:
                 for phi in phis:
                     idx += 1
-                    self._exp_steps.append({
+                    self._exp_steps.append(self._exp_apply_step_defaults({
                         "name": f"vector_{idx:04d}",
                         "magnetic_field": {"magnitude_nT": b, "theta_deg": theta, "phi_deg": phi},
-                    })
+                    }))
         self._exp_rebuild_table()
         self._exp_sync_plan_preview()
 
@@ -2265,11 +2493,11 @@ class ODMRControlGUI(QMainWindow):
             for y in ys:
                 for z in zs:
                     idx += 1
-                    self._exp_steps.append({
+                    self._exp_steps.append(self._exp_apply_step_defaults({
                         "name": f"odmr_{idx:04d}",
                         "magnetic_field": {"x_nT": x, "y_nT": y, "z_nT": z},
                         "microwave": dict(microwave),
-                    })
+                    }))
         self._exp_rebuild_table()
         self._exp_sync_plan_preview()
 
@@ -2278,18 +2506,23 @@ class ODMRControlGUI(QMainWindow):
     def _exp_add_step(self) -> None:
         """Add a new blank step to the step list."""
         idx = len(self._exp_steps) + 1
-        self._exp_steps.append({
+        self._exp_steps.append(self._exp_apply_step_defaults({
             "name": f"step_{idx:04d}",
             "magnetic_field": {"x_nT": 0, "y_nT": 0, "z_nT": 0},
-        })
+        }))
         self._exp_rebuild_table()
         self._exp_sync_plan_preview()
 
     def _exp_delete_selected_step(self) -> None:
-        """Delete the currently selected step."""
-        row = self._exp_step_table.currentRow()
-        if 0 <= row < len(self._exp_steps):
-            self._exp_steps.pop(row)
+        """Delete selected rows; checked rows take priority when present."""
+        rows = self._exp_checked_step_indices()
+        if not rows:
+            row = self._exp_step_table.currentRow()
+            rows = [row] if row >= 0 else []
+        for row in sorted(rows, reverse=True):
+            if 0 <= row < len(self._exp_steps):
+                self._exp_steps.pop(row)
+        if rows:
             self._exp_rebuild_table()
             self._exp_sync_plan_preview()
 
@@ -2392,16 +2625,39 @@ class ODMRControlGUI(QMainWindow):
             ("start_hz", "扫频起始 / Start:", 2.82e9),
             ("stop_hz", "扫频终止 / Stop:", 2.92e9),
             ("step_hz", "扫频步进 / Step:", 1e6),
-            ("dwell_ms", "驻留时间 / Dwell:", 50e-3),
+            ("dwell_ms", "驻留时间 / Dwell:", 50.0),
         ]:
             grid.addWidget(QLabel(label), row, 0)
             if key == "dwell_ms":
-                selector = TimeUnitSelector(float(sweep.get(key, default) or default))
+                selector = TimeUnitSelector(float(sweep.get(key, default) or default) / 1000.0, default_unit="ms")
             else:
-                selector = FrequencyUnitSelector(float(sweep.get(key, default) or default))
+                unit = "MHz" if key == "step_hz" else "GHz"
+                selector = FrequencyUnitSelector(float(sweep.get(key, default) or default), default_unit=unit)
             sweep_selectors[key] = selector
             grid.addWidget(selector, row, 1, 1, 2)
             row += 1
+
+        # Laser
+        grid.addWidget(QLabel("--- 激光器 / Laser ---"), row, 0, 1, 4)
+        row += 1
+        laser = step.get("laser", {})
+        laser_enable = QCheckBox("启用激光 / Enable Laser")
+        laser_enable.setChecked(bool(laser))
+        grid.addWidget(laser_enable, row, 0, 1, 2)
+        row += 1
+        grid.addWidget(QLabel("功率 / Power:"), row, 0)
+        laser_power_selector = UnitSelector(
+            float(laser.get("power_mw", 0.0) or 0.0),
+            LASER_POWER_UNITS,
+            "mW",
+            validator=QIntValidator(0, int(self._cfg.get("laser", {}).get("max_power_mw", 150))),
+        )
+        grid.addWidget(laser_power_selector, row, 1, 1, 2)
+        row += 1
+        laser_output_check = QCheckBox("输出 / Output")
+        laser_output_check.setChecked(bool(laser.get("output", True)))
+        grid.addWidget(laser_output_check, row, 0, 1, 2)
+        row += 1
 
         # Timing
         grid.addWidget(QLabel("--- 时序 / Timing ---"), row, 0, 1, 4)
@@ -2476,8 +2732,10 @@ class ODMRControlGUI(QMainWindow):
         lockin = step.get("lockin", {})
         grid.addWidget(QLabel("Channel:"), row, 0)
         lockin_ch_combo = QComboBox()
-        lockin_ch_combo.addItems(["1", "2"])
-        lockin_ch_combo.setCurrentText(str(lockin.get("channel", 1)))
+        lockin_ch_combo.addItem("CH-A", 1)
+        lockin_ch_combo.addItem("CH-B", 2)
+        ch_idx = lockin_ch_combo.findData(int(lockin.get("channel", 1) or 1))
+        lockin_ch_combo.setCurrentIndex(max(0, ch_idx))
         grid.addWidget(lockin_ch_combo, row, 1)
         row += 1
 
@@ -2546,6 +2804,15 @@ class ODMRControlGUI(QMainWindow):
             else:
                 step.pop("microwave", None)
 
+            # Update laser
+            if laser_enable.isChecked():
+                step["laser"] = {
+                    "power_mw": laser_power_selector.value_in_base_unit(),
+                    "output": laser_output_check.isChecked(),
+                }
+            else:
+                step.pop("laser", None)
+
             # Update timing
             step["timing"] = {
                 "settle_s": settle_selector.value_in_base_unit(),
@@ -2568,7 +2835,7 @@ class ODMRControlGUI(QMainWindow):
                 step.pop("acquisition", None)
 
             # Update lock-in
-            step["lockin"] = {"channel": int(lockin_ch_combo.currentText())}
+            step["lockin"] = {"channel": int(lockin_ch_combo.currentData() or 1)}
 
             self._exp_steps[step_idx] = step
             self._exp_rebuild_table()
@@ -2748,7 +3015,7 @@ class ODMRControlGUI(QMainWindow):
         freq_layout.addWidget(QLabel("CW 频率:"), 0, 0)
         self._cw_freq_selector = FrequencyUnitSelector(cfg_sweep["cw_freq_hz"])
         freq_layout.addWidget(self._cw_freq_selector, 0, 1)
-        btn = QPushButton("设 / Set")
+        btn = QPushButton("设置")
         btn.setObjectName("primaryBtn")
         btn.clicked.connect(self._set_cw_freq)
         freq_layout.addWidget(btn, 0, 2)
@@ -2771,7 +3038,7 @@ class ODMRControlGUI(QMainWindow):
         self._power_limit_label = QLabel(f"Max: {self._max_power_dbm:.0f} dBm")
         self._power_limit_label.setStyleSheet("color: #666; font-size: 11px;")
         power_layout.addWidget(self._power_limit_label, 0, 2)
-        btn = QPushButton("设 / Set")
+        btn = QPushButton("设置")
         btn.setObjectName("primaryBtn")
         btn.clicked.connect(self._set_power)
         power_layout.addWidget(btn, 0, 3)
@@ -2797,12 +3064,12 @@ class ODMRControlGUI(QMainWindow):
         self._fm_mode_combo.addItems(["NORM", "LNO", "HDEV"])
         self._fm_mode_combo.setCurrentText("HDEV")
         mod_layout.addWidget(self._fm_mode_combo, 0, 3)
-        mod_layout.addWidget(QLabel("FM 偏差 (Hz):"), 1, 0)
-        self._fm_dev_edit = QLineEdit(str(cfg_sweep["fm_dev_hz"]))
-        mod_layout.addWidget(self._fm_dev_edit, 1, 1)
-        btn = QPushButton("设 / Set")
+        mod_layout.addWidget(QLabel("FM 偏差:"), 1, 0)
+        self._fm_dev_selector = FrequencyUnitSelector(cfg_sweep["fm_dev_hz"], default_unit="Hz")
+        mod_layout.addWidget(self._fm_dev_selector, 1, 1)
+        btn = QPushButton("设置")
         btn.setObjectName("primaryBtn")
-        btn.clicked.connect(lambda: self._set_fm_dev(self._fm_dev_edit.text()))
+        btn.clicked.connect(self._set_fm_dev)
         mod_layout.addWidget(btn, 1, 2)
         self._am_toggle = QCheckBox("AM 调制 / AM Modulation")
         mod_layout.addWidget(self._am_toggle, 2, 0)
@@ -2816,25 +3083,25 @@ class ODMRControlGUI(QMainWindow):
         lf_group = QGroupBox("LF 发生器 / LF Generator")
         lf_layout = QGridLayout(lf_group)
         lf_layout.addWidget(QLabel("LF 频率:"), 0, 0)
-        self._lf_freq_selector = FrequencyUnitSelector(cfg_sweep["lf_freq_hz"])
+        self._lf_freq_selector = FrequencyUnitSelector(cfg_sweep["lf_freq_hz"], default_unit="Hz")
         lf_layout.addWidget(self._lf_freq_selector, 0, 1)
-        btn = QPushButton("设 / Set")
+        btn = QPushButton("设置")
         btn.setObjectName("primaryBtn")
         btn.clicked.connect(self._set_lf_freq)
         lf_layout.addWidget(btn, 0, 2)
-        lf_layout.addWidget(QLabel("LF 幅度 (mV):"), 1, 0)
-        self._lf_amp_edit = QLineEdit(str(cfg_sweep["lf_amp_mv"]))
-        lf_layout.addWidget(self._lf_amp_edit, 1, 1)
-        btn2 = QPushButton("设 / Set")
+        lf_layout.addWidget(QLabel("LF 幅度:"), 1, 0)
+        self._lf_amp_selector = VoltageUnitSelector(float(cfg_sweep["lf_amp_mv"]) / 1000.0, default_unit="mV")
+        lf_layout.addWidget(self._lf_amp_selector, 1, 1)
+        btn2 = QPushButton("设置")
         btn2.setObjectName("primaryBtn")
-        btn2.clicked.connect(lambda: self._set_lf_amp(self._lf_amp_edit.text()))
+        btn2.clicked.connect(self._set_lf_amp)
         lf_layout.addWidget(btn2, 1, 2)
         lf_layout.addWidget(QLabel("LF 波形:"), 2, 0)
         self._lf_shape_combo = QComboBox()
         self._lf_shape_combo.addItems(["SINE", "SQUARE", "TRIANGLE", "SAWTOOTH", "ISAWTOOTH"])
         self._lf_shape_combo.setCurrentText(cfg_sweep["lf_shape"])
         lf_layout.addWidget(self._lf_shape_combo, 2, 1)
-        btn3 = QPushButton("设 / Set")
+        btn3 = QPushButton("设置")
         btn3.setObjectName("primaryBtn")
         btn3.clicked.connect(self._set_lf_shape)
         lf_layout.addWidget(btn3, 2, 2)
@@ -2860,15 +3127,15 @@ class ODMRControlGUI(QMainWindow):
             "step_hz": cfg_sweep.get("step_hz", 1e6),
             "dwell_ms": cfg_sweep.get("dwell_ms", 50),
         }
-        self._rf_sweep_start_edit = QLineEdit(str(sweep_defaults["start_hz"]))
-        self._rf_sweep_stop_edit = QLineEdit(str(sweep_defaults["stop_hz"]))
-        self._rf_sweep_step_edit = QLineEdit(str(sweep_defaults["step_hz"]))
-        self._rf_sweep_dwell_edit = QLineEdit(str(sweep_defaults["dwell_ms"]))
+        self._rf_sweep_start_selector = FrequencyUnitSelector(float(sweep_defaults["start_hz"]), default_unit="GHz")
+        self._rf_sweep_stop_selector = FrequencyUnitSelector(float(sweep_defaults["stop_hz"]), default_unit="GHz")
+        self._rf_sweep_step_selector = FrequencyUnitSelector(float(sweep_defaults["step_hz"]), default_unit="MHz")
+        self._rf_sweep_dwell_selector = TimeUnitSelector(float(sweep_defaults["dwell_ms"]) / 1000.0, default_unit="ms")
         for row, (label, widget) in enumerate((
-            ("Start (Hz):", self._rf_sweep_start_edit),
-            ("Stop (Hz):", self._rf_sweep_stop_edit),
-            ("Step (Hz):", self._rf_sweep_step_edit),
-            ("Dwell (ms):", self._rf_sweep_dwell_edit),
+            ("Start:", self._rf_sweep_start_selector),
+            ("Stop:", self._rf_sweep_stop_selector),
+            ("Step:", self._rf_sweep_step_selector),
+            ("Dwell:", self._rf_sweep_dwell_selector),
         ), start=1):
             rf_sweep.addWidget(QLabel(label), row, 0)
             rf_sweep.addWidget(widget, row, 1)
@@ -2890,12 +3157,12 @@ class ODMRControlGUI(QMainWindow):
         rf_sweep.addWidget(self._rf_sweep_trigger_combo, 3, 3)
         self._rf_sweep_lfc_check = QCheckBox("LF ramp")
         rf_sweep.addWidget(self._rf_sweep_lfc_check, 2, 4)
-        self._rf_sweep_ovolt_start_edit = QLineEdit("0")
-        self._rf_sweep_ovolt_stop_edit = QLineEdit("3")
+        self._rf_sweep_ovolt_start_selector = VoltageUnitSelector(0.0, default_unit="V")
+        self._rf_sweep_ovolt_stop_selector = VoltageUnitSelector(3.0, default_unit="V")
         rf_sweep.addWidget(QLabel("V start:"), 3, 4)
-        rf_sweep.addWidget(self._rf_sweep_ovolt_start_edit, 3, 5)
+        rf_sweep.addWidget(self._rf_sweep_ovolt_start_selector, 3, 5)
         rf_sweep.addWidget(QLabel("V stop:"), 4, 4)
-        rf_sweep.addWidget(self._rf_sweep_ovolt_stop_edit, 4, 5)
+        rf_sweep.addWidget(self._rf_sweep_ovolt_stop_selector, 4, 5)
         set_sweep_btn = QPushButton("配置扫频 / Configure")
         set_sweep_btn.setObjectName("primaryBtn")
         set_sweep_btn.clicked.connect(self._apply_rf_sweep_config)
@@ -2939,7 +3206,8 @@ class ODMRControlGUI(QMainWindow):
         ch_layout = QHBoxLayout()
         ch_layout.addWidget(QLabel("目标通道 / Target Channel:"))
         self._lockin_ctrl_channel = QComboBox()
-        self._lockin_ctrl_channel.addItems(["Channel A", "Channel B"])
+        self._lockin_ctrl_channel.addItem("CH-A", 1)
+        self._lockin_ctrl_channel.addItem("CH-B", 2)
         ch_layout.addWidget(self._lockin_ctrl_channel)
         ch_layout.addStretch()
         layout.addLayout(ch_layout)
@@ -2963,7 +3231,7 @@ class ODMRControlGUI(QMainWindow):
                 else:
                     w = QLineEdit(str(default))
                 gl.addWidget(w, row, 1)
-                btn = QPushButton("Set")
+                btn = QPushButton("设置")
                 btn.setObjectName("primaryBtn")
                 gl.addWidget(btn, row, 2)
                 widgets[key] = (w, btn)
@@ -2996,7 +3264,7 @@ class ODMRControlGUI(QMainWindow):
                 ("参考相位（-180°~+180°, 精度0.01°）\nPhase (deg)", "phase", "0", "line"),
                 ("参考信号源：外部 / 内部\nSource (0=Ext,1=Int)", "ref_source", 0, "combo", ["External", "Internal"]),
                 ("外部参考触发：TTL上升沿 / TTL下降沿 / 正弦过零检测\nSlope (0=TTL Rising,1=TTL Falling,2=Sine Zero Cross)", "slope", 0, "combo", ["TTL Rising", "TTL Falling", "Sine Zero Cross"]),
-                ("内部参考频率\nFrequency", "freq", None, "selector", FrequencyUnitSelector(1000.0)),
+                ("内部参考频率\nFrequency", "freq", None, "selector", FrequencyUnitSelector(1000.0, default_unit="Hz")),
                 ("谐波检测次数（限制: 次数×频率<102kHz）\nHarmonic", "harmonic", "1", "line"),
             ]
         )
@@ -3078,7 +3346,7 @@ class ODMRControlGUI(QMainWindow):
         return page
 
     def _get_lockin_ctrl_channel(self) -> int:
-        return self._lockin_ctrl_channel.currentIndex() + 1
+        return int(self._lockin_ctrl_channel.currentData() or (self._lockin_ctrl_channel.currentIndex() + 1))
 
     def _set_lockin_input(self, key: str, widget) -> None:
         ch = self._get_lockin_ctrl_channel()
@@ -3236,7 +3504,7 @@ class ODMRControlGUI(QMainWindow):
         ctrl_bar = QHBoxLayout()
         ctrl_bar.addWidget(QLabel("通道:"))
         self._wave_ch_select = QComboBox()
-        self._wave_ch_select.addItems(["Channel A", "Channel B"])
+        self._wave_ch_select.addItems(["CH-A", "CH-B"])
         self._wave_ch_select.currentIndexChanged.connect(self._on_wave_channel_changed)
         ctrl_bar.addWidget(self._wave_ch_select)
 
@@ -3454,11 +3722,11 @@ class ODMRControlGUI(QMainWindow):
         self._stop_freq_selector = FrequencyUnitSelector(cfg_sweep["stop_freq_hz"])
         sweep_layout.addWidget(self._stop_freq_selector, 0, 3)
         sweep_layout.addWidget(QLabel("步进:"), 1, 0)
-        self._step_selector = FrequencyUnitSelector(cfg_sweep["step_hz"])
+        self._step_selector = FrequencyUnitSelector(cfg_sweep["step_hz"], default_unit="MHz")
         sweep_layout.addWidget(self._step_selector, 1, 1)
-        sweep_layout.addWidget(QLabel("驻留 (ms):"), 1, 2)
-        self._dwell_edit = QLineEdit(str(cfg_sweep["dwell_ms"]))
-        sweep_layout.addWidget(self._dwell_edit, 1, 3)
+        sweep_layout.addWidget(QLabel("驻留:"), 1, 2)
+        self._dwell_selector = TimeUnitSelector(float(cfg_sweep["dwell_ms"]) / 1000.0, default_unit="ms")
+        sweep_layout.addWidget(self._dwell_selector, 1, 3)
         sweep_layout.addWidget(QLabel("功率:"), 2, 0)
         self._sweep_power_selector = PowerUnitSelector(cfg_sweep["power_dbm"])
         sweep_layout.addWidget(self._sweep_power_selector, 2, 1)
@@ -4003,13 +4271,14 @@ class ODMRControlGUI(QMainWindow):
         except Exception as exc:
             self._on_error("Set LF freq failed: " + str(exc))
 
-    def _set_lf_amp(self, val):
+    def _set_lf_amp(self):
         try:
+            mv = self._lf_amp_selector.value_in_base_unit() * 1000.0
             if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_LF_VOLTAGE, {"mv": float(val)}, source="gui"))
+                self._cmd_service.submit(Command(CommandType.SMB_SET_LF_VOLTAGE, {"mv": mv}, source="gui"))
             else:
-                self._ctrl.smb.set_lf_voltage(float(val))
-            self._on_log("LF amp set to " + val + " mV", "smb")
+                self._ctrl.smb.set_lf_voltage(mv)
+            self._on_log(f"LF amp set to {mv} mV", "smb")
         except Exception as exc:
             self._on_error("Set LF amp failed: " + str(exc))
 
@@ -4024,13 +4293,14 @@ class ODMRControlGUI(QMainWindow):
         except Exception as exc:
             self._on_error("Set LF shape failed: " + str(exc))
 
-    def _set_fm_dev(self, val):
+    def _set_fm_dev(self):
         try:
+            hz = self._fm_dev_selector.value_in_base_unit()
             if self._cmd_service is not None:
-                self._cmd_service.submit(Command(CommandType.SMB_SET_FM_DEVIATION, {"hz": float(val)}, source="gui"))
+                self._cmd_service.submit(Command(CommandType.SMB_SET_FM_DEVIATION, {"hz": hz}, source="gui"))
             else:
-                self._ctrl.smb.set_fm_deviation(float(val))
-            self._on_log("FM deviation set to " + val + " Hz", "smb")
+                self._ctrl.smb.set_fm_deviation(hz)
+            self._on_log(f"FM deviation set to {hz} Hz", "smb")
         except Exception as exc:
             self._on_error("Set FM dev failed: " + str(exc))
 
@@ -4046,10 +4316,10 @@ class ODMRControlGUI(QMainWindow):
             lf_freq_hz = self._lf_freq_selector.value_in_base_unit()
             params = [
                 (CommandType.SMB_SET_POWER, {"power_dbm": p}),
-                (CommandType.SMB_SET_LF_VOLTAGE, {"mv": float(self._lf_amp_edit.text())}),
+                (CommandType.SMB_SET_LF_VOLTAGE, {"mv": self._lf_amp_selector.value_in_base_unit() * 1000.0}),
                 (CommandType.SMB_SET_LF_FREQ, {"freq_hz": lf_freq_hz}),
                 (CommandType.SMB_SET_LF_SHAPE, {"shape": self._lf_shape_combo.currentText()}),
-                (CommandType.SMB_SET_FM_DEVIATION, {"hz": float(self._fm_dev_edit.text())}),
+                (CommandType.SMB_SET_FM_DEVIATION, {"hz": self._fm_dev_selector.value_in_base_unit()}),
                 (CommandType.SMB_APPLY_CONFIG, {"modulation": {
                     "fm_source": self._fm_source_combo.currentText(),
                     "fm_mode": self._fm_mode_combo.currentText(),
@@ -4060,13 +4330,13 @@ class ODMRControlGUI(QMainWindow):
                     self._cmd_service.submit(Command(ct, pr, source="gui"))
             else:
                 self._ctrl.smb.set_power(p)
-                self._ctrl.smb.set_lf_voltage(float(self._lf_amp_edit.text()))
+                self._ctrl.smb.set_lf_voltage(self._lf_amp_selector.value_in_base_unit() * 1000.0)
                 self._ctrl.smb.set_lf_freq(lf_freq_hz)
                 self._ctrl.smb.set_lf_shape(self._lf_shape_combo.currentText())
                 self._ctrl.smb.set_lf_impedance(self._lf_impedance_combo.currentText())
                 self._ctrl.smb.set_fm_source(self._fm_source_combo.currentText())
                 self._ctrl.smb.set_fm_mode(self._fm_mode_combo.currentText())
-                self._ctrl.smb.set_fm_deviation(float(self._fm_dev_edit.text()))
+                self._ctrl.smb.set_fm_deviation(self._fm_dev_selector.value_in_base_unit())
             self._on_log("All parameters applied", "smb")
         except Exception as exc:
             self._on_error("Apply all failed: " + str(exc))
@@ -4080,13 +4350,13 @@ class ODMRControlGUI(QMainWindow):
             "rf_output": self._rf_toggle.isChecked(),
             "lf": {
                 "frequency_hz": self._lf_freq_selector.value_in_base_unit(),
-                "voltage_mv": float(self._lf_amp_edit.text()),
+                "voltage_mv": self._lf_amp_selector.value_in_base_unit() * 1000.0,
                 "shape": self._lf_shape_combo.currentText(),
                 "impedance": self._lf_impedance_combo.currentText(),
                 "output": self._lf_toggle.isChecked(),
             },
             "modulation": {
-                "fm_deviation_hz": float(self._fm_dev_edit.text()),
+                "fm_deviation_hz": self._fm_dev_selector.value_in_base_unit(),
                 "fm_source": self._fm_source_combo.currentText(),
                 "fm_mode": self._fm_mode_combo.currentText(),
                 "fm_state": self._fm_toggle.isChecked(),
@@ -4094,17 +4364,17 @@ class ODMRControlGUI(QMainWindow):
                 "am_state": self._am_toggle.isChecked(),
             },
             "sweep": {
-                "start_hz": float(self._rf_sweep_start_edit.text()),
-                "stop_hz": float(self._rf_sweep_stop_edit.text()),
-                "step_hz": float(self._rf_sweep_step_edit.text()),
-                "dwell_ms": float(self._rf_sweep_dwell_edit.text()),
+                "start_hz": self._rf_sweep_start_selector.value_in_base_unit(),
+                "stop_hz": self._rf_sweep_stop_selector.value_in_base_unit(),
+                "step_hz": self._rf_sweep_step_selector.value_in_base_unit(),
+                "dwell_ms": self._rf_sweep_dwell_selector.value_in_base_unit() * 1000.0,
                 "spacing": self._rf_sweep_spacing_combo.currentText(),
                 "shape": self._rf_sweep_shape_combo.currentText(),
                 "retrace": self._rf_sweep_retrace_combo.currentText() == "ON",
                 "trigger": self._rf_sweep_trigger_combo.currentText(),
                 "lf_connector": self._rf_sweep_lfc_check.isChecked(),
-                "ovolt_start_v": float(self._rf_sweep_ovolt_start_edit.text()),
-                "ovolt_stop_v": float(self._rf_sweep_ovolt_stop_edit.text()),
+                "ovolt_start_v": self._rf_sweep_ovolt_start_selector.value_in_base_unit(),
+                "ovolt_stop_v": self._rf_sweep_ovolt_stop_selector.value_in_base_unit(),
             },
         }
 
@@ -4261,12 +4531,12 @@ class ODMRControlGUI(QMainWindow):
             start_freq_hz=self._start_freq_selector.value_in_base_unit(),
             stop_freq_hz=self._stop_freq_selector.value_in_base_unit(),
             step_hz=self._step_selector.value_in_base_unit(),
-            dwell_ms=float(self._dwell_edit.text()),
+            dwell_ms=self._dwell_selector.value_in_base_unit() * 1000.0,
             power_dbm=self._sweep_power_selector.value_in_base_unit(),
             lf_freq_hz=self._lf_freq_selector.value_in_base_unit(),
-            lf_amp_mv=float(self._lf_amp_edit.text()),
+            lf_amp_mv=self._lf_amp_selector.value_in_base_unit() * 1000.0,
             lf_shape=self._lf_shape_combo.currentText(),
-            fm_dev_hz=float(self._fm_dev_edit.text()),
+            fm_dev_hz=self._fm_dev_selector.value_in_base_unit(),
             cycles=cycles,
             cycle_interval_ms=interval_ms,
         )
@@ -4471,6 +4741,9 @@ class ODMRControlGUI(QMainWindow):
                 selector.set_unit(unit)
         if hasattr(self, '_mag_vec_mag') and isinstance(self._mag_vec_mag, MagneticFieldUnitSelector):
             self._mag_vec_mag.set_unit(unit)
+        if hasattr(self, "_mag_vec_cart_selectors"):
+            for selector in self._mag_vec_cart_selectors.values():
+                selector.set_unit(unit)
 
     def _on_lockin_data_ready(self, data):
         """处理 Lockin 数据，按 channel 路由到对应显示和 buffer。"""

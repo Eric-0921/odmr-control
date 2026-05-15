@@ -232,6 +232,11 @@ class PlanCompiler:
             step["acquisition"]["column_groups"] = list(draft.recording.column_groups)
         if microwave is not None:
             step["microwave"] = microwave
+        if draft.devices.laser:
+            step["laser"] = {
+                "power_mw": draft.laser.power_mw,
+                "output": draft.laser.output,
+            }
         return step
 
     @staticmethod

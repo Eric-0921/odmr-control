@@ -68,6 +68,14 @@ class TestUnitConversions(unittest.TestCase):
     def test_time_h(self):
         self.assertEqual(UNIT_CONVERSIONS["time"]["h"], 3600.0)
 
+    # --- 电压 ---
+
+    def test_voltage_v(self):
+        self.assertEqual(UNIT_CONVERSIONS["voltage"]["V"], 1.0)
+
+    def test_voltage_mv(self):
+        self.assertAlmostEqual(UNIT_CONVERSIONS["voltage"]["mV"], 1e-3)
+
 
 class TestDbmMwConversion(unittest.TestCase):
     """验证 dBm <-> mW 对数转换"""

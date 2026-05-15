@@ -74,6 +74,12 @@ class AcquisitionDefaults:
 
 
 @dataclass
+class LaserDefaults:
+    power_mw: float = 0.0
+    output: bool = False
+
+
+@dataclass
 class BxyzGridDraft:
     kind: Literal["bxyz_grid"] = "bxyz_grid"
     x_start_nT: float = 0.0
@@ -134,6 +140,7 @@ class ExperimentPlanDraft:
     devices: DeviceRequirements = field(default_factory=DeviceRequirements)
     timing: TimingDefaults = field(default_factory=TimingDefaults)
     acquisition: AcquisitionDefaults = field(default_factory=AcquisitionDefaults)
+    laser: LaserDefaults = field(default_factory=LaserDefaults)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
