@@ -281,14 +281,14 @@ class SMB100ADriver:
     def set_sweep_dwell(self, ms: float) -> None:
         if ms < 0:
             raise ValueError(f"驻留时间不能为负: {ms}")
-        self._write(f"SWE:DWELL {ms:.1f}ms")
+        self._write(f"SWE:DWEL {ms:.1f}ms")
 
     def set_sweep_mode(self, mode: str = "AUTO") -> None:
         """mode: AUTO | SINGLE | STEP"""
         self._write(f"SWE:FREQ:MODE {mode}")
 
     def set_freq_mode(self, mode: str) -> None:
-        """mode: CW | SWEEP"""
+        """mode: CW | SWE"""
         self._write(f"SOUR:FREQ:MODE {mode}")
         with self._lock:
             self._cached_mode = mode
@@ -330,7 +330,7 @@ class SMB100ADriver:
         self._write(f"SWE:RETR {'ON' if on else 'OFF'}")
 
     def set_sweep_trigger_source(self, source: str = "IMM") -> None:
-        self._write(f"SWE:TRIG:SOUR {source}")
+        self._write(f"TRIG:FSW:SOUR {source}")
 
     def get_sweep_running(self) -> bool:
         return self._query("SWE:RUNN?").strip() in ("1", "ON")
@@ -375,10 +375,10 @@ class SMB100ADriver:
         self._write(f"SOUR:LFO:FREQ:MODE SWE")
         self._write(f"SOUR:LFO:FREQ:STAR {start_hz:.3f}Hz")
         self._write(f"SOUR:LFO:FREQ:STOP {stop_hz:.3f}Hz")
-        self._write(f"SOUR:LFO:SWE:STEP {step_hz:.3f}Hz")
+        self._write(f"SOUR:LFO:SWE:FREQ:STEP:LIN {step_hz:.3f}Hz")
         self._write(f"SOUR:LFO:SWE:SHAP {shape}")
         self._write(f"SOUR:LFO:SWE:SPAC {spacing}")
-        self._write(f"SOUR:LFO:SWE:TRIG:SOUR {trigger}")
+        self._write(f"TRIG:LFFS:SOUR {trigger}")
 
     # -- FM modulation -------------------------------------------------------
 
@@ -404,7 +404,7 @@ class SMB100ADriver:
     def set_am_depth(self, pct: float) -> None:
         if not 0 <= pct <= 100:
             raise ValueError("AM depth must be 0..100 %")
-        self._write(f"SOUR:AM:DEPT {pct:.3f}PCT")
+        self._write(f"SOUR:AM:DEPT:LIN {pct:.3f}PCT")
 
     def set_am_source(self, source: str = "INT") -> None:
         self._write(f"SOUR:AM:SOUR {source}")
@@ -477,7 +477,7 @@ class SMB100ADriver:
 
     def start_sweep(self) -> None:
         """启动扫频：切到 SWEEP 模式并执行。"""
-        self.set_freq_mode("SWEEP")
+        self.set_freq_mode("SWE")
         time.sleep(0.05)
         self.execute_single_sweep()
 

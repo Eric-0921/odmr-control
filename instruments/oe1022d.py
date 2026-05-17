@@ -461,6 +461,8 @@ class OE1022DDriver:
 
     def set_ref_phase(self, channel: int = 1, phase_deg: float = 0.0) -> None:
         """参考相位，单位度。"""
+        if not -180.0 <= phase_deg <= 180.0:
+            raise ValueError("OE1022D reference phase must be within -180.0~+180.0 deg")
         self._exchange_ascii(f"PHASD {channel},{phase_deg:.2f}")
 
     def set_ref_source(self, channel: int = 1, source: int = 0) -> None:
@@ -473,7 +475,7 @@ class OE1022DDriver:
 
     def set_ref_frequency(self, channel: int = 1, freq_hz: float = 1000.0) -> None:
         """参考频率，单位 Hz（仅内部源有效）。"""
-        self._exchange_ascii(f"FREQD {channel},{freq_hz:.6g}")
+        self._exchange_ascii(f"FREQD {channel},{freq_hz:.6f}")
 
     def set_harmonic(self, channel: int = 1, harmonic: int = 1, slot: int = 1) -> None:
         """谐波次数: slot=1/2, harmonic=1~32767."""
@@ -539,6 +541,8 @@ class OE1022DDriver:
         """Configure OE1022D sample buffers per manual SRATD/SLEND/SSLED/STRGD/SPRMD."""
         if not 1 <= length <= 16384:
             raise ValueError("OE1022D sample length must be 1..16384")
+        if not 1.0 <= step_time_ms <= 100_000.0:
+            raise ValueError("OE1022D sample step time must be within 1.0~100000.0 ms")
         self._exchange_ascii(f"SRATD {channel},{step_time_ms:.3f}")
         self._exchange_ascii(f"SLEND {channel},{length}")
         for idx, param in enumerate(buffers, start=1):

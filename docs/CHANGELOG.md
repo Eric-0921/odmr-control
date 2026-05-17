@@ -4,6 +4,29 @@
 
 ---
 
+## [2.1.1] - 2026-05-15
+
+### Bug 修复
+
+| 编号 | 问题 | 严重程度 | 修复 |
+|------|------|----------|------|
+| FIX-021 | SMB100A `SOUR:FREQ:MODE SWEEP` 命令无效，手册要求 `SWE` | 🔴 高 | 改为 `SOUR:FREQ:MODE SWE` |
+| FIX-022 | SMB100A `SWE:DWELL` 命令拼写错误，手册要求 `SWE:DWEL` | 🔴 高 | 改为 `SWE:DWEL` |
+| FIX-023 | SMB100A `SWE:TRIG:SOUR` 命令路径错误，手册要求 `TRIG:FSW:SOUR` | 🔴 高 | 改为 `TRIG:FSW:SOUR` |
+| FIX-024 | SMB100A LF Sweep trigger 命令路径错误，手册要求 `TRIG:LFFS:SOUR` | 🔴 高 | 改为 `TRIG:LFFS:SOUR` |
+| FIX-025 | SMB100A LF Sweep step 命令不完整，手册要求 `SOUR:LFO:SWE:FREQ:STEP:LIN` | 🔴 高 | 补全为 `SOUR:LFO:SWE:FREQ:STEP:LIN` |
+| FIX-026 | SMB100A AM depth 命令不完整，手册要求 `SOUR:AM:DEPT:LIN` | 🔴 高 | 补全为 `SOUR:AM:DEPT:LIN` |
+| FIX-027 | OE1022D `FREQD` 使用 `.6g` 精度，损失 1 mHz 分辨率 | 🟡 中 | 改为 `.6f` |
+| FIX-028 | OE1022D `SRATD` 缺少 1 ms~100 s 范围校验 | 🟡 中 | 新增 `1.0 <= step_time_ms <= 100000.0` 校验 |
+| FIX-029 | OE1022D `PHASD` 缺少 ±180° 范围校验 | 🟡 中 | 新增 `-180.0 <= phase_deg <= 180.0` 校验 |
+
+### 变更
+
+- `instruments/smb100a.py`：6 处 SCPI 命令与 R&S SMB100A 操作手册对齐
+- `instruments/oe1022d.py`：1 处 ASCII 格式修正 + 2 处参数范围校验与 OE1022D 手册对齐
+
+---
+
 ## [2.1.0] - 2026-05-13
 
 ### 新增
