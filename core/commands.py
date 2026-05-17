@@ -27,7 +27,7 @@ class CommandType(Enum):
     SMB_SET_LF_SHAPE = auto()         # {shape}
     SMB_SET_MODULATION = auto()       # {mod_type, enabled, depth/freq/...}
     SMB_SET_FM_DEVIATION = auto()     # {hz}
-    SMB_SET_SWEEP = auto()            # {start_hz, stop_hz, step_hz, dwell_ms, power_dbm}
+    SMB_SET_SWEEP = auto()            # {start_hz, stop_hz, step_hz, dwell_ms, power_dbm, spacing, shape, retrace, trigger, lf_connector, ovolt_*}
     SMB_START_SWEEP = auto()
     SMB_STOP_SWEEP = auto()
     SMB_QUERY_STATE = auto()          # {} -> 返回完整状态字典
@@ -36,10 +36,10 @@ class CommandType(Enum):
     # ===== OE1022D 连接与基础控制 =====
     LOCKIN_CONNECT = auto()           # {port, baudrate, bytesize, parity, stopbits, timeout}
     LOCKIN_DISCONNECT = auto()
-    LOCKIN_SET_INPUT = auto()         # {channel, source, gain, ground, coupling, notch}
+    LOCKIN_SET_INPUT = auto()         # {channel, source, ground, coupling, notch}
     LOCKIN_SET_REF_PHASE = auto()     # {channel, phase_deg, source, slope, freq_hz, harmonic}
     LOCKIN_SET_GAIN_TC = auto()       # {channel, sensitivity, reserve, time_const, filter_db, sync}
-    LOCKIN_SET_OUTPUT = auto()        # {channel, source, offset, expand, voltage}
+    LOCKIN_SET_OUTPUT = auto()        # {output_ch, source, offset, expand, speed, aux_voltage_v}
     LOCKIN_SET_SAMPLE = auto()        # {step_time_ms, length, trigger_mode, sample_mode}
     LOCKIN_AUTO_GAIN = auto()         # {channel}
     LOCKIN_AUTO_RESERVE = auto()      # {channel}
@@ -65,10 +65,55 @@ class CommandType(Enum):
     ACQ_SET_SAMPLING = auto()         # {interval_ms}
     ACQ_START_RECORDING = auto()      # {output_dir, filename_prefix}
     ACQ_STOP_RECORDING = auto()
+    ACQ_QUERY_STATE = auto()
+
+    # ===== 磁场控制 =====
+    MAG_CONNECT_AXIS = auto()         # {axis, port, baudrate}
+    MAG_DISCONNECT_AXIS = auto()      # {axis}
+    MAG_CONNECT_ALL = auto()          # {ports: {X,Y,Z}, baudrate}
+    MAG_DISCONNECT_ALL = auto()
+    MAG_SCAN_PORTS = auto()           # {baudrate}
+    MAG_AUTO_DETECT = auto()          # {baudrate, bindings}
+    MAG_BIND_AXIS_IDN = auto()        # {axis, idn, port}
+    MAG_SET_POLL_INTERVAL = auto()    # {interval_ms}
+    MAG_SET_FIELD = auto()            # {axis, field_nT}
+    MAG_SET_FIELD_3D = auto()         # {x_nT, y_nT, z_nT}
+    MAG_SET_CURRENT = auto()          # {axis, current_mA}
+    MAG_SET_ZERO_OFFSET = auto()      # {axis, zero_offset_mA}
+    MAG_CAPTURE_BACKGROUND = auto()   # {axis}: read current as zero offset/background
+    MAG_PREPARE_ZERO_LOCK = auto()    # {axis}: output zero offset then lock zero
+    MAG_SET_COIL_CONSTANT = auto()    # {axis, coil_constant}
+    MAG_SET_OUTPUT = auto()           # {axis, enabled}
+    MAG_LOCK_ZERO = auto()            # {axis, locked}
+    MAG_QUERY_STATE = auto()          # {axis?} -> 三轴状态
+    MAG_EMERGENCY_STOP = auto()
+    MAG_LOAD_SEQUENCE = auto()        # {sequence | path}
+    MAG_START_SEQUENCE = auto()       # {record_path?}
+    MAG_PAUSE_SEQUENCE = auto()
+    MAG_RESUME_SEQUENCE = auto()
+    MAG_STOP_SEQUENCE = auto()
 
     # ===== 系统 =====
     SYS_EMERGENCY_STOP = auto()
     SYS_QUERY_ALL_STATUS = auto()     # 查询所有已连接设备状态
+
+    # ===== 配置和实验自动化 =====
+    LOCKIN_QUERY_CONFIG = auto()
+    LOCKIN_APPLY_CONFIG = auto()
+    LOCKIN_SET_DISPLAY_REFRESH_POLICY = auto()
+    SMB_QUERY_CONFIG = auto()
+    SMB_APPLY_CONFIG = auto()
+    EXPERIMENT_LOAD_JSON = auto()
+    EXPERIMENT_VALIDATE = auto()
+    EXPERIMENT_PREFLIGHT = auto()
+    EXPERIMENT_START = auto()
+    EXPERIMENT_PAUSE = auto()
+    EXPERIMENT_RESUME = auto()
+    EXPERIMENT_STOP = auto()
+    EXPERIMENT_QUERY_STATE = auto()
+    EXPERIMENT_WAIT = auto()           # {duration_s?, condition?}
+    EXPERIMENT_CONDITION_EVAL = auto() # {condition} -> {met: bool}
+    EXPERIMENT_MODIFY_STEP = auto()    # {step_index, overrides}
 
 
 @dataclass(frozen=True)

@@ -19,6 +19,7 @@ from typing import Callable, Dict, Optional
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 
 from data.recorder import ODMRRecorder
+from core.mag_field_controller import AXES as MAG_AXES, FieldController
 from instruments.laser_msl import LaserMSLDriver
 from instruments.oe1022d import OE1022DDriver
 from instruments.smb100a import SMB100ADriver
@@ -38,6 +39,7 @@ class InstrumentController(QObject):
     lockin_status_changed = pyqtSignal(dict)           # 过载/PLL 状态
     lockin_batch_ready = pyqtSignal(dict)              # RALL? batch
     laser_state_changed = pyqtSignal(dict)             # 激光器状态
+    mag_state_changed = pyqtSignal(dict)               # 三轴磁场状态
     sweep_progress = pyqtSignal(int, int)              # current_cycle, total_cycles
     sweep_finished = pyqtSignal(bool)                  # completed_ok
     error_occurred = pyqtSignal(str)
@@ -48,9 +50,15 @@ class InstrumentController(QObject):
         self._smb = SMB100ADriver()
         self._lockin = OE1022DDriver()
         self._laser = LaserMSLDriver()
+        self._mag = FieldController(self)
         self._smb_queue: queue.Queue = queue.Queue()
         self._lockin_queue: queue.Queue = queue.Queue()
         self._laser_queue: queue.Queue = queue.Queue()
+        self._mag.current_changed.connect(self._on_mag_axis_changed)
+        self._mag.field_changed.connect(self._on_mag_axis_changed)
+        self._mag.connection_changed.connect(self._on_mag_connection_changed)
+        self._mag.error_occurred.connect(self._on_mag_error)
+        self._mag.log_requested.connect(self.log_requested.emit)
 
         # workers
         self._smb_worker: Optional[SMBPollWorker] = None
@@ -84,6 +92,10 @@ class InstrumentController(QObject):
         return self._laser
 
     @property
+    def mag(self) -> FieldController:
+        return self._mag
+
+    @property
     def is_smb_connected(self) -> bool:
         return self._smb.is_connected
 
@@ -94,6 +106,10 @@ class InstrumentController(QObject):
     @property
     def is_laser_connected(self) -> bool:
         return self._laser.is_connected
+
+    @property
+    def is_mag_connected(self) -> bool:
+        return any(self._mag.is_connected(axis) for axis in MAG_AXES)
 
     @property
     def is_sweeping(self) -> bool:
@@ -124,8 +140,9 @@ class InstrumentController(QObject):
         parity: str = "N",
         stopbits: int = 1,
         timeout: float = 1.0,
+        transport: str = "rs232",
     ) -> str:
-        idn = self._lockin.connect(port, baudrate, bytesize, parity, stopbits, timeout)
+        idn = self._lockin.connect(port, baudrate, bytesize, parity, stopbits, timeout, transport)
         self._start_lockin_monitor()
         return idn
 
@@ -218,7 +235,7 @@ class InstrumentController(QObject):
         self._laser_worker = LaserPollWorker(self._laser, self._laser_queue, interval_ms)
         self._laser_thread = QThread(self)
         self._laser_worker.moveToThread(self._laser_thread)
-        self._laser_worker.state_updated.connect(self.laser_state_changed.emit)
+        self._laser_worker.state_updated.connect(self._on_laser_state_updated)
         self._laser_worker.log_requested.connect(self.log_requested.emit)
         self._laser_worker.error_occurred.connect(self.error_occurred.emit)
         self._laser_thread.started.connect(self._laser_worker.run)
@@ -238,7 +255,12 @@ class InstrumentController(QObject):
 
     def start_lockin_acquire(self, recorder: Optional[ODMRRecorder] = None) -> None:
         """启动 RALL? 高速采集（仅在扫频期间调用）。"""
+        if not self._lockin.rall_supported:
+            raise RuntimeError("OE1022D RALL? requires the USB2.0 interface; RS232 supports SNAPD?/sample commands only.")
         if self._lockin_acquire_thread is not None:
+            if recorder is not None and self._lockin_acquire_worker is not None:
+                self._recorder = recorder
+                self._lockin_acquire_worker.set_recorder(recorder)
             return
         self._recorder = recorder
         self._lockin_acquire_worker = LockinAcquireWorker(
@@ -250,6 +272,7 @@ class InstrumentController(QObject):
         self._lockin_acquire_worker.log_requested.connect(self.log_requested.emit)
         self._lockin_acquire_worker.error_occurred.connect(self.error_occurred.emit)
         self._lockin_acquire_worker.finished.connect(self._on_acquire_finished)
+        self._lockin_acquire_worker.set_mag_state(self._mag.get_field_snapshot())
         self._lockin_acquire_thread.started.connect(self._lockin_acquire_worker.run)
         self._lockin_acquire_thread.finished.connect(self._lockin_acquire_worker.deleteLater)
         self._lockin_acquire_thread.start()
@@ -260,6 +283,15 @@ class InstrumentController(QObject):
         self._stop_lockin_acquire()
         if self._recorder is not None and self._recorder.is_recording:
             self._recorder.stop_recording()
+
+    def detach_lockin_recorder(self) -> None:
+        """停止当前 recorder，但保持 RALL? 采集线程继续运行。"""
+        recorder = self._recorder
+        self._recorder = None
+        if self._lockin_acquire_worker is not None:
+            self._lockin_acquire_worker.set_recorder(None)
+        if recorder is not None and recorder.is_recording:
+            recorder.stop_recording()
 
     def _stop_lockin_acquire(self) -> None:
         if self._lockin_acquire_worker is not None:
@@ -277,9 +309,32 @@ class InstrumentController(QObject):
 
     def _on_smb_state_updated(self, freq_hz: float, output_on: bool, mode: str) -> None:
         self.smb_state_changed.emit(freq_hz, output_on, mode)
+        self.update_acquire_smb_state(freq_hz, self._smb.cached_power_dbm, output_on)
+
+    def update_acquire_smb_state(self, freq_hz: float, power_dbm: float, output_on: bool) -> None:
+        """向 RALL? 采集线程同步最近的 SMB 状态。"""
         if self._lockin_acquire_worker is not None:
-            power = self._smb.cached_power_dbm
-            self._lockin_acquire_worker.set_smb_state(freq_hz, power, output_on)
+            self._lockin_acquire_worker.set_smb_state(freq_hz, power_dbm, output_on)
+
+    def _on_laser_state_updated(self, state: dict) -> None:
+        self.laser_state_changed.emit(state)
+        if self._lockin_acquire_worker is not None:
+            self._lockin_acquire_worker.set_laser_state(
+                float(state.get("power_mw", 0.0)),
+                bool(state.get("output_on", False)),
+            )
+
+    def _on_mag_axis_changed(self, *_args) -> None:
+        snapshot = self._mag.get_field_snapshot()
+        self.mag_state_changed.emit(snapshot)
+        if self._lockin_acquire_worker is not None:
+            self._lockin_acquire_worker.set_mag_state(snapshot)
+
+    def _on_mag_connection_changed(self, _axis: str, _connected: bool) -> None:
+        self.mag_state_changed.emit(self._mag.get_field_snapshot())
+
+    def _on_mag_error(self, axis: str, msg: str) -> None:
+        self.error_occurred.emit(f"[Mag {axis}] {msg}")
 
     def _on_acquire_finished(self) -> None:
         self._acquiring = False
@@ -300,6 +355,7 @@ class InstrumentController(QObject):
         if self._laser.is_connected:
             if not self._laser.emergency_stop():
                 self.error_occurred.emit("[急停] Laser 关闭失败（3 次重试均失败）")
+        self._mag.all_output_off()
         self.log_requested.emit("[急停] 已执行 Emergency Stop")
 
     def verify_emergency_stop(self) -> Dict[str, object]:
@@ -321,6 +377,7 @@ class InstrumentController(QObject):
                 result["laser"] = {"ok": False, "error": str(exc)}
         result["acquiring"] = self._acquiring
         result["sweeping"] = self._sweeping
+        result["magnetic_field"] = self._mag.verify_emergency_stop()
         return result
 
     # -- convenience pass-throughs -------------------------------------------
@@ -340,5 +397,6 @@ class InstrumentController(QObject):
             (self._smb_thread is not None and self._smb_thread.isRunning()) or
             (self._lockin_monitor_thread is not None and self._lockin_monitor_thread.isRunning()) or
             (self._lockin_acquire_thread is not None and self._lockin_acquire_thread.isRunning()) or
-            (self._laser_thread is not None and self._laser_thread.isRunning())
+            (self._laser_thread is not None and self._laser_thread.isRunning()) or
+            self._mag.is_any_worker_running()
         )

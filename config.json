@@ -85,6 +85,29 @@
   "laser_bindings": {},
   "lockin_bindings": {},
   "smb_bindings": {},
+  "magnetic_field": {
+    "baudrate": 9600,
+    "poll_interval_ms": 500,
+    "bindings": {
+      "X": "MAYNUO,M8812,080020960220402003,V2.7",
+      "Y": "MAYNUO,M8812,080020960220402020,V2.7",
+      "Z": "MAYNUO,M8812,080020960220402022,V2.7"
+    },
+    "axes": {
+      "X": {
+        "coil_constant": 156.15,
+        "zero_offset_mA": 0.0
+      },
+      "Y": {
+        "coil_constant": 143.26,
+        "zero_offset_mA": 0.0
+      },
+      "Z": {
+        "coil_constant": 141.77,
+        "zero_offset_mA": 0.0
+      }
+    }
+  },
   "sweep": {
     "power_dbm": -30.0,
     "start_freq_hz": 2820000000.0,
@@ -100,6 +123,9 @@
   "acquisition": {
     "monitor_interval_ms": 94,
     "rall_batch_interval_ms": 50,
+    "rall_points_per_batch": 50,
+    "effective_sampling_rate_hz": 1000,
+    "_note": "RALL? 采样率由硬件固定: 50ms/batch x 50 points = 1 kHz，不可软件配置",
     "save_dir": "./experiments",
     "auto_save": true
   },

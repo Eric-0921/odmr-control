@@ -198,6 +198,11 @@ class _SweepRunner(QObject):
 
             try:
                 freq = self._ctrl.smb.get_freq_cw()
+                self._ctrl.update_acquire_smb_state(
+                    freq,
+                    self._ctrl.smb.cached_power_dbm,
+                    self._ctrl.smb.cached_output_on,
+                )
             except Exception:
                 time.sleep(0.05)
                 continue

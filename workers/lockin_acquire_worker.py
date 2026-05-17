@@ -1,7 +1,7 @@
 """OE1022D 高速采集 Worker (RALL?)
 
 在扫频期间以 50ms 间隔发送 RALL? 并读取 12288 bytes，
-解析后通过信号批量回传，同时写入 Parquet。
+解析后通过信号批量回传，同时写入 CSV。
 
 严格对齐 50ms 时序，允许 ±5ms 抖动。
 """
@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 import time
 
 import numpy as np
@@ -39,15 +40,37 @@ class LockinAcquireWorker(QObject):
         self._stop_requested = False
         self._batch_count = 0
         self._dropped = 0
+        self._last_batch_time_s = 0.0
+        self._state_lock = threading.Lock()
         self._smb_freq_hz = 0.0
         self._smb_power_dbm = 0.0
         self._smb_rf_on = False
+        self._laser_power_mw = 0.0
+        self._laser_on = False
+        self._mag_state = {}
 
     def set_smb_state(self, freq_hz: float, power_dbm: float, rf_on: bool) -> None:
-        """同步 SMB100A 当前状态，用于写入 Parquet。"""
-        self._smb_freq_hz = freq_hz
-        self._smb_power_dbm = power_dbm
-        self._smb_rf_on = rf_on
+        """同步 SMB100A 当前状态，用于写入 CSV。"""
+        with self._state_lock:
+            self._smb_freq_hz = freq_hz
+            self._smb_power_dbm = power_dbm
+            self._smb_rf_on = rf_on
+
+    def set_laser_state(self, power_mw: float, output_on: bool) -> None:
+        """同步激光器缓存状态，用于写入 CSV。"""
+        with self._state_lock:
+            self._laser_power_mw = power_mw
+            self._laser_on = output_on
+
+    def set_mag_state(self, state: dict) -> None:
+        """同步三轴磁场缓存状态，用于写入 CSV。"""
+        with self._state_lock:
+            self._mag_state = dict(state)
+
+    def set_recorder(self, recorder: ODMRRecorder | None) -> None:
+        """采集不中断时切换/附加 recorder。"""
+        with self._state_lock:
+            self._recorder = recorder
 
     def run(self) -> None:
         self.log_requested.emit("[Lockin] 采集线程启动 (RALL?)")
@@ -92,15 +115,34 @@ class LockinAcquireWorker(QObject):
 
                     consecutive_errors = 0
                     batch = self._driver.parse_rall(raw)
+                    config_snapshot = self._driver.parse_rall_config(raw)
+                    batch["config_snapshot"] = config_snapshot
+                    batch["acquisition_stats"] = {
+                        "batch_count": self._batch_count + 1,
+                        "dropped_batches": self._dropped,
+                        "batch_rate_hz": self._batch_rate(t_start),
+                    }
                     self.batch_ready.emit(batch)
                     self._batch_count += 1
 
-                    if self._recorder is not None and self._recorder.is_recording:
-                        self._recorder.write_batch(
+                    with self._state_lock:
+                        recorder = self._recorder
+                        smb_freq_hz = self._smb_freq_hz
+                        smb_power_dbm = self._smb_power_dbm
+                        smb_rf_on = self._smb_rf_on
+                        laser_power_mw = self._laser_power_mw
+                        laser_on = self._laser_on
+                        mag_state = dict(self._mag_state)
+
+                    if recorder is not None and recorder.is_recording:
+                        recorder.write_batch(
                             batch,
-                            smb_freq_hz=self._smb_freq_hz,
-                            smb_power_dbm=self._smb_power_dbm,
-                            smb_rf_on=self._smb_rf_on,
+                            smb_freq_hz=smb_freq_hz,
+                            smb_power_dbm=smb_power_dbm,
+                            smb_rf_on=smb_rf_on,
+                            laser_power_mw=laser_power_mw,
+                            laser_on=laser_on,
+                            mag_state=mag_state,
                         )
 
                     if self._batch_count % 200 == 0:
@@ -131,10 +173,12 @@ class LockinAcquireWorker(QObject):
         except Exception as exc:
             self.error_occurred.emit(f"[Lockin] 采集线程异常: {exc}")
         finally:
-            # 确保 recorder 被关闭，防止 Parquet 文件损坏
-            if self._recorder is not None and self._recorder.is_recording:
+            # 确保 recorder 被关闭，防止 CSV 文件句柄泄漏
+            with self._state_lock:
+                recorder = self._recorder
+            if recorder is not None and recorder.is_recording:
                 try:
-                    self._recorder.stop_recording()
+                    recorder.stop_recording()
                     self.log_requested.emit("[Lockin] Recorder stopped in finally")
                 except Exception as exc:
                     self.error_occurred.emit(f"[Lockin] Recorder stop failed: {exc}")
@@ -145,6 +189,16 @@ class LockinAcquireWorker(QObject):
 
     def stop(self) -> None:
         self._stop_requested = True
+
+    def _batch_rate(self, now_s: float) -> float:
+        if self._last_batch_time_s <= 0:
+            self._last_batch_time_s = now_s
+            return 0.0
+        dt = now_s - self._last_batch_time_s
+        self._last_batch_time_s = now_s
+        if dt <= 0:
+            return 0.0
+        return 1.0 / dt
 
     def _drain_commands(self) -> None:
         while True:
