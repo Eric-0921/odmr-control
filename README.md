@@ -8,15 +8,113 @@ PyQt5 桌面应用，用于控制光探测磁共振 (ODMR) 实验。统一管理
 | 锁相放大器 | SSI OE1022D | Serial/RS-232 | 信号检测 |
 | 激光器 | CNI MSL-U-532nm-300mW | Serial/RS-232 (单向) | 光激发 |
 
+## 环境要求
+
+| 项目 | 要求 |
+|------|------|
+| Python | >= 3.9（推荐 3.11–3.13） |
+| 操作系统 | Windows 10/11（推荐）、macOS、Linux |
+| 内存 | >= 4 GB |
+| 磁盘 | >= 500 MB（实验数据另计） |
+
+## 安装与部署
+
+### 方式一：Conda 环境（推荐）
+
+```bash
+# 1. 创建并激活环境
+conda create -n odmr python=3.11
+conda activate odmr
+
+# 2. 安装依赖
+pip install -r requirements.txt
+
+# 3. 验证安装
+python -m pytest tests/ -v
+```
+
+### 方式二：系统 Python / venv
+
+```bash
+# 1. 创建虚拟环境
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
+# 2. 安装依赖
+pip install -r requirements.txt
+
+# 3. 验证安装
+python -m pytest tests/ -v
+```
+
+### 硬件驱动与 VISA 后端
+
+SMB100A 通过 **VISA** 通信，需安装对应后端的驱动：
+
+| 连接方式 | 后端 | 说明 |
+|----------|------|------|
+| USB / GPIB | NI-VISA 或 R&S VISA | 推荐 NI-VISA 21.0+ |
+| LAN (TCPIP) | 无需额外驱动 | pyvisa 自带 socket 后端 |
+| Serial | pyserial 即可 | 无需单独 VISA 驱动 |
+
+> **Windows 用户**：安装 NI-VISA 后，设备管理器中会出现 "NI-VISA USB Device"，Resource Manager 可自动识别地址。
+>
+> **macOS/Linux 用户**：可使用 `pyvisa-py` 纯 Python 后端（功能受限，建议测试用）：
+> ```bash
+> pip install pyvisa-py
+> ```
+
+OE1022D 和激光器通过 **RS-232 串口** 连接，需确保：
+- USB-转-串口适配器驱动已安装
+- 端口不被其他程序占用
+- 在 `config.json` 中配置正确的串口号
+
+### 配置文件
+
+首次运行前，检查 `config.json`：
+
+```json
+{
+  "smb": {
+    "address": "TCPIP0::192.168.1.10::inst0::INSTR",
+    "amplifier_installed": true
+  },
+  "lockin": {
+    "port": "COM3",
+    "baudrate": 115200
+  },
+  "laser": {
+    "port": "COM4",
+    "max_power_mw": 150
+  }
+}
+```
+
 ## 快速开始
 
 ```bash
-pip install -r requirements.txt
+# 激活环境（如使用 conda/venv）
+conda activate odmr
+
+# 启动主程序
 python main.py
 
 # 运行单元测试（无需硬件）
 python -m pytest tests/ -v
 ```
+
+### 首次运行检查清单
+
+- [ ] 微波源 SMB100A 已上电，网线/USB 已连接
+- [ ] 锁相放大器 OE1022D 已上电，串口已连接
+- [ ] 激光器已上电，串口已连接
+- [ ] `config.json` 中的地址/端口与实际一致
+- [ ] 已安装 VISA 后端（USB/GPIB 场景）
 
 ## 架构
 
