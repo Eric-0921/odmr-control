@@ -14,7 +14,8 @@
 from __future__ import annotations
 
 import queue
-from typing import Callable, Dict, Optional
+import time
+from typing import Callable, Dict, List, Optional, Any
 
 from PyQt5.QtCore import QObject, QThread, pyqtSignal
 
@@ -72,6 +73,10 @@ class InstrumentController(QObject):
 
         # recorder
         self._recorder: Optional[ODMRRecorder] = None
+
+        # event log for multi-device timestamp alignment
+        self._event_log: List[Dict[str, Any]] = []
+        self._last_event_values: Dict[str, Any] = {}
 
         # safety state
         self._sweeping = False
@@ -262,6 +267,8 @@ class InstrumentController(QObject):
                 self._recorder = recorder
                 self._lockin_acquire_worker.set_recorder(recorder)
             return
+        # RALL? 采集期间停止 SNAPD? 监控，避免两个 Worker 竞争串口锁导致设备响应混乱
+        self._stop_lockin_monitor()
         self._recorder = recorder
         self._lockin_acquire_worker = LockinAcquireWorker(
             self._lockin, self._lockin_queue, recorder
@@ -277,6 +284,8 @@ class InstrumentController(QObject):
         self._lockin_acquire_thread.finished.connect(self._lockin_acquire_worker.deleteLater)
         self._lockin_acquire_thread.start()
         self._acquiring = True
+        self._event_log.clear()
+        self._last_event_values.clear()
 
     def stop_lockin_acquire(self) -> None:
         """停止 RALL? 采集。"""
@@ -303,12 +312,54 @@ class InstrumentController(QObject):
                 self._lockin_acquire_thread.wait(1000)
             self._lockin_acquire_thread = None
         self._lockin_acquire_worker = None
+        # 输出事件日志
+        self._flush_event_log()
+        # 恢复 SNAPD? 监控
+        if self.is_lockin_connected:
+            self._start_lockin_monitor()
         self._acquiring = False
+
+    # -- event logging for multi-device alignment ---------------------------
+
+    def _log_event(self, device: str, param: str, value: Any) -> None:
+        """记录设备状态变化事件（仅在采集期间，且值与上次不同时记录）。"""
+        if not self._acquiring:
+            return
+        key = f"{device}.{param}"
+        # 简单去重：与上次记录的值比较
+        if key in self._last_event_values and self._last_event_values[key] == value:
+            return
+        self._last_event_values[key] = value
+        self._event_log.append({
+            "timestamp": time.monotonic(),
+            "device": device,
+            "param": param,
+            "value": value,
+        })
+
+    def _flush_event_log(self) -> None:
+        """将事件日志写入 recorder 的 events.jsonl，然后清空。"""
+        if self._recorder is None or not self._recorder.is_recording:
+            return
+        if not self._event_log:
+            return
+        try:
+            import json
+            events_path = self._recorder.output_dir / "events.jsonl"
+            with open(events_path, "w", encoding="utf-8") as f:
+                for ev in self._event_log:
+                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self.log_requested.emit(f"[EventLog] 写入失败: {exc}")
+        self._event_log.clear()
+        self._last_event_values.clear()
 
     # -- slots ---------------------------------------------------------------
 
     def _on_smb_state_updated(self, freq_hz: float, output_on: bool, mode: str) -> None:
         self.smb_state_changed.emit(freq_hz, output_on, mode)
+        self._log_event("smb", "freq_hz", freq_hz)
+        self._log_event("smb", "output_on", output_on)
         self.update_acquire_smb_state(freq_hz, self._smb.cached_power_dbm, output_on)
 
     def update_acquire_smb_state(self, freq_hz: float, power_dbm: float, output_on: bool) -> None:
@@ -318,6 +369,8 @@ class InstrumentController(QObject):
 
     def _on_laser_state_updated(self, state: dict) -> None:
         self.laser_state_changed.emit(state)
+        self._log_event("laser", "power_mw", float(state.get("power_mw", 0.0)))
+        self._log_event("laser", "output_on", bool(state.get("output_on", False)))
         if self._lockin_acquire_worker is not None:
             self._lockin_acquire_worker.set_laser_state(
                 float(state.get("power_mw", 0.0)),
@@ -327,6 +380,11 @@ class InstrumentController(QObject):
     def _on_mag_axis_changed(self, *_args) -> None:
         snapshot = self._mag.get_field_snapshot()
         self.mag_state_changed.emit(snapshot)
+        axes = snapshot.get("axes", {})
+        for axis in ("X", "Y", "Z"):
+            status = axes.get(axis, {})
+            self._log_event(f"mag_{axis}", "target_field_nT", float(status.get("target_field_nT", 0.0)))
+            self._log_event(f"mag_{axis}", "output_on", bool(status.get("output_on", False)))
         if self._lockin_acquire_worker is not None:
             self._lockin_acquire_worker.set_mag_state(snapshot)
 
@@ -340,6 +398,9 @@ class InstrumentController(QObject):
         self._acquiring = False
         self._lockin_acquire_thread = None
         self._lockin_acquire_worker = None
+        # 恢复 SNAPD? 监控
+        if self.is_lockin_connected:
+            self._start_lockin_monitor()
 
     # -- safety operations ---------------------------------------------------
 

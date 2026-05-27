@@ -94,12 +94,29 @@ class LockinAcquireWorker(QObject):
             while not self._stop_requested:
                 t_start = time.monotonic()
 
+                # 在发送 RALL? 之前快照设备状态（采集端时间基准）
+                with self._state_lock:
+                    state_snapshot = {
+                        "smb_freq_hz": self._smb_freq_hz,
+                        "smb_power_dbm": self._smb_power_dbm,
+                        "smb_rf_on": self._smb_rf_on,
+                        "laser_power_mw": self._laser_power_mw,
+                        "laser_on": self._laser_on,
+                        "mag_state": dict(self._mag_state),
+                    }
+
                 self._drain_commands()
 
                 try:
-                    # 每批都需要重新发送 RALL? 命令
+                    # 每批重新发送 RALL? 命令（查询式：设备不会自动持续发送）
+                    t_rall_start = time.monotonic()
                     self._driver.start_rall_stream()
                     raw = self._driver.read_rall_batch(timeout=1.0)
+                    t_rall_elapsed = (time.monotonic() - t_rall_start) * 1000.0
+                    if self._batch_count % 20 == 0:
+                        self.log_requested.emit(
+                            f"[Lockin] RALL? 读取耗时: {t_rall_elapsed:.1f} ms, 数据: {len(raw)} bytes"
+                        )
                     if len(raw) != RALL_TOTAL_BYTES:
                         self._dropped += 1
                         consecutive_errors += 1
@@ -119,30 +136,27 @@ class LockinAcquireWorker(QObject):
                     batch["config_snapshot"] = config_snapshot
                     batch["acquisition_stats"] = {
                         "batch_count": self._batch_count + 1,
+                        "batch_timestamp_s": t_start,  # 采集端统一时间基准
                         "dropped_batches": self._dropped,
                         "batch_rate_hz": self._batch_rate(t_start),
                     }
+                    batch["state_snapshot"] = state_snapshot
                     self.batch_ready.emit(batch)
                     self._batch_count += 1
 
                     with self._state_lock:
                         recorder = self._recorder
-                        smb_freq_hz = self._smb_freq_hz
-                        smb_power_dbm = self._smb_power_dbm
-                        smb_rf_on = self._smb_rf_on
-                        laser_power_mw = self._laser_power_mw
-                        laser_on = self._laser_on
-                        mag_state = dict(self._mag_state)
 
                     if recorder is not None and recorder.is_recording:
                         recorder.write_batch(
                             batch,
-                            smb_freq_hz=smb_freq_hz,
-                            smb_power_dbm=smb_power_dbm,
-                            smb_rf_on=smb_rf_on,
-                            laser_power_mw=laser_power_mw,
-                            laser_on=laser_on,
-                            mag_state=mag_state,
+                            batch_timestamp_s=t_start,
+                            smb_freq_hz=state_snapshot["smb_freq_hz"],
+                            smb_power_dbm=state_snapshot["smb_power_dbm"],
+                            smb_rf_on=state_snapshot["smb_rf_on"],
+                            laser_power_mw=state_snapshot["laser_power_mw"],
+                            laser_on=state_snapshot["laser_on"],
+                            mag_state=state_snapshot["mag_state"],
                         )
 
                     if self._batch_count % 200 == 0:

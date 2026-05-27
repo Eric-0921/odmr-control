@@ -152,6 +152,7 @@ class ODMRRecorder:
     def write_batch(
         self,
         rall_data: Dict[str, np.ndarray],
+        batch_timestamp_s: float = 0.0,
         smb_freq_hz: float = 0.0,
         smb_power_dbm: float = 0.0,
         smb_rf_on: bool = False,
@@ -167,7 +168,10 @@ class ODMRRecorder:
                 return
 
             n = self._batch_len(rall_data)
-            t_batch = time.monotonic() - self._start_time
+            if batch_timestamp_s > 0:
+                t_batch = batch_timestamp_s - self._start_time
+            else:
+                t_batch = time.monotonic() - self._start_time
             for i in range(n):
                 row = []
                 if self._has_group("CH-A"):

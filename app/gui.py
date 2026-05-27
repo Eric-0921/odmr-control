@@ -14,6 +14,7 @@ import logging
 import queue
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,6 +75,8 @@ from instruments.oe1022d import (
 
 try:
     import pyqtgraph as pg
+    # OpenGL 暂关闭 — 某些系统上会导致渲染阻塞，刷新率异常
+    # pg.setConfigOptions(useOpenGL=True, enableExperimental=True)
     _HAS_PYG = True
 except ImportError:
     _HAS_PYG = False
@@ -277,11 +280,8 @@ class ODMRControlGUI(QMainWindow):
         self._recorder: Optional[ODMRRecorder] = None
         self._recording = False
 
-        # waveform display telemetry; acquisition can stay at 50 ms while GUI redraw adapts
-        policy = self._cfg.get("lockin", {}).get("display_refresh_policy", {})
-        self._wave_display_max_ms = int(policy.get("max_interval_ms", 300))
-        self._wave_display_min_ms = int(policy.get("min_interval_ms", 50))
-        self._wave_display_interval_ms = self._wave_display_max_ms
+        # waveform display telemetry — 固定 16ms 刷新率 (~60 FPS)，不再随时间常数变化
+        self._wave_display_interval_ms = 16
         self._wave_last_repaint_ts = 0.0
         self._wave_last_fps_ts = datetime.datetime.now().timestamp()
         self._wave_repaint_count = 0
@@ -307,10 +307,11 @@ class ODMRControlGUI(QMainWindow):
         self._build_central()
         self._build_statusbar()
 
-        # display update timer (50ms, decoupled from data rate)
+        # display update timer (16ms ~ 60 FPS, PreciseTimer 提高 Windows 精度)
         self._display_timer = QTimer(self)
+        self._display_timer.setTimerType(Qt.PreciseTimer)
         self._display_timer.timeout.connect(self._on_display_tick)
-        self._display_timer.start(50)
+        self._display_timer.start(16)
 
     def _setup_error_logger(self) -> None:
         log_dir = Path(__file__).parent.parent / "errors"
@@ -3475,11 +3476,11 @@ class ODMRControlGUI(QMainWindow):
         ("X",   "X",      "#0080c8", True,  "amp"),
         ("Y",   "Y",      "#00a651", True,  "amp"),
         ("R",   "R",      "#e04040", True,  "amp"),
-        ("θ",    "theta",    "#ff8c00", True,  "amp"),
+        ("θ",    "theta",    "#ff8c00", False,  "amp"),
         ("freq", "freq",     "#808080", False, "other"),
         ("noise","noise",    "#c0c0c0", False, "other"),
-        ("Xh1",  "Xh1",     "#4080c8", True,  "amp"),
-        ("Yh1",  "Yh1",     "#40a651", True,  "amp"),
+        ("Xh1",  "Xh1",     "#4080c8", False,  "amp"),
+        ("Yh1",  "Yh1",     "#40a651", False,  "amp"),
         ("Rh1",  "Rh1",     "#e08080", False, "amp"),
         ("θh1",  "theta_h1","#c08000", False, "amp"),
         ("Xh2",  "Xh2",     "#8080c8", False, "amp"),
@@ -3519,7 +3520,23 @@ class ODMRControlGUI(QMainWindow):
 
         self._wave_auto_y = QCheckBox("Auto Y")
         self._wave_auto_y.setChecked(True)
+        self._wave_auto_y = QCheckBox("Auto Y")
+        self._wave_auto_y.setChecked(True)
         ctrl_bar.addWidget(self._wave_auto_y)
+
+        ctrl_bar.addWidget(QLabel("窗口:"))
+        self._wave_window_combo = QComboBox()
+        self._wave_window_combo.addItems(["1 s", "2 s", "5 s", "10 s", "30 s"])
+        self._wave_window_combo.setCurrentText("2 s")
+        self._wave_window_combo.currentTextChanged.connect(self._on_wave_window_changed)
+        ctrl_bar.addWidget(self._wave_window_combo)
+
+        ctrl_bar.addWidget(QLabel("刷新:"))
+        self._wave_refresh_combo = QComboBox()
+        self._wave_refresh_combo.addItems(["16 ms", "33 ms", "50 ms", "100 ms"])
+        self._wave_refresh_combo.setCurrentText("16 ms")
+        self._wave_refresh_combo.currentTextChanged.connect(self._on_wave_refresh_changed)
+        ctrl_bar.addWidget(self._wave_refresh_combo)
 
         ctrl_bar.addStretch()
 
@@ -3573,17 +3590,26 @@ class ODMRControlGUI(QMainWindow):
             self._wave_plot = pg.PlotWidget()
             self._wave_plot.setLabel("left", "幅度", units="mV")
             self._wave_plot.setLabel("bottom", "时间", units="s")
-            self._wave_plot.addLegend()
             self._wave_plot.showGrid(x=True, y=True, alpha=0.3)
+            # 固定视口范围：最近 1 秒，避免 pyqtgraph 每帧重新计算范围
+            self._wave_window_seconds = 2
+            self._wave_plot.setXRange(-self._wave_window_seconds * 1.05, 0.1, padding=0)
+            self._wave_plot.disableAutoRange(axis=pg.ViewBox.XAxis)
             # 零线
             self._wave_zero_line = pg.InfiniteLine(
                 pos=0, angle=0, pen=pg.mkPen("#999", width=1, style=Qt.DotLine)
             )
             self._wave_plot.addItem(self._wave_zero_line)
 
-            self._wave_curves: Dict[str, pg.PlotDataItem] = {}
+            self._wave_curves: Dict[str, pg.PlotCurveItem] = {}
             for label, key, color, _default, _axis in self._WAVE_PARAMS:
-                curve = self._wave_plot.plot(pen=pg.mkPen(color, width=1.5), name=label)
+                # autoDownsample=False 避免 pyqtgraph 自动降采样导致 batch 边界视觉锯齿
+                # skipFiniteCheck=False 确保 np.nan 能正确断裂曲线（用于 ring-buffer wrap-around 间隙）
+                curve = pg.PlotCurveItem(
+                    pen=pg.mkPen(color, width=1.5), name=label,
+                    autoDownsample=False, skipFiniteCheck=False
+                )
+                self._wave_plot.addItem(curve)
                 self._wave_curves[key] = curve
 
             layout.addWidget(self._wave_plot, 1)
@@ -3593,9 +3619,10 @@ class ODMRControlGUI(QMainWindow):
             self._wave_curves = {}
 
         # -- Waveform buffers --------------------------------------------------
+        # capacity=60000 支持 60s @ 1kHz，避免 5s 一次的 ring-buffer wrap-around 锯齿
         self._waveform_buffers: Dict[int, CircularBuffer] = {
-            1: CircularBuffer(channels=self._WAVE_BUFFER_CHANNELS, capacity=5000),
-            2: CircularBuffer(channels=self._WAVE_BUFFER_CHANNELS, capacity=5000),
+            1: CircularBuffer(channels=self._WAVE_BUFFER_CHANNELS, capacity=60000),
+            2: CircularBuffer(channels=self._WAVE_BUFFER_CHANNELS, capacity=60000),
         }
         self._waveform_paused = False
         self._waveform_page_active = False
@@ -3654,6 +3681,21 @@ class ODMRControlGUI(QMainWindow):
         if key in self._wave_curves:
             if not checked:
                 self._wave_curves[key].setData([], [])
+
+    def _on_wave_window_changed(self, text: str) -> None:
+        """时间窗口切换：调整 X 轴范围和 buffer 读取点数。"""
+        seconds = int(text.replace(" s", ""))
+        self._wave_window_seconds = seconds
+        self._wave_plot.setXRange(-seconds * 1.05, 0.1, padding=0)
+        self._on_log(f"波形窗口改为 {seconds} s", "gui")
+
+    def _on_wave_refresh_changed(self, text: str) -> None:
+        """刷新率切换：调整 QTimer 间隔。"""
+        ms = int(text.replace(" ms", ""))
+        self._display_timer.stop()
+        self._display_timer.start(ms)
+        self._wave_display_interval_ms = ms
+        self._on_log(f"波形刷新率改为 {ms} ms", "gui")
 
     def _on_wave_channel_changed(self, idx: int) -> None:
         """通道切换：清空曲线，等待新数据。"""
@@ -4781,6 +4823,8 @@ class ODMRControlGUI(QMainWindow):
 
     def _on_lockin_batch_ready(self, batch):
         """处理 RALL? 批次数据：喂给波形缓冲区和兼容旧缓冲区。"""
+        # 统计 GUI 层实际收到的 batch 频率（用于诊断采集 vs 渲染瓶颈）
+        self._wave_batch_arrival_count = getattr(self, '_wave_batch_arrival_count', 0) + 1
         n = len(batch.get("lockin_A_X_mv", []))
         if n == 0:
             return
@@ -4788,67 +4832,66 @@ class ODMRControlGUI(QMainWindow):
         if isinstance(stats, dict):
             self._wave_batch_rate_hz = float(stats.get("batch_rate_hz", self._wave_batch_rate_hz) or 0.0)
             self._wave_dropped_batches = int(stats.get("dropped_batches", self._wave_dropped_batches) or 0)
-        snapshot = batch.get("config_snapshot", {})
-        ch_idx = self._wave_ch_select.currentIndex() if hasattr(self, "_wave_ch_select") else 0
-        ch_key = "A" if ch_idx == 0 else "B"
-        ch_cfg = snapshot.get(ch_key, {}) if isinstance(snapshot, dict) else {}
-        tc_index = ch_cfg.get("time_constant_index")
-        if tc_index is not None:
-            interval = OE1022DDriver.display_interval_for_time_constant(
-                int(tc_index),
-                min_ms=self._wave_display_min_ms,
-                max_ms=self._wave_display_max_ms,
-            )
-            self._wave_display_interval_ms = int(interval)
-            tc_meta = TIME_CONSTANTS.get(int(tc_index), (str(tc_index), 0.0))
-            self._wave_tc_label = str(tc_meta[0])
-        ts = datetime.datetime.now().timestamp()
-        dt = 0.05 / n  # 50ms / n points
+        tc_meta = TIME_CONSTANTS.get(6, ("10 ms", 0.01))  # 仅用于状态标签显示，不再控制刷新率
+        self._wave_tc_label = str(tc_meta[0])
+        # 使用采集端 batch_timestamp_s 作为时间基准（若有，兼容旧 worker 则回退到 batch_count）
+        stats = batch.get("acquisition_stats", {})
+        batch_ts = float(stats.get("batch_timestamp_s", 0.0)) if isinstance(stats, dict) else 0.0
+        if batch_ts <= 0:
+            batch_count = int(stats.get("batch_count", 0)) if isinstance(stats, dict) else 0
+            batch_ts = batch_count * 0.050
+        base_ts = batch_ts
+        dt = 0.050 / n  # 点间隔 = 50ms / n points
 
-        for ch_label, ch_num in [("A", 1), ("B", 2)]:
-            prefix = f"lockin_{ch_label}_"
-            x = batch.get(f"{prefix}X_mv")
-            y = batch.get(f"{prefix}Y_mv")
-            if x is None or y is None:
-                continue
-            r = np.sqrt(x**2 + y**2)
-            theta = np.degrees(np.arctan2(y, x))
-            freq = batch.get(f"{prefix}freq_hz", np.zeros(n))
-            noise = batch.get(f"{prefix}noise_mv", np.zeros(n))
-            xh1 = batch.get(f"{prefix}Xh1_mv", np.zeros(n))
-            yh1 = batch.get(f"{prefix}Yh1_mv", np.zeros(n))
-            rh1 = np.sqrt(xh1**2 + yh1**2)
-            theta_h1 = np.degrees(np.arctan2(yh1, xh1))
-            xh2 = batch.get(f"{prefix}Xh2_mv", np.zeros(n))
-            yh2 = batch.get(f"{prefix}Yh2_mv", np.zeros(n))
-            rh2 = np.sqrt(xh2**2 + yh2**2)
-            theta_h2 = np.degrees(np.arctan2(yh2, xh2))
+        # 抑制 numpy overflow warning（即使数据正常，某些 numpy 版本也会误报）
+        with np.errstate(over="ignore"):
+            for ch_label, ch_num in [("A", 1), ("B", 2)]:
+                prefix = f"lockin_{ch_label}_"
+                x = batch.get(f"{prefix}X_mv")
+                y = batch.get(f"{prefix}Y_mv")
+                if x is None or y is None:
+                    continue
+                r = np.sqrt(x**2 + y**2)
+                theta = np.degrees(np.arctan2(y, x))
+                freq = batch.get(f"{prefix}freq_hz", np.zeros(n))
+                noise = batch.get(f"{prefix}noise_mv", np.zeros(n))
+                xh1 = batch.get(f"{prefix}Xh1_mv", np.zeros(n))
+                yh1 = batch.get(f"{prefix}Yh1_mv", np.zeros(n))
+                rh1 = np.sqrt(xh1**2 + yh1**2)
+                theta_h1 = np.degrees(np.arctan2(yh1, xh1))
+                xh2 = batch.get(f"{prefix}Xh2_mv", np.zeros(n))
+                yh2 = batch.get(f"{prefix}Yh2_mv", np.zeros(n))
+                rh2 = np.sqrt(xh2**2 + yh2**2)
+                theta_h2 = np.degrees(np.arctan2(yh2, xh2))
 
-            timestamps = [ts + i * dt for i in range(n)]
+                timestamps = np.arange(n, dtype=np.float64) * dt + base_ts
 
-            # 写入波形缓冲区
-            if ch_num in self._waveform_buffers:
-                self._waveform_buffers[ch_num].extend({
-                    "X": x.tolist(), "Y": y.tolist(), "R": r.tolist(), "theta": theta.tolist(),
-                    "freq": freq.tolist(), "noise": noise.tolist(),
-                    "Xh1": xh1.tolist(), "Yh1": yh1.tolist(), "Rh1": rh1.tolist(), "theta_h1": theta_h1.tolist(),
-                    "Xh2": xh2.tolist(), "Yh2": yh2.tolist(), "Rh2": rh2.tolist(), "theta_h2": theta_h2.tolist(),
-                }, timestamps)
+                # 写入波形缓冲区（numpy 数组直接传入，无 .tolist()）
+                if ch_num in self._waveform_buffers:
+                    self._waveform_buffers[ch_num].extend({
+                        "X": x, "Y": y, "R": r, "theta": theta,
+                        "freq": freq, "noise": noise,
+                        "Xh1": xh1, "Yh1": yh1, "Rh1": rh1, "theta_h1": theta_h1,
+                        "Xh2": xh2, "Yh2": yh2, "Rh2": rh2, "theta_h2": theta_h2,
+                    }, timestamps)
 
-        # 兼容旧缓冲区（CH-A 基波）
-        if 1 in self._lockin_ch_buffers:
-            x_a = batch.get("lockin_A_X_mv", np.zeros(n))
-            y_a = batch.get("lockin_A_Y_mv", np.zeros(n))
-            r_a = np.sqrt(x_a**2 + y_a**2)
-            for i in range(n):
-                point = {"X": float(x_a[i]), "Y": float(y_a[i]), "R": float(r_a[i])}
-                self._lockin_ch_buffers[1].append(point, ts + i * dt)
-                self._buffer.append(point, ts + i * dt)
+            # 兼容旧缓冲区（CH-A 基波）—— 批量写入避免逐点 Python 循环
+            if 1 in self._lockin_ch_buffers:
+                x_a = batch.get("lockin_A_X_mv", np.zeros(n))
+                y_a = batch.get("lockin_A_Y_mv", np.zeros(n))
+                r_a = np.sqrt(x_a**2 + y_a**2)
+                ts_arr = np.arange(n, dtype=np.float64) * dt + base_ts
+                self._lockin_ch_buffers[1].extend(
+                    {"X": x_a, "Y": y_a, "R": r_a}, ts_arr
+                )
+                self._buffer.extend(
+                    {"X": x_a, "Y": y_a, "R": r_a}, ts_arr
+                )
 
         self._waveform_data_count += n
 
     def _on_display_tick(self):
-        """定时刷新波形图。"""
+        """定时刷新波形图（性能优化版）。"""
         if not _HAS_PYG or not hasattr(self, '_wave_plot') or self._wave_plot is None:
             return
         if self._waveform_paused:
@@ -4872,7 +4915,7 @@ class ODMRControlGUI(QMainWindow):
         if buf is None:
             return
 
-        # 更新状态标签
+        # 更新状态标签（增加 tick 调用频率诊断，帮助定位是渲染卡还是采集卡）
         if hasattr(self, '_wave_status_label'):
             self._wave_repaint_count += 1
             elapsed = max(now - self._wave_last_fps_ts, 1e-6)
@@ -4880,46 +4923,67 @@ class ODMRControlGUI(QMainWindow):
                 self._wave_fps = self._wave_repaint_count / elapsed
                 self._wave_repaint_count = 0
                 self._wave_last_fps_ts = now
+                # 同时统计每秒到达 GUI 的 batch 数量
+                batch_arrival_count = getattr(self, '_wave_batch_arrival_count', 0)
+                self._wave_batch_arrival_hz = batch_arrival_count / elapsed
+                self._wave_batch_arrival_count = 0
             self._wave_status_label.setText(
-                f"数据点: {self._waveform_data_count} | "
+                f"点: {self._waveform_data_count} | "
                 f"FPS: {self._wave_fps:.1f} | "
-                f"batch: {self._wave_batch_rate_hz:.1f} Hz | "
-                f"TC: {self._wave_tc_label} | "
-                f"draw<= {self._wave_display_interval_ms} ms | "
+                f"batch_out: {self._wave_batch_rate_hz:.1f} Hz | "
+                f"batch_in: {getattr(self, '_wave_batch_arrival_hz', 0.0):.1f} Hz | "
+                f"draw: {self._wave_display_interval_ms}ms | "
                 f"drop: {self._wave_dropped_batches}"
             )
 
-        # 更新所有可见曲线
+        # 更新所有可见曲线 + 收集 Auto Y 需要的数据
+        amp_vals_for_y = []
+        if not hasattr(self, '_wave_curve_visible'):
+            self._wave_curve_visible: Dict[str, bool] = {}
         for _label, key, _color, _default, axis_group in self._WAVE_PARAMS:
             cb = self._wave_checkboxes.get(key)
             curve = self._wave_curves.get(key)
             if cb is None or curve is None:
                 continue
-            if not cb.isChecked():
+            checked = cb.isChecked()
+            was_visible = self._wave_curve_visible.get(key, False)
+            if not checked:
+                # 只在从可见变为不可见时清空一次，避免每帧重复 setData([], [])
+                if was_visible:
+                    curve.setData([], [])
+                    self._wave_curve_visible[key] = False
                 continue
-            ts_arr, vals = buf.get(key, max_points=2000, downsample=2)
+            self._wave_curve_visible[key] = True
+            # 根据时间窗口计算显示点数：窗口秒数 × 1000 点/秒
+            window_s = getattr(self, '_wave_window_seconds', 2)
+            max_pts = window_s * 1000
+            ts_arr, vals = buf.get(key, max_points=max_pts, downsample=1)
             if len(ts_arr) > 0:
                 ts_arr = ts_arr - ts_arr[-1]  # 相对时间，最新=0
+                # 检测 ring-buffer wrap-around 导致的时间跳跃（>3ms 即断裂）
+                if len(ts_arr) > 1:
+                    gaps = np.diff(ts_arr) < -0.003  # 正常间隔约 -1ms
+                    if np.any(gaps):
+                        gap_indices = np.where(gaps)[0] + 1
+                        ts_arr = np.insert(ts_arr, gap_indices, np.nan)
+                        vals = np.insert(vals, gap_indices, np.nan)
                 curve.setData(ts_arr, vals)
+                # 同时收集 amp 通道数据用于 Auto Y（复用已 get 的数据，避免二次读取）
+                if axis_group == "amp" and len(vals) > 0:
+                    amp_vals_for_y.append(vals)
 
-        # Auto Y 轴缩放
+        # Auto Y 轴缩放 — 每 10 次刷新（约 160ms @ 16ms 间隔）计算一次，减少开销
         if hasattr(self, '_wave_auto_y') and self._wave_auto_y.isChecked():
-            amp_vals = []
-            for _label, key, _color, _default, axis_group in self._WAVE_PARAMS:
-                if axis_group != "amp":
-                    continue
-                cb = self._wave_checkboxes.get(key)
-                if cb is None or not cb.isChecked():
-                    continue
-                _ts, vals = buf.get(key, max_points=500)
-                if len(vals) > 0:
-                    amp_vals.extend(vals.tolist())
-            if amp_vals:
-                y_max_abs = max(abs(min(amp_vals)), abs(max(amp_vals)))
-                if y_max_abs > 0:
-                    margin = y_max_abs * 0.1
-                    self._wave_plot.setYRange(-y_max_abs - margin, y_max_abs + margin, padding=0)
-                    # Y 轴标签：数据已由 RALL? 驱动转换为 mV
+            self._wave_y_update_counter = getattr(self, '_wave_y_update_counter', 0) + 1
+            if self._wave_y_update_counter >= 10 and amp_vals_for_y:
+                self._wave_y_update_counter = 0
+                # 用 numpy 拼接求极值，避免 Python list.extend
+                all_vals = np.concatenate(amp_vals_for_y)
+                if len(all_vals) > 0:
+                    y_max = float(np.nanmax(np.abs(all_vals)))
+                    if y_max > 0 and not np.isinf(y_max):
+                        margin = y_max * 0.1
+                        self._wave_plot.setYRange(-y_max - margin, y_max + margin, padding=0)
 
     def _on_command_completed(self, request_id: str, success: bool, message: str, result: dict) -> None:
         """处理 CommandService 异步命令结果。"""
